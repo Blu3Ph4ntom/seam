@@ -12,14 +12,21 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use authority_fabric::frame::{self, Frame, FrameError};
+use authority_fabric::frame::{self, Frame, FrameError, XferMsg};
 use authority_fabric::id::EpId;
 use authority_fabric::proto::{self, ControlMsg};
-use authority_fabric::queue::{BoundedQueue, PopError};
+use authority_fabric::queue::DualQueue;
 use authority_fabric::router::{PeerId, Router};
 use authority_fabric::{marker, Limits};
 
 // ---------------------------------------------------------------- core ----
+
+/// Benchmark-only stage tracing (SEAM_XFER_TRACE=1).
+fn host_trace(stage: &'static str) {
+    if std::env::var("SEAM_XFER_TRACE").map(|v| v == "1").unwrap_or(false) {
+        eprintln!("XFER_TRACE {stage} t={:?}", std::time::SystemTime::now());
+    }
+}
 
 enum HostMsg {
     Frame(PeerId, Frame),
@@ -31,8 +38,8 @@ enum HostMsg {
 
 struct Conn {
     child: Child,
-    out: Arc<BoundedQueue<Frame>>,
-    ctrl: Arc<BoundedQueue<Frame>>,
+    /// Wake-driven; ctrl compartment has reserved capacity.
+    q: Arc<DualQueue<Frame>>,
 }
 
 struct Fabric {
@@ -92,32 +99,22 @@ impl Fabric {
         }
 
         let pid = self.router.accept_peer();
-        let outq: Arc<BoundedQueue<Frame>> = Arc::new(BoundedQueue::new(
-            self.lim().queue_max_msgs,
-            self.lim().queue_max_bytes,
-        ));
-        let ctrlq: Arc<BoundedQueue<Frame>> = Arc::new(BoundedQueue::new(
-            self.lim().control_queue_max_msgs,
-            self.lim().control_queue_max_bytes,
+        let lim = self.lim();
+        let q: Arc<DualQueue<Frame>> = Arc::new(DualQueue::new(
+            lim.queue_max_msgs,
+            lim.queue_max_bytes,
+            lim.control_queue_max_msgs,
+            lim.control_queue_max_bytes,
         ));
 
-        // Writer: prefer control frames so lifecycle is not stuck behind DATA.
+        // Wake-driven writer: blocks until a frame arrives or the queue
+        // closes. Control frames jump ahead by construction (pop order),
+        // not by polling.
         {
-            let q = outq.clone();
-            let c = ctrlq.clone();
+            let q = q.clone();
             std::thread::spawn(move || {
                 let mut tx = stdin;
-                loop {
-                    let frame = if let Some(f) = c.try_pop() {
-                        Some(f)
-                    } else {
-                        match q.pop_deadline(Instant::now() + Duration::from_millis(1)) {
-                            Ok(f) => Some(f),
-                            Err(PopError::Timeout) => c.try_pop(),
-                            Err(PopError::Closed) => break,
-                        }
-                    };
-                    let Some(f) = frame else { continue };
+                while let Some(f) = q.pop_block() {
                     let mut buf = Vec::with_capacity(f.cost());
                     frame::encode_into(&f, &mut buf);
                     if tx.write_all(&buf).and_then(|_| tx.flush()).is_err() {
@@ -154,7 +151,7 @@ impl Fabric {
             });
         }
 
-        self.conns.insert(pid, Conn { child, out: outq, ctrl: ctrlq });
+        self.conns.insert(pid, Conn { child, q });
         Ok(pid)
     }
 
@@ -186,6 +183,8 @@ impl Fabric {
     }
 
     fn on_frame(&mut self, pid: PeerId, f: Frame) -> bool {
+        let prepare_in = matches!(&f, Frame::Data(d) if !d.attachments.is_empty());
+        let accept_in = matches!(&f, Frame::Xfer(XferMsg::Accept { .. }));
         let outcome = match f {
             Frame::Hello { magic, version } => {
                 let r = self.router.on_hello(pid, magic, version);
@@ -200,6 +199,9 @@ impl Fabric {
             }
             Frame::Data(d) => match self.router.on_data(pid, d) {
                 Ok(mut oc) => {
+                    if prepare_in {
+                        host_trace("host_prepare_received");
+                    }
                     for h in oc.to_host.drain(..) {
                         self.ctrl_drain.push_back((h.corr, h.payload));
                     }
@@ -227,6 +229,9 @@ impl Fabric {
             },
             Frame::Xfer(x) => match self.router.on_xfer(pid, x) {
                 Ok(oc) => {
+                    if accept_in {
+                        host_trace("host_accept_received");
+                    }
                     self.dispatch_sends(&oc);
                     None
                 }
@@ -259,17 +264,25 @@ impl Fabric {
 
     fn dispatch_sends(&mut self, oc: &authority_fabric::router::RouteOutcome) {
         for (dest, f) in &oc.send {
+            if matches!(f, Frame::Xfer(XferMsg::Commit { .. })) {
+                host_trace("host_commit_emitted");
+            }
+            if matches!(f, Frame::Xfer(XferMsg::Committed { .. })) {
+                host_trace("host_committed_emitted");
+            }
             if let Some(c) = self.conns.get(dest) {
                 let frame = f.clone();
                 let cost = frame.cost();
-                let offer = matches!(&frame, Frame::Data(d) if !d.attachments.is_empty());
-                if frame::is_control_frame(&frame) || offer {
+                // Transfer offers ride the reserved ctrl compartment so a
+                // saturated DATA queue cannot strand authority in escrow.
+                let is_ctrl = frame::is_control_frame(&frame)
+                    || matches!(&frame, Frame::Data(d) if !d.attachments.is_empty());
+                if is_ctrl {
                     let deadline = Instant::now() + Duration::from_millis(2000);
-                    let q = if frame::is_control_frame(&frame) { &c.ctrl } else { &c.out };
-                    if q.push_deadline(frame, cost, deadline).is_err() {
+                    if c.q.push_ctrl(frame, cost, deadline).is_err() {
                         marker!("HOST_CTRL_PUSH_FAILED dest={}", dest.0);
                     }
-                } else if c.out.try_push(frame, cost).is_err() {
+                } else if c.q.push_data(frame, cost).is_err() {
                     marker!("HOST_DATA_BACKPRESSURE dest={}", dest.0);
                 }
             }
@@ -278,8 +291,7 @@ impl Fabric {
 
     fn teardown_conn(&mut self, pid: PeerId) {
         if let Some(mut c) = self.conns.remove(&pid) {
-            c.out.close();
-            c.ctrl.close();
+            c.q.close();
             let code = c.child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
             self.exit_codes.insert(pid, code);
         }
@@ -307,8 +319,8 @@ impl Fabric {
         match self.router.grant(to, ep) {
             Ok(frame) => {
                 if let Some(c) = self.conns.get(&to) {
-                    let deadline = Instant::now() + Duration::from_millis(500);
-                    if c.ctrl.push_deadline(frame.clone(), frame.cost(), deadline).is_err() {
+                    let deadline = Instant::now() + Duration::from_millis(2000);
+                    if c.q.push_ctrl(frame.clone(), frame.cost(), deadline).is_err() {
                         marker!("HOST_GRANT_PUSH_FAILED");
                     }
                 }
@@ -349,7 +361,7 @@ impl Fabric {
         let ids: Vec<PeerId> = self.conns.keys().copied().collect();
         for pid in &ids {
             if let Some(c) = self.conns.get(pid) {
-                let _ = c.out.try_push(Frame::Shutdown, 8);
+                let _ = c.q.push_ctrl(Frame::Shutdown, 8, Instant::now() + Duration::from_secs(1));
             }
         }
         // Give writers a moment to flush, then process graceful collapses.

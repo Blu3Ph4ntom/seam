@@ -106,6 +106,25 @@ impl<T> BoundedQueue<T> {
         }
     }
 
+    /// Wake-driven blocking pop: sleeps until an item arrives or the queue
+    /// closes. No timers, no periodic re-check.
+    pub fn pop_block(&self) -> Option<T> {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if let Some((item, cost)) = g.q.pop_front() {
+                g.msgs -= 1;
+                g.bytes -= cost;
+                drop(g);
+                self.space.notify_all();
+                return Some(item);
+            }
+            if g.closed {
+                return None;
+            }
+            g = self.space.wait(g).unwrap();
+        }
+    }
+
     /// Pop with deadline.
     pub fn pop_deadline(&self, deadline: Instant) -> Result<T, PopError> {
         let mut g = self.inner.lock().unwrap();
@@ -148,6 +167,155 @@ impl<T> BoundedQueue<T> {
 
     pub fn is_closed(&self) -> bool {
         self.inner.lock().unwrap().closed
+    }
+}
+
+/// Two-compartment bounded queue with ONE wake source. The writer blocks
+/// forever on `pop_block` (no timers); a push to either compartment wakes
+/// it. Control frames keep a reserved capacity so ordinary DATA can never
+/// starve lifecycle traffic. Steady state: zero periodic polling.
+pub struct DualQueue<T> {
+    inner: Mutex<DualInner<T>>,
+    space: Condvar,
+    work: Condvar,
+    max_data_msgs: usize,
+    max_data_bytes: usize,
+    max_ctrl_msgs: usize,
+    max_ctrl_bytes: usize,
+}
+
+struct DualInner<T> {
+    data: VecDeque<(T, usize)>,
+    ctrl: VecDeque<(T, usize)>,
+    d_msgs: usize,
+    d_bytes: usize,
+    c_msgs: usize,
+    c_bytes: usize,
+    closed: bool,
+}
+
+impl<T> DualQueue<T> {
+    pub fn new(
+        max_data_msgs: usize,
+        max_data_bytes: usize,
+        max_ctrl_msgs: usize,
+        max_ctrl_bytes: usize,
+    ) -> Self {
+        DualQueue {
+            inner: Mutex::new(DualInner {
+                data: VecDeque::new(),
+                ctrl: VecDeque::new(),
+                d_msgs: 0,
+                d_bytes: 0,
+                c_msgs: 0,
+                c_bytes: 0,
+                closed: false,
+            }),
+            space: Condvar::new(),
+            work: Condvar::new(),
+            max_data_msgs,
+            max_data_bytes,
+            max_ctrl_msgs,
+            max_ctrl_bytes,
+        }
+    }
+
+    /// Ordinary application DATA. Never blocks; fails when DATA capacity is
+    /// exhausted (backpressure is the caller's problem).
+    pub fn push_data(&self, item: T, cost: usize) -> Result<(), (T, Backlog)> {
+        let mut g = self.inner.lock().unwrap();
+        if g.closed || g.d_msgs >= self.max_data_msgs || g.d_bytes + cost > self.max_data_bytes {
+            return Err((item, g.backlog()));
+        }
+        g.data.push_back((item, cost));
+        g.d_msgs += 1;
+        g.d_bytes += cost;
+        drop(g);
+        self.work.notify_all();
+        Ok(())
+    }
+
+    /// Lifecycle/control frame. Waits (bounded) for reserved capacity; the
+    /// item is returned untouched on failure — silent loss is forbidden.
+    pub fn push_ctrl(
+        &self,
+        item: T,
+        cost: usize,
+        deadline: Instant,
+    ) -> Result<(), (T, Backlog)> {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if g.closed {
+                return Err((item, g.backlog()));
+            }
+            if g.c_msgs < self.max_ctrl_msgs && g.c_bytes + cost <= self.max_ctrl_bytes {
+                g.ctrl.push_back((item, cost));
+                g.c_msgs += 1;
+                g.c_bytes += cost;
+                drop(g);
+                self.work.notify_all();
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err((item, g.backlog()));
+            }
+            let wait = std::cmp::min(deadline - now, Duration::from_millis(20));
+            let (ng, _) = self.space.wait_timeout(g, wait).unwrap();
+            g = ng;
+        }
+    }
+
+    /// Wake-driven pop: control first, then data. `None` only after close
+    /// and drain. No timeout, no periodic re-check.
+    pub fn pop_block(&self) -> Option<T> {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if let Some((item, cost)) = g.ctrl.pop_front() {
+                g.c_msgs -= 1;
+                g.c_bytes -= cost;
+                drop(g);
+                self.space.notify_all();
+                return Some(item);
+            }
+            if let Some((item, cost)) = g.data.pop_front() {
+                g.d_msgs -= 1;
+                g.d_bytes -= cost;
+                drop(g);
+                self.space.notify_all();
+                return Some(item);
+            }
+            if g.closed {
+                return None;
+            }
+            g = self.work.wait(g).unwrap();
+        }
+    }
+
+    /// Blocking pop for single-compartment use (child writer).
+    pub fn close(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.closed = true;
+        drop(g);
+        self.work.notify_all();
+        self.space.notify_all();
+    }
+
+    pub fn backlog(&self) -> Backlog {
+        self.inner.lock().unwrap().backlog()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap().closed
+    }
+}
+
+impl<T> DualInner<T> {
+    fn backlog(&self) -> Backlog {
+        Backlog {
+            msgs: self.d_msgs + self.c_msgs,
+            bytes: self.d_bytes + self.c_bytes,
+        }
     }
 }
 

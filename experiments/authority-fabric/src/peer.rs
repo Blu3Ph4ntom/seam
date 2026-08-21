@@ -163,9 +163,17 @@ pub struct RuntimeInner {
     broken: AtomicBool,
     pub sent_frames: AtomicU64,
     pub received_frames: AtomicU64,
+    born: Instant,
 }
 
 const INBOUND_COST_OVERHEAD: usize = 96;
+
+/// Benchmark-only stage tracing (SEAM_XFER_TRACE=1). Silent otherwise.
+fn xfer_trace(stage: &'static str) {
+    if std::env::var("SEAM_XFER_TRACE").map(|v| v == "1").unwrap_or(false) {
+        eprintln!("XFER_TRACE {stage} t={:?}", std::time::SystemTime::now());
+    }
+}
 
 impl RuntimeInner {
     fn new_inner(lim: Limits) -> Self {
@@ -191,6 +199,7 @@ impl RuntimeInner {
             broken: AtomicBool::new(false),
             sent_frames: AtomicU64::new(0),
             received_frames: AtomicU64::new(0),
+            born: Instant::now(),
         }
     }
 
@@ -221,6 +230,7 @@ impl RuntimeInner {
 
     fn finish_parked(self: &Arc<Self>, p: Parked) {
         if p.is_response {
+            xfer_trace("recipient_resolved_caller");
             let inner = {
                 let mut st = self.st.lock().unwrap();
                 st.waiters.remove(&p.corr).map(|s| s.peek())
@@ -345,6 +355,7 @@ impl RuntimeInner {
     fn process_xfer(self: &Arc<Self>, x: XferMsg) -> bool {
         match x {
             XferMsg::Commit { tid, ep, partner } => {
+                xfer_trace("recipient_commit_received");
                 let mut ready: Vec<Parked> = Vec::new();
                 {
                     let mut st = self.st.lock().unwrap();
@@ -424,6 +435,7 @@ impl RuntimeInner {
         // Attachments are offers: ACCEPT if we have capacity, then wait for
         // COMMIT before the handle becomes usable.
         if !d.attachments.is_empty() {
+            xfer_trace("recipient_offer_received");
             let cap_ok = {
                 let st = self.st.lock().unwrap();
                 st.handles.values().filter(|h| h.cause.is_none()).count()
@@ -656,6 +668,7 @@ impl Endpoint {
     }
 
     fn release(&self) -> Result<(), FabError> {
+        xfer_trace("endpoint_release_emit");
         let res = self.shared.push_out(Frame::Close { target: self.id });
         let mut st = self.shared.st.lock().unwrap();
         st.fail_handle(self.id, Cause::Graceful);
@@ -706,9 +719,9 @@ fn writer_loop<W: Write>(sh: Arc<RuntimeInner>, mut tx: W) {
         if sh.broken.load(Ordering::SeqCst) {
             break;
         }
-        let deadline = Instant::now() + Duration::from_millis(100);
-        match sh.out.pop_deadline(deadline) {
-            Ok(f) => {
+        // Wake-driven: block until work or close. No periodic timer.
+        match sh.out.pop_block() {
+            Some(f) => {
                 let mut buf = Vec::with_capacity(f.cost());
                 frame::encode_into(&f, &mut buf);
                 if tx.write_all(&buf).and_then(|_| tx.flush()).is_err() {
@@ -716,8 +729,7 @@ fn writer_loop<W: Write>(sh: Arc<RuntimeInner>, mut tx: W) {
                     break;
                 }
             }
-            Err(PopError::Timeout) => continue,
-            Err(PopError::Closed) => break,
+            None => break,
         }
     }
 }
@@ -821,6 +833,9 @@ impl Runtime {
             attachments,
             payload,
         }))?;
+        if !waiters.is_empty() {
+            xfer_trace("sender_reply_emitted");
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         for (tid, slot) in waiters {
             let mut status_probes = 0u8;
@@ -857,6 +872,7 @@ impl Runtime {
                 }
             }
         }
+        xfer_trace("sender_saw_committed");
         Ok(())
     }
 

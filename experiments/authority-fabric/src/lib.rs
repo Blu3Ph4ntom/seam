@@ -18,7 +18,7 @@ pub use frame::FrameError;
 pub use id::{EpId, TransferId};
 pub use limits::Limits;
 pub use peer::{CallResult, Endpoint, Inbound, PeerAccounting, Runtime, RuntimeInner};
-pub use queue::Backlog;
+pub use queue::{Backlog, DualQueue};
 pub use router::{Accounting as RouterAccounting, HostDelivery, PeerId, Poison, Router};
 
 /// Emit a structured marker line to stderr. Markers are the demo/e2e
