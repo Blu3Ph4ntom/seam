@@ -1,0 +1,17 @@
+error[E0382]: borrow of moved value: `ep`
+  --> tests/compile-fail/use_after_transfer.rs:11:13
+   |
+ 9 |     let ep = Endpoint::__unchecked(EpId(42), sh);
+   |         -- move occurs because `ep` has type `Endpoint`, which does not implement the `Copy` trait
+10 |     consume(ep);
+   |             -- value moved here
+11 |     let _ = ep.call(vec![1], std::time::Duration::from_secs(1)); //~ ERROR E0382
+   |             ^^ value borrowed here after move
+   |
+note: consider changing this parameter type in function `consume` to borrow instead if owning the value isn't necessary
+  --> tests/compile-fail/use_after_transfer.rs:3:15
+   |
+ 3 | fn consume(e: Endpoint) {
+   |    -------    ^^^^^^^^ this parameter takes ownership of the value
+   |    |
+   |    in this function
