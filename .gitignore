@@ -1,0 +1,10 @@
+# Local engineering state - never commit
+.agent/
+
+# Build artifacts
+/target
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
