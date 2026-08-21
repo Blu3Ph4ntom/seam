@@ -1,0 +1,767 @@
+//! Child-side runtime: connection to the host fabric, move-only endpoint
+//! handles, request/reply with correlation, capability receipt and transfer,
+//! deterministic failure surfacing.
+//!
+//! Concurrency model: one reader thread (transport -> state machine), one
+//! writer thread (bounded outbound queue -> transport). A single state
+//! mutex, never held across blocking IO.
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::fabric_error::{Cause, FabError};
+use crate::frame::{self, Attachment, DataInner, Frame, FrameError, ERR_CAPACITY};
+use crate::id::EpId;
+use crate::limits::Limits;
+use crate::queue::{BoundedQueue, PopError};
+
+/// A message delivered to a locally-implemented endpoint.
+#[derive(Debug)]
+pub struct Inbound {
+    /// The sender's endpoint identity (informational).
+    pub from: EpId,
+    /// Our own handle that received this message. Replies are sent ON THIS
+    /// handle: pair-routing makes that symmetric.
+    pub local: EpId,
+    pub corr: u32,
+    pub payload: Vec<u8>,
+    /// Capabilities transferred inside this message. Possessing them IS the
+    /// authority; they arrived only because someone transferred them.
+    pub received: Vec<Endpoint>,
+}
+
+/// Successful call result: response payload plus capabilities transferred
+/// back inside the reply.
+#[derive(Debug)]
+pub struct CallResult {
+    pub payload: Vec<u8>,
+    pub received: Vec<Endpoint>,
+}
+
+pub(crate) struct WaitSlot {
+    pub ep: EpId,
+    inner: Arc<(Mutex<Option<Result<CallResult, FabError>>>, Condvar)>,
+}
+
+impl WaitSlot {
+    fn new(ep: EpId) -> Self {
+        WaitSlot { ep, inner: Arc::new((Mutex::new(None), Condvar::new())) }
+    }
+    fn resolve(self, res: Result<CallResult, FabError>) {
+        let (m, cv) = &*self.inner;
+        *m.lock().unwrap() = Some(res);
+        cv.notify_all();
+    }
+    fn peek(&self) -> Arc<(Mutex<Option<Result<CallResult, FabError>>>, Condvar)> {
+        self.inner.clone()
+    }
+}
+
+enum CreateOutcome {
+    Done(EpId, EpId),
+    Failed(FabError),
+}
+
+struct HState {
+    partner: EpId,
+    /// None = live.
+    cause: Option<Cause>,
+}
+
+struct State {
+    handles: HashMap<EpId, HState>,
+    /// their-side id -> our-side handle (receive demux).
+    partner_of_theirs: HashMap<EpId, EpId>,
+    waiters: HashMap<u32, WaitSlot>,
+    create_slot: Option<Arc<(Mutex<Option<CreateOutcome>>, Condvar)>>,
+    next_corr: u32,
+    terminal: Option<Cause>,
+    dropped_after_close: u64,
+    /// Grant/attachment arrival order. HashMap iteration is randomized, so
+    /// `next_new_handle` would otherwise race which bootstrap grant is
+    /// claimed first (root vs. control).
+    arrival_order: Vec<EpId>,
+}
+
+impl State {
+    /// Marks the endpoint failed and wakes its waiters. Returns true if this
+    /// call transitioned it.
+    fn fail_handle(&mut self, ep: EpId, cause: Cause) -> bool {
+        let held = match self.handles.get_mut(&ep) {
+            Some(h) if h.cause.is_none() => {
+                h.cause = Some(cause);
+                true
+            }
+            _ => false,
+        };
+        if !held {
+            return false;
+        }
+        let done: Vec<u32> = self
+            .waiters
+            .iter()
+            .filter(|(_, s)| s.ep == ep)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in done {
+            if let Some(slot) = self.waiters.remove(&k) {
+                slot.resolve(Err(FabError::Closed(cause)));
+            }
+        }
+        true
+    }
+
+    fn go_terminal(&mut self, cause: Cause) {
+        if self.terminal.is_some() {
+            return;
+        }
+        self.terminal = Some(cause);
+        let live: Vec<EpId> = self
+            .handles
+            .iter()
+            .filter(|(_, h)| h.cause.is_none())
+            .map(|(k, _)| *k)
+            .collect();
+        for ep in live {
+            self.fail_handle(ep, cause);
+        }
+    }
+}
+
+pub struct RuntimeInner {
+    pub lim: Limits,
+    st: Mutex<State>,
+    out: BoundedQueue<Frame>,
+    /// Internally synchronized; deliberately OUTSIDE the state mutex so
+    /// consumers block on it without holding the lock.
+    inbound: BoundedQueue<Inbound>,
+    new_handle: Condvar,
+    new_handle_m: Mutex<()>,
+    broken: AtomicBool,
+    pub sent_frames: AtomicU64,
+    pub received_frames: AtomicU64,
+}
+
+const INBOUND_COST_OVERHEAD: usize = 96;
+
+impl RuntimeInner {
+    fn new_inner(lim: Limits) -> Self {
+        RuntimeInner {
+            lim: lim.clone(),
+            st: Mutex::new(State {
+                handles: HashMap::new(),
+                partner_of_theirs: HashMap::new(),
+                waiters: HashMap::new(),
+                create_slot: None,
+                next_corr: 0,
+                terminal: None,
+                dropped_after_close: 0,
+                arrival_order: Vec::new(),
+            }),
+            out: BoundedQueue::new(lim.queue_max_msgs, lim.queue_max_bytes),
+            inbound: BoundedQueue::new(lim.queue_max_msgs, lim.queue_max_bytes),
+            new_handle: Condvar::new(),
+            new_handle_m: Mutex::new(()),
+            broken: AtomicBool::new(false),
+            sent_frames: AtomicU64::new(0),
+            received_frames: AtomicU64::new(0),
+        }
+    }
+
+    /// Same construction as `connect_as_child`, minus handshake and IO threads.
+    #[doc(hidden)]
+    pub fn __for_tests(lim: Limits) -> Arc<Self> {
+        Arc::new(Self::new_inner(lim))
+    }
+
+    fn push_out(&self, f: Frame) -> Result<(), FabError> {
+        let cost = f.cost();
+        match self.out.try_push(f, cost) {
+            Ok(()) => {
+                self.sent_frames.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err((_, backlog)) => Err(FabError::Backpressured {
+                queued_msgs: backlog.msgs,
+                queued_bytes: backlog.bytes,
+            }),
+        }
+    }
+
+    fn poison(&self) {
+        // The fabric misbehaved at the framing level; fail closed.
+        self.go_terminal_pub(Cause::PeerLost);
+    }
+
+    fn go_terminal_pub(&self, cause: Cause) {
+        {
+            let mut st = self.st.lock().unwrap();
+            st.go_terminal(cause);
+        }
+        self.broken.store(true, Ordering::SeqCst);
+        self.out.close();
+        self.inbound.close();
+        let _g = self.new_handle_m.lock().unwrap();
+        self.new_handle.notify_all();
+    }
+
+    /// Reader-thread entry for every frame arriving from the fabric.
+    /// Returns false when the loop must stop.
+    fn process(self: &Arc<Self>, f: Frame) -> bool {
+        self.received_frames.fetch_add(1, Ordering::Relaxed);
+        match f {
+            Frame::Hello { .. } | Frame::Close { .. } => {
+                // The host never re-handshakes a child, and peers (not the
+                // host) emit Close. Either means wire-level confusion.
+                self.poison();
+                false
+            }
+            Frame::Grant { ep, partner } => {
+                {
+                    let mut st = self.st.lock().unwrap();
+                    if st.terminal.is_some() {
+                        return true;
+                    }
+                    if !st.handles.contains_key(&ep) {
+                        st.handles.insert(ep, HState { partner, cause: None });
+                        st.arrival_order.push(ep);
+                    }
+                    st.partner_of_theirs.insert(partner, ep);
+                }
+                let _g = self.new_handle_m.lock().unwrap();
+                self.new_handle.notify_all();
+                true
+            }
+            Frame::Data(d) => {
+                self.process_data(d);
+                true
+            }
+            Frame::ClosedNotify { entries } => {
+                let mut st = self.st.lock().unwrap();
+                for (id, cause) in entries {
+                    if st.fail_handle(id, cause) {
+                        if let Some(h) = st.handles.get(&id) {
+                            let partner = h.partner;
+                            st.partner_of_theirs.remove(&partner);
+                        }
+                    }
+                }
+                true
+            }
+            Frame::Create => true,
+            Frame::CreateAck { impl_ep, transferable_ep } => {
+                let mut st = self.st.lock().unwrap();
+                if let Some(slot) = st.create_slot.take() {
+                    let (m, cv) = &*slot;
+                    *m.lock().unwrap() = Some(CreateOutcome::Done(impl_ep, transferable_ep));
+                    cv.notify_all();
+                }
+                true
+            }
+            Frame::Error(code) => {
+                let mut st = self.st.lock().unwrap();
+                if let Some(slot) = st.create_slot.take() {
+                    let err = match code {
+                        ERR_CAPACITY => FabError::Backpressured { queued_msgs: 0, queued_bytes: 0 },
+                        _ => FabError::ProtocolViolation("unknown error code"),
+                    };
+                    let (m, cv) = &*slot;
+                    *m.lock().unwrap() = Some(CreateOutcome::Failed(err));
+                    cv.notify_all();
+                }
+                true
+            }
+            Frame::Shutdown => {
+                self.go_terminal_pub(Cause::Graceful);
+                false
+            }
+        }
+    }
+
+    fn process_data(self: &Arc<Self>, d: DataInner) {
+        // Materialize transferred capabilities first: receiving them IS
+        // acquiring authority.
+        for att in &d.attachments {
+            {
+                let mut st = self.st.lock().unwrap();
+                if st.terminal.is_some() {
+                    return;
+                }
+                if !st.handles.contains_key(&att.id) {
+                    st.handles.insert(att.id, HState { partner: att.partner, cause: None });
+                    st.arrival_order.push(att.id);
+                }
+                st.partner_of_theirs.insert(att.partner, att.id);
+            }
+            let _g = self.new_handle_m.lock().unwrap();
+            self.new_handle.notify_all();
+        }
+
+        enum Next {
+            Deliver(EpId),
+            Respond(EpId),
+        }
+        let next = {
+            let mut st = self.st.lock().unwrap();
+            let Some(local) = st.partner_of_theirs.get(&d.target).copied() else {
+                st.dropped_after_close += 1;
+                return;
+            };
+            if st.handles.get(&local).and_then(|h| h.cause).is_some() {
+                // Message raced past closure notification: counted, never
+                // treated as success anywhere.
+                st.dropped_after_close += 1;
+                return;
+            }
+            if d.corr != 0 {
+                let is_response = st
+                    .waiters
+                    .get(&d.corr)
+                    .map(|s| s.ep == local)
+                    .unwrap_or(false);
+                if is_response {
+                    Next::Respond(local)
+                } else {
+                    Next::Deliver(local)
+                }
+            } else {
+                Next::Deliver(local)
+            }
+        };
+
+        match next {
+            Next::Respond(local) => {
+                let received = d
+                    .attachments
+                    .iter()
+                    .map(|a| Endpoint { id: a.id, shared: self.clone() })
+                    .collect();
+                let inner = {
+                    let mut st = self.st.lock().unwrap();
+                    st.waiters.remove(&d.corr).map(|s| s.peek())
+                };
+                let res = Ok(CallResult { payload: d.payload, received });
+                match inner {
+                    Some(inner) => {
+                        let (m, cv) = &*inner;
+                        *m.lock().unwrap() = Some(res);
+                        cv.notify_all();
+                    }
+                    None => {
+                        // Late response after caller timeout: count it.
+                        let mut st = self.st.lock().unwrap();
+                        st.dropped_after_close += 1;
+                        let _ = local;
+                    }
+                }
+            }
+            Next::Deliver(local) => {
+                let received = d
+                    .attachments
+                    .iter()
+                    .map(|a| Endpoint { id: a.id, shared: self.clone() })
+                    .collect();
+                let cost = d.payload.len() + INBOUND_COST_OVERHEAD;
+                let mut item =
+                    Inbound { from: d.target, local, corr: d.corr, payload: d.payload, received };
+                // Backpressure: retry WITHOUT holding the state lock; bounded
+                // forever because the fabric eventually goes terminal.
+                loop {
+                    match self.inbound.try_push(item, cost) {
+                        Ok(()) => return,
+                        Err((back, _bl)) => {
+                            item = back;
+                            let dead = {
+                                let st = self.st.lock().unwrap();
+                                st.terminal.is_some()
+                            } || self.broken.load(Ordering::Relaxed);
+                            if dead {
+                                let mut st = self.st.lock().unwrap();
+                                st.dropped_after_close += 1;
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Move-only authority handle. Deliberately NOT Clone/Copy: transferring or
+/// closing consumes it (invariants I3/I4). The internal identity is private
+/// and validated on every use.
+pub struct Endpoint {
+    id: EpId,
+    shared: Arc<RuntimeInner>,
+}
+
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoint").field("id", &self.id.0).finish()
+    }
+}
+
+impl Endpoint {
+    /// Test-only constructor. Not an authority source.
+    #[doc(hidden)]
+    pub fn __unchecked(id: EpId, shared: Arc<RuntimeInner>) -> Self {
+        Endpoint { id, shared }
+    }
+
+    pub fn id(&self) -> EpId {
+        self.id
+    }
+
+    /// Invoke the remote side. Blocks until reply, closure, or timeout.
+    pub fn call(&self, payload: Vec<u8>, timeout: Duration) -> Result<CallResult, FabError> {
+        let deadline = Instant::now() + timeout;
+        let (corr, slot) = {
+            let mut st = self.shared.st.lock().unwrap();
+            if let Some(c) = st.handles.get(&self.id).and_then(|h| h.cause) {
+                return Err(FabError::Closed(c));
+            }
+            if st.terminal.is_some() {
+                return Err(FabError::FabricLost);
+            }
+            if st.waiters.len() >= self.shared.lim.max_outstanding_requests {
+                return Err(FabError::Backpressured {
+                    queued_msgs: st.waiters.len(),
+                    queued_bytes: 0,
+                });
+            }
+            st.next_corr += 1;
+            let corr = st.next_corr;
+            let slot = WaitSlot::new(self.id);
+            st.waiters.insert(corr, slot);
+            (corr, st.waiters.get(&corr).unwrap().peek())
+        };
+
+        self.shared.push_out(Frame::Data(DataInner {
+            target: self.id,
+            corr,
+            attachments: vec![],
+            payload,
+        }))
+        .map_err(|e| {
+            let mut st = self.shared.st.lock().unwrap();
+            st.waiters.remove(&corr);
+            e
+        })?;
+
+        let (m, cv) = &*slot;
+        let mut g = m.lock().unwrap();
+        loop {
+            if let Some(res) = g.take() {
+                let mut st = self.shared.st.lock().unwrap();
+                st.waiters.remove(&corr);
+                return res;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let mut st = self.shared.st.lock().unwrap();
+                st.waiters.remove(&corr);
+                return Err(FabError::Timeout);
+            }
+            let (ng, _) = cv.wait_timeout(g, deadline - now).unwrap();
+            g = ng;
+        }
+    }
+
+    /// Destroy this end deliberately. Consumes the authority.
+    pub fn close(self) -> Result<(), FabError> {
+        let res = self.shared.push_out(Frame::Close { target: self.id });
+        let mut st = self.shared.st.lock().unwrap();
+        st.fail_handle(self.id, Cause::Graceful);
+        if let Some(h) = st.handles.get(&self.id) {
+            let partner = h.partner;
+            st.partner_of_theirs.remove(&partner);
+        }
+        res
+    }
+}
+
+fn reader_loop<R: Read>(sh: Arc<RuntimeInner>, mut rx: R, lim: Limits) {
+    loop {
+        if sh.broken.load(Ordering::SeqCst) {
+            break;
+        }
+        match frame::read_frame(&mut rx, &lim) {
+            Ok(f) => {
+                if !sh.process(f) {
+                    break;
+                }
+            }
+            Err(FrameError::TooLarge { .. }) => {
+                sh.poison();
+                break;
+            }
+            Err(_) => {
+                // Truncated / IO error: transport gone (host death shows up
+                // here as EOF).
+                sh.go_terminal_pub(Cause::PeerLost);
+                break;
+            }
+        }
+    }
+}
+
+fn writer_loop<W: Write>(sh: Arc<RuntimeInner>, mut tx: W) {
+    loop {
+        if sh.broken.load(Ordering::SeqCst) {
+            break;
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
+        match sh.out.pop_deadline(deadline) {
+            Ok(f) => {
+                let mut buf = Vec::with_capacity(f.cost());
+                frame::encode_into(&f, &mut buf);
+                if tx.write_all(&buf).and_then(|_| tx.flush()).is_err() {
+                    sh.go_terminal_pub(Cause::PeerLost);
+                    break;
+                }
+            }
+            Err(PopError::Timeout) => continue,
+            Err(PopError::Closed) => break,
+        }
+    }
+}
+
+/// Test/demo introspection snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerAccounting {
+    pub live_handles: usize,
+    pub inbound_backlog_msgs: usize,
+    pub dropped_after_close: u64,
+    pub sent_frames: u64,
+    pub received_frames: u64,
+    pub terminal: bool,
+}
+
+pub struct Runtime {
+    shared: Arc<RuntimeInner>,
+    lim: Limits,
+}
+
+impl Runtime {
+    /// Connect as a child over an established byte-stream channel (e.g., the
+    /// stdin/stdout pipes a parent spawned us with). Performs the handshake
+    /// synchronously, then starts IO threads.
+    pub fn connect_as_child<R, W>(rx: R, mut tx: W, lim: Limits) -> std::io::Result<Runtime>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        let hello = Frame::Hello { magic: lim.hello_magic, version: lim.hello_version };
+        let mut buf = Vec::with_capacity(hello.cost());
+        frame::encode_into(&hello, &mut buf);
+        tx.write_all(&buf)?;
+        tx.flush()?;
+
+        let shared = Arc::new(RuntimeInner::new_inner(lim.clone()));
+
+        {
+            let sh = shared.clone();
+            let lim2 = lim.clone();
+            std::thread::spawn(move || reader_loop(sh, rx, lim2));
+        }
+        {
+            let sh = shared.clone();
+            std::thread::spawn(move || writer_loop(sh, tx));
+        }
+
+        Ok(Runtime { shared, lim })
+    }
+
+    pub fn limits(&self) -> &Limits {
+        &self.lim
+    }
+
+    /// Blocks until a message arrives on any locally-implemented endpoint.
+    pub fn wait_inbound(&self, timeout: Duration) -> Result<Inbound, FabError> {
+        match self.shared.inbound.pop_deadline(Instant::now() + timeout) {
+            Ok(item) => Ok(item),
+            Err(PopError::Closed) => Err(FabError::FabricLost),
+            Err(PopError::Timeout) => Err(FabError::Timeout),
+        }
+    }
+
+    /// Reply to a request ON THE HANDLE THAT RECEIVED IT (pair-routing makes
+    /// this symmetric). Consumes any capabilities attached to the reply:
+    /// after this call the sender no longer holds them (I4).
+    pub fn reply(
+        &self,
+        req: &Inbound,
+        payload: Vec<u8>,
+        caps: Vec<Endpoint>,
+    ) -> Result<(), FabError> {
+        let mut attachments = Vec::with_capacity(caps.len());
+        {
+            let mut st = self.shared.st.lock().unwrap();
+            for cap in caps {
+                match st.handles.get(&cap.id).and_then(|h| h.cause) {
+                    Some(c) => return Err(FabError::Closed(c)),
+                    None => {}
+                }
+                let partner = st.handles.get(&cap.id).unwrap().partner;
+                attachments.push(Attachment { id: cap.id, partner });
+                // Transfer-out: sender relinquishes. The demux entry stays:
+                // traffic addressed to the moved side still routes to us
+                // (we implement its partner).
+                st.handles.remove(&cap.id);
+            }
+        }
+        self.shared.push_out(Frame::Data(DataInner {
+            target: req.local,
+            corr: req.corr,
+            attachments,
+            payload,
+        }))
+    }
+
+    /// Ask the fabric for a fresh endpoint pair: (implementation side,
+    /// transferable side). Both are initially held by us; transferring the
+    /// second one delegates invocation authority while implementation
+    /// traffic keeps arriving on the first.
+    pub fn create_endpoint(&self, timeout: Duration) -> Result<(Endpoint, Endpoint), FabError> {
+        let deadline = Instant::now() + timeout;
+        let slot = Arc::new((Mutex::new(None::<CreateOutcome>), Condvar::new()));
+        {
+            let mut st = self.shared.st.lock().unwrap();
+            if st.terminal.is_some() {
+                return Err(FabError::FabricLost);
+            }
+            if st.create_slot.is_some() {
+                return Err(FabError::Backpressured { queued_msgs: 0, queued_bytes: 0 });
+            }
+            st.create_slot = Some(slot.clone());
+        }
+        if let Err(e) = self.shared.push_out(Frame::Create) {
+            let mut st = self.shared.st.lock().unwrap();
+            st.create_slot = None;
+            return Err(e);
+        }
+        let (m, cv) = &*slot;
+        let mut g = m.lock().unwrap();
+        loop {
+            match g.take() {
+                Some(CreateOutcome::Done(imp, tra)) => {
+                    let mut st = self.shared.st.lock().unwrap();
+                    if !st.handles.contains_key(&imp) {
+                        st.handles.insert(imp, HState { partner: tra, cause: None });
+                        st.arrival_order.push(imp);
+                    }
+                    if !st.handles.contains_key(&tra) {
+                        st.handles.insert(tra, HState { partner: imp, cause: None });
+                        st.arrival_order.push(tra);
+                    }
+                    // Demux: a DATA addressed with the peer's handle (the
+                    // partner id) must resolve to our local side.
+                    st.partner_of_theirs.insert(tra, imp);
+                    st.partner_of_theirs.insert(imp, tra);
+                    return Ok((
+                        Endpoint { id: imp, shared: self.shared.clone() },
+                        Endpoint { id: tra, shared: self.shared.clone() },
+                    ));
+                }
+                Some(CreateOutcome::Failed(e)) => return Err(e),
+                None => {}
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let mut st = self.shared.st.lock().unwrap();
+                st.create_slot = None;
+                return Err(FabError::Timeout);
+            }
+            let (ng, _) = cv.wait_timeout(g, deadline - now).unwrap();
+            g = ng;
+        }
+    }
+
+    /// Wait until a handle exists that is not in `exclude`; returns its id.
+    /// Used by roles that receive grants asynchronously.
+    pub fn next_new_handle(&self, exclude: &[EpId], timeout: Duration) -> Result<EpId, FabError> {
+        let deadline = Instant::now() + timeout;
+        let mut g = self.shared.new_handle_m.lock().unwrap();
+        loop {
+            {
+                let st = self.shared.st.lock().unwrap();
+                let found = st.arrival_order.iter().copied().find(|id| {
+                    !exclude.contains(id)
+                        && st
+                            .handles
+                            .get(id)
+                            .map(|h| h.cause.is_none())
+                            .unwrap_or(false)
+                });
+                if let Some(id) = found {
+                    return Ok(id);
+                }
+                if st.terminal.is_some() {
+                    return Err(FabError::FabricLost);
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(FabError::Timeout);
+            }
+            let (ng, _) = self
+                .shared
+                .new_handle
+                .wait_timeout(g, deadline - now)
+                .unwrap();
+            g = ng;
+        }
+    }
+
+    pub fn live_handles(&self) -> Vec<EpId> {
+        let st = self.shared.st.lock().unwrap();
+        st.handles
+            .iter()
+            .filter(|(_, h)| h.cause.is_none())
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    /// Materialize the public handle for an identity we already hold
+    /// (grants arrive before we can observe them synchronously). Not an
+    /// authority source: it fails unless the runtime currently records us
+    /// as the holder.
+    pub fn endpoint_for(&self, id: EpId) -> Option<Endpoint> {
+        let st = self.shared.st.lock().unwrap();
+        match st.handles.get(&id) {
+            Some(h) if h.cause.is_none() => {
+                Some(Endpoint { id, shared: self.shared.clone() })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn fabric_terminal(&self) -> Option<Cause> {
+        self.shared.st.lock().unwrap().terminal
+    }
+
+    pub fn accounting(&self) -> PeerAccounting {
+        let st = self.shared.st.lock().unwrap();
+        PeerAccounting {
+            live_handles: st.handles.values().filter(|h| h.cause.is_none()).count(),
+            inbound_backlog_msgs: self.shared.inbound.backlog().msgs,
+            dropped_after_close: st.dropped_after_close,
+            sent_frames: self.shared.sent_frames.load(Ordering::Relaxed),
+            received_frames: self.shared.received_frames.load(Ordering::Relaxed),
+            terminal: st.terminal.is_some(),
+        }
+    }
+
+    /// Best-effort orderly goodbye: announce, give the writer a moment,
+    /// then mark everything closed.
+    pub fn shutdown(&self) {
+        let _ = self.shared.push_out(Frame::Shutdown);
+        std::thread::sleep(Duration::from_millis(40));
+        self.shared.go_terminal_pub(Cause::Graceful);
+    }
+}
