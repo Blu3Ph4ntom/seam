@@ -1,0 +1,622 @@
+//! Client role. Modes selected via SEAM_CLIENT_MODE:
+//!   (empty|"full")  happy path + kill-then-failure assertions
+//!   root_closed_tolerant : root grant may or may not arrive; any explicit
+//!                          failure within bound is success
+//!   root_closed_strict   : grant must arrive, then call must fail Closed
+//!   outstanding_request  : request in flight when service dies
+//!   kill_after_first_increment : nested capability proven once, then killed
+//!   graceful_done        : full happy path, then signal Done
+//!   watchdog             : report fabric loss (host-death test)
+//!   churn                : N create/transfer/close cycles
+//!   perf                 : RTT / transfer latency measurement
+
+use std::collections::HashSet;
+use std::io::Write;
+use std::time::{Duration, Instant};
+
+use authority_fabric::fabric_error::FabError;
+use authority_fabric::peer::Runtime;
+use authority_fabric::proto::{
+    self, CounterRequest, CounterResponse, RootRequest, RootResponse,
+};
+use authority_fabric::{marker, Endpoint, EpId, Limits};
+
+const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn mode() -> String {
+    std::env::var("SEAM_CLIENT_MODE").unwrap_or_else(|_| "full".into())
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("rawpeer") {
+        rawpeer();
+        return;
+    }
+    let lim = Limits {
+        // Churn needs more concurrent capacity than the default.
+        max_live_endpoints: 64,
+        ..Limits::default()
+    };
+    let rt = match Runtime::connect_as_child(std::io::stdin(), std::io::stdout(), lim) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL connect: {e}");
+            std::process::exit(2);
+        }
+    };
+    let code = match mode().as_str() {
+        "root_closed_tolerant" => root_closed(&rt, false),
+        "root_closed_strict" => root_closed(&rt, true),
+        "outstanding_request" => outstanding_request(&rt),
+        "kill_after_first_increment" => kill_after_first_increment(&rt),
+        "graceful_done" => graceful_done(&rt),
+        "watchdog" => watchdog(&rt),
+        "churn" => churn(&rt),
+        "perf" => perf(&rt),
+        _ => full_demo(&rt),
+    };
+    rt.shutdown();
+    std::process::exit(code);
+}
+
+/// Wait for the next granted handle not yet claimed.
+fn claim(rt: &Runtime, exclude: &mut HashSet<EpId>) -> Result<EpId, FabError> {
+    let id = rt.next_new_handle(
+        &exclude.iter().copied().collect::<Vec<_>>(),
+        Duration::from_secs(10),
+    )?;
+    exclude.insert(id);
+    Ok(id)
+}
+
+fn claim_ep(rt: &Runtime, seen: &mut HashSet<EpId>) -> Result<Endpoint, String> {
+    let id = claim(rt, seen).map_err(|e| format!("capability grant: {e}"))?;
+    rt.endpoint_for(id)
+        .ok_or_else(|| "claimed id not live".to_string())
+}
+
+/// Happy path + post-kill failure assertions (default demo).
+fn full_demo(rt: &Runtime) -> i32 {
+    let mut seen = HashSet::new();
+    let Ok(root) = claim_ep(rt, &mut seen) else {
+        eprintln!("CLIENT_FAIL no root capability");
+        return 1;
+    };
+    marker!("CLIENT_HAS_ROOT_CAPABILITY");
+
+    // Typed request through the transferred root capability.
+    match root.call(proto::encode_root_request(RootRequest::Ping), CALL_TIMEOUT) {
+        Ok(res) => match proto::decode_root_response(&res.payload) {
+            Ok(RootResponse::Pong) => {}
+            other => {
+                eprintln!("CLIENT_FAIL ping reply {other:?}");
+                return 1;
+            }
+        },
+        Err(e) => {
+            eprintln!("CLIENT_FAIL ping: {e}");
+            return 1;
+        }
+    }
+
+    // Nested capability: the service returns NEW authority inside an
+    // ordinary reply. No name, no lookup, no registry.
+    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL open_counter: {e}");
+            return 1;
+        }
+    };
+    match proto::decode_root_response(&res.payload) {
+        Ok(RootResponse::Counter) => {}
+        other => {
+            eprintln!("CLIENT_FAIL open_counter reply {other:?}");
+            return 1;
+        }
+    }
+    let Some(counter) = res.received.into_iter().next() else {
+        eprintln!("CLIENT_FAIL no counter capability attached");
+        return 1;
+    };
+    marker!("CLIENT_RECEIVED_NESTED_CAPABILITY");
+
+    let cres = match counter.call(
+        proto::encode_counter_request(CounterRequest::Increment),
+        CALL_TIMEOUT,
+    ) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL increment: {e}");
+            return 1;
+        }
+    };
+    match proto::decode_counter_response(&cres.payload) {
+        Ok(CounterResponse::Incremented(1)) => {}
+        other => {
+            eprintln!("CLIENT_FAIL increment reply {other:?}");
+            return 1;
+        }
+    }
+    marker!("CLIENT_NESTED_INVOCATION_SUCCEEDED");
+
+    // Signal the host to kill the service; wait for ack.
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL no control channel: {e}");
+            return 1;
+        }
+    };
+    if send_ctrl_wait_ack(&ctrl, proto::ControlMsg::ReadyToKill).is_err() {
+        // Ack may race the kill; failures below are what matter.
+        marker!("CLIENT_CTRL_ACK_RACED");
+    }
+
+    // G11: root capability must now fail explicitly.
+    match root.call(proto::encode_root_request(RootRequest::Ping), CALL_TIMEOUT) {
+        Err(FabError::Closed(_)) => marker!("CLIENT_ROOT_FAILURE_OBSERVED"),
+        Err(e) => {
+            eprintln!("CLIENT_FAIL expected Closed on root, got {e}");
+            return 1;
+        }
+        Ok(_) => {
+            eprintln!("CLIENT_FAIL root still healthy after service death");
+            return 1;
+        }
+    }
+
+    // G12: the returned capability must fail too.
+    match counter.call(
+        proto::encode_counter_request(CounterRequest::Get),
+        CALL_TIMEOUT,
+    ) {
+        Err(FabError::Closed(_)) => marker!("CLIENT_NESTED_FAILURE_OBSERVED"),
+        Err(e) => {
+            eprintln!("CLIENT_FAIL expected Closed on counter, got {e}");
+            return 1;
+        }
+        Ok(_) => {
+            eprintln!("CLIENT_FAIL counter still healthy after service death");
+            return 1;
+        }
+    }
+
+    // Report completion.
+    if ctrl.call(proto::encode_control(proto::ControlMsg::Done), CALL_TIMEOUT).is_err() {
+        marker!("CLIENT_DONE_SIGNAL_UNACKED");
+    } else {
+        marker!("CLIENT_DONE_ACKED");
+    }
+    println!("CLIENT_OK");
+    0
+}
+
+fn send_ctrl_wait_ack(ctrl: &Endpoint, m: proto::ControlMsg) -> Result<(), FabError> {
+    let res = ctrl.call(proto::encode_control(m), Duration::from_secs(5))?;
+    proto::decode_control_ack(&res.payload)?;
+    Ok(())
+}
+
+/// Grant may or may not have arrived before the peer died; either an
+/// explicit Closed failure or a missing grant counts as observed failure.
+fn root_closed(rt: &Runtime, strict: bool) -> i32 {
+    let mut seen = HashSet::new();
+    match claim(rt, &mut seen) {
+        Err(FabError::Timeout) => {
+            if strict {
+                eprintln!("CLIENT_FAIL grant never arrived (strict)");
+                1
+            } else {
+                marker!("CLIENT_GRANT_NEVER_ARRIVED");
+                println!("CLIENT_OK");
+                0
+            }
+        }
+        Err(e) => {
+            marker!("CLIENT_FABRIC_LOST_WAITING_GRANT {e}");
+            println!("CLIENT_OK");
+            0
+        }
+        Ok(id) => {
+            let Some(root) = rt.endpoint_for(id) else {
+                marker!("CLIENT_ROOT_CLOSED_OBSERVED");
+                println!("CLIENT_OK");
+                return 0;
+            };
+            if !strict {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            match root.call(proto::encode_root_request(RootRequest::Ping), CALL_TIMEOUT) {
+                Err(FabError::Closed(_)) => {
+                    marker!("CLIENT_ROOT_CLOSED_OBSERVED");
+                    println!("CLIENT_OK");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("CLIENT_FAIL unexpected error {e}");
+                    1
+                }
+                Ok(_) => {
+                    eprintln!("CLIENT_FAIL root unexpectedly healthy");
+                    1
+                }
+            }
+        }
+    }
+}
+
+/// A request left in flight must resolve as explicit failure, not hang.
+fn outstanding_request(rt: &Runtime) -> i32 {
+    let mut seen = HashSet::new();
+    let Ok(root) = claim_ep(rt, &mut seen) else {
+        eprintln!("CLIENT_FAIL no root");
+        return 1;
+    };
+    let started = Instant::now();
+    match root.call(proto::encode_root_request(RootRequest::Ping), Duration::from_secs(30)) {
+        Err(FabError::Closed(_)) => {
+            marker!(
+                "CLIENT_OUTSTANDING_FAILED_MS {}",
+                started.elapsed().as_millis()
+            );
+            println!("CLIENT_OK");
+            0
+        }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL unexpected {e}");
+            1
+        }
+        Ok(_) => {
+            eprintln!("CLIENT_FAIL outstanding request succeeded after service death");
+            1
+        }
+    }
+}
+
+/// Nested capability used exactly once, THEN the service dies; both caps
+/// must fail (this is scenario F's client side).
+fn kill_after_first_increment(rt: &Runtime) -> i32 {
+    let mut seen = HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL no root: {e}");
+            return 1;
+        }
+    };
+    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL open_counter: {e}");
+            return 1;
+        }
+    };
+    let Some(counter) = res.received.into_iter().next() else {
+        eprintln!("CLIENT_FAIL no counter attached");
+        return 1;
+    };
+    let cres = match counter.call(
+        proto::encode_counter_request(CounterRequest::Increment),
+        CALL_TIMEOUT,
+    ) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL increment: {e}");
+            return 1;
+        }
+    };
+    match proto::decode_counter_response(&cres.payload) {
+        Ok(CounterResponse::Incremented(1)) => {}
+        other => {
+            eprintln!("CLIENT_FAIL increment reply {other:?}");
+            return 1;
+        }
+    }
+    marker!("CLIENT_FIRST_INCREMENT_OK");
+
+    // Tell host to kill; await ack best-effort.
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL no control: {e}");
+            return 1;
+        }
+    };
+    let _ = send_ctrl_wait_ack(&ctrl, proto::ControlMsg::ReadyToKill);
+
+    match root.call(proto::encode_root_request(RootRequest::Ping), CALL_TIMEOUT) {
+        Err(FabError::Closed(_)) => marker!("CLIENT_ROOT_FAILURE_OBSERVED"),
+        _ => {
+            eprintln!("CLIENT_FAIL root not explicitly failed");
+            return 1;
+        }
+    }
+    match counter.call(proto::encode_counter_request(CounterRequest::Get), CALL_TIMEOUT) {
+        Err(FabError::Closed(_)) => marker!("CLIENT_NESTED_FAILURE_OBSERVED"),
+        _ => {
+            eprintln!("CLIENT_FAIL counter not explicitly failed");
+            return 1;
+        }
+    }
+    println!("CLIENT_OK");
+    0
+}
+
+/// Everything succeeds, then signal orderly completion.
+fn graceful_done(rt: &Runtime) -> i32 {
+    let mut seen = HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL no root: {e}");
+            return 1;
+        }
+    };
+    if root
+        .call(proto::encode_root_request(RootRequest::Ping), CALL_TIMEOUT)
+        .is_err()
+    {
+        eprintln!("CLIENT_FAIL ping failed");
+        return 1;
+    }
+    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL open_counter: {e}");
+            return 1;
+        }
+    };
+    let Some(counter) = res.received.into_iter().next() else {
+        eprintln!("CLIENT_FAIL no counter");
+        return 1;
+    };
+    if counter
+        .call(proto::encode_counter_request(CounterRequest::Get), CALL_TIMEOUT)
+        .is_err()
+    {
+        eprintln!("CLIENT_FAIL counter get failed");
+        return 1;
+    }
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL no control: {e}");
+            return 1;
+        }
+    };
+    match send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done) {
+        Ok(()) => {
+            println!("CLIENT_OK");
+            0
+        }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL done signal: {e}");
+            1
+        }
+    }
+}
+
+/// Host-death watchdog: exit 0 iff fabric loss is observed deterministically.
+fn watchdog(rt: &Runtime) -> i32 {
+    let mut seen = HashSet::new();
+    match claim(rt, &mut seen) {
+        Ok(id) => {
+            let Some(root) = rt.endpoint_for(id) else {
+                marker!("CLIENT_FABRIC_LOST_OBSERVED");
+                write_marker_file("client_fabric_lost");
+                println!("CLIENT_OK");
+                return 0;
+            };
+            // Poll until the fabric is gone (bounded).
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if rt.fabric_terminal().is_some() {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    write_marker_file("client_watchdog_timeout");
+                    eprintln!("CLIENT_FAIL never observed fabric loss");
+                    return 1;
+                }
+                let _ = root.call(
+                    proto::encode_root_request(RootRequest::Ping),
+                    Duration::from_millis(200),
+                );
+            }
+        }
+        Err(FabError::FabricLost | FabError::Closed(_)) => {}
+        Err(e) => {
+            eprintln!("CLIENT_FAIL waiting root: {e}");
+            return 1;
+        }
+    }
+    marker!("CLIENT_FABRIC_LOST_OBSERVED");
+    write_marker_file("client_fabric_lost");
+    println!("CLIENT_OK");
+    0
+}
+
+fn write_marker_file(name: &str) {
+    if let Ok(dir) = std::env::var("SEAM_MARKER_DIR") {
+        let p = std::path::Path::new(&dir).join(name);
+        let _ = std::fs::write(p, b"1");
+    }
+}
+
+/// N endpoint create/transfer/close cycles through the real fabric.
+fn churn(rt: &Runtime) -> i32 {
+    let n: usize = std::env::var("SEAM_CHURN_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    let mut seen = HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL no root: {e}");
+            return 1;
+        }
+    };
+    let t0 = Instant::now();
+    for i in 0..n {
+        let res = match root.call(
+            proto::encode_root_request(RootRequest::OpenCounter),
+            Duration::from_secs(20),
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("CLIENT_FAIL churn[{i}]: {e}");
+                return 1;
+            }
+        };
+        let Some(counter) = res.received.into_iter().next() else {
+            eprintln!("CLIENT_FAIL churn[{i}]: no capability");
+            return 1;
+        };
+        // Destroy our side deliberately: conversation retires everywhere.
+        if let Err(e) = counter.close() {
+            eprintln!("CLIENT_FAIL churn[{i}] close: {e}");
+            return 1;
+        }
+    }
+    let ms = t0.elapsed().as_millis();
+    marker!("CHURN_DONE n={n} ms={ms}");
+
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL no control after churn: {e}");
+            return 1;
+        }
+    };
+    if send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done).is_err() {
+        eprintln!("CLIENT_FAIL churn done signal");
+        return 1;
+    }
+    println!("CLIENT_OK");
+    0
+}
+
+/// RTT and transfer-latency measurements (charter §51). Prints PERF lines.
+fn perf(rt: &Runtime) -> i32 {
+    const N: usize = 2000;
+    let mut seen = HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL no root: {e}");
+            return 1;
+        }
+    };
+
+    // Warmup.
+    for _ in 0..100 {
+        if root
+            .call(proto::encode_root_request(RootRequest::Ping), Duration::from_secs(5))
+            .is_err()
+        {
+            eprintln!("CLIENT_FAIL warmup");
+            return 1;
+        }
+    }
+
+    let mut samples = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        if root
+            .call(proto::encode_root_request(RootRequest::Ping), Duration::from_secs(5))
+            .is_err()
+        {
+            eprintln!("CLIENT_FAIL rtt probe");
+            return 1;
+        }
+        samples.push(t.elapsed());
+    }
+    print_perf("root_rtt_us", &samples);
+
+    // Transfer latency: create pair at service + transfer back to us.
+    let mut tsamples = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        let res = match root.call(
+            proto::encode_root_request(RootRequest::OpenCounter),
+            Duration::from_secs(5),
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("CLIENT_FAIL transfer probe: {e}");
+                return 1;
+            }
+        };
+        let Some(counter) = res.received.into_iter().next() else {
+            eprintln!("CLIENT_FAIL transfer probe: no cap");
+            return 1;
+        };
+        tsamples.push(t.elapsed());
+        let _ = counter.close();
+    }
+    print_perf("transfer_roundtrip_us", &tsamples);
+
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(_) => return 1,
+    };
+    if send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done).is_err() {
+        return 1;
+    }
+    println!("CLIENT_OK");
+    0
+}
+
+fn print_perf(name: &str, s: &[Duration]) {
+    let mut v: Vec<u128> = s.iter().map(|d| d.as_micros()).collect();
+    v.sort_unstable();
+    let pct = |p: f64| -> u128 {
+        let idx = (((v.len() as f64) * p).ceil() as usize).saturating_sub(1).min(v.len() - 1);
+        v[idx]
+    };
+    marker!(
+        "PERF {} n={} min={}us p50={}us p95={}us p99={}us max={}us",
+        name,
+        v.len(),
+        v[0],
+        pct(0.50),
+        pct(0.95),
+        pct(0.99),
+        v[v.len() - 1]
+    );
+}
+
+/// Hostile raw peer: valid hello, then an oversized frame. Must be
+/// quarantined by the host without crashing anything.
+fn rawpeer() {
+    let mut tx = std::io::stdout();
+    // Valid handshake so adoption succeeds.
+    let hello = hello_frame();
+    let _ = tx.write_all(&hello);
+    let _ = tx.flush();
+    // Oversized declared length with a small body: decoder must reject
+    // BEFORE allocating attacker-controlled memory.
+    let mut evil = Vec::new();
+    evil.extend_from_slice(&(u32::MAX / 2).to_le_bytes());
+    evil.extend_from_slice(&[0u8; 16]);
+    let _ = tx.write_all(&evil);
+    let _ = tx.flush();
+    // Then a normal-sized frame that must NEVER be processed (we are dead).
+    let _ = tx.write_all(&hello);
+    let _ = tx.flush();
+    // Park until EOF from quarantine. Host waits on child.exit.
+    std::thread::sleep(Duration::from_millis(800));
+}
+
+fn hello_frame() -> Vec<u8> {
+    let f = authority_fabric::frame::Frame::Hello {
+        magic: Limits::default().hello_magic,
+        version: Limits::default().hello_version,
+    };
+    let mut buf = Vec::new();
+    authority_fabric::frame::encode_into(&f, &mut buf);
+    buf
+}
