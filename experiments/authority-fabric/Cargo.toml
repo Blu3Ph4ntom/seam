@@ -1,0 +1,29 @@
+[package]
+name = "authority-fabric"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+default-run = "host"
+
+[lib]
+name = "authority_fabric"
+path = "src/lib.rs"
+
+[[bin]]
+name = "host"
+path = "src/bin/host.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "service"
+path = "src/bin/service.rs"
+
+[dependencies]
+getrandom = "0.3"
+
+[dev-dependencies]
+trybuild = "1"
