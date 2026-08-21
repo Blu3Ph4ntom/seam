@@ -1,0 +1,11 @@
+error[E0599]: no method named `clone` found for struct `Endpoint` in the current scope
+ --> tests/compile-fail/no_clone.rs:6:16
+  |
+6 |     let _ = ep.clone(); //~ ERROR
+  |                ^^^^^
+  |
+help: there is a method `close` with a similar name
+  |
+6 -     let _ = ep.clone(); //~ ERROR
+6 +     let _ = ep.close(); //~ ERROR
+  |

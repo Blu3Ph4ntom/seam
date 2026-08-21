@@ -6,7 +6,7 @@ fn consume(e: Endpoint) {
 
 fn main() {
     let sh = RuntimeInner::__for_tests(Limits::default());
-    let ep = Endpoint::__unchecked(EpId(42), sh);
+    let ep = Endpoint::__unchecked(EpId::from_raw([42; 16]), sh);
     consume(ep);
     let _ = ep.call(vec![1], std::time::Duration::from_secs(1)); //~ ERROR E0382
 }

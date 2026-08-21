@@ -15,7 +15,7 @@ pub mod router;
 
 pub use fabric_error::{Cause, FabError};
 pub use frame::FrameError;
-pub use id::EpId;
+pub use id::{EpId, TransferId};
 pub use limits::Limits;
 pub use peer::{CallResult, Endpoint, Inbound, PeerAccounting, Runtime, RuntimeInner};
 pub use queue::Backlog;

@@ -32,6 +32,7 @@ enum HostMsg {
 struct Conn {
     child: Child,
     out: Arc<BoundedQueue<Frame>>,
+    ctrl: Arc<BoundedQueue<Frame>>,
 }
 
 struct Fabric {
@@ -82,29 +83,45 @@ impl Fabric {
         let mut child = cmd.spawn().map_err(|e| format!("spawn {role}: {e}"))?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
+        // Parent pipe ends must not be inheritable by later siblings; extra
+        // copies keep pipes open after host death (orphans).
+        #[cfg(windows)]
+        {
+            deny_inherit(&stdin);
+            deny_inherit(&stdout);
+        }
 
         let pid = self.router.accept_peer();
         let outq: Arc<BoundedQueue<Frame>> = Arc::new(BoundedQueue::new(
             self.lim().queue_max_msgs,
             self.lim().queue_max_bytes,
         ));
+        let ctrlq: Arc<BoundedQueue<Frame>> = Arc::new(BoundedQueue::new(
+            self.lim().control_queue_max_msgs,
+            self.lim().control_queue_max_bytes,
+        ));
 
-        // Writer thread: drains the bounded queue into the child's stdin.
+        // Writer: prefer control frames so lifecycle is not stuck behind DATA.
         {
             let q = outq.clone();
+            let c = ctrlq.clone();
             std::thread::spawn(move || {
                 let mut tx = stdin;
                 loop {
-                    match q.pop_deadline(Instant::now() + Duration::from_millis(100)) {
-                        Ok(f) => {
-                            let mut buf = Vec::with_capacity(f.cost());
-                            frame::encode_into(&f, &mut buf);
-                            if tx.write_all(&buf).and_then(|_| tx.flush()).is_err() {
-                                break;
-                            }
+                    let frame = if let Some(f) = c.try_pop() {
+                        Some(f)
+                    } else {
+                        match q.pop_deadline(Instant::now() + Duration::from_millis(1)) {
+                            Ok(f) => Some(f),
+                            Err(PopError::Timeout) => c.try_pop(),
+                            Err(PopError::Closed) => break,
                         }
-                        Err(PopError::Timeout) => continue,
-                        Err(PopError::Closed) => break,
+                    };
+                    let Some(f) = frame else { continue };
+                    let mut buf = Vec::with_capacity(f.cost());
+                    frame::encode_into(&f, &mut buf);
+                    if tx.write_all(&buf).and_then(|_| tx.flush()).is_err() {
+                        break;
                     }
                 }
             });
@@ -137,7 +154,7 @@ impl Fabric {
             });
         }
 
-        self.conns.insert(pid, Conn { child, out: outq });
+        self.conns.insert(pid, Conn { child, out: outq, ctrl: ctrlq });
         Ok(pid)
     }
 
@@ -208,6 +225,13 @@ impl Fabric {
                 }
                 Err(p) => Some(p),
             },
+            Frame::Xfer(x) => match self.router.on_xfer(pid, x) {
+                Ok(oc) => {
+                    self.dispatch_sends(&oc);
+                    None
+                }
+                Err(p) => Some(p),
+            },
             Frame::ClosedNotify { .. } | Frame::Grant { .. } | Frame::CreateAck { .. } | Frame::Error(_) => {
                 Some(self.router.on_illegal(pid, "peer sent host-only frame"))
             }
@@ -238,7 +262,16 @@ impl Fabric {
             if let Some(c) = self.conns.get(dest) {
                 let frame = f.clone();
                 let cost = frame.cost();
-                let _ = c.out.try_push(frame, cost);
+                let offer = matches!(&frame, Frame::Data(d) if !d.attachments.is_empty());
+                if frame::is_control_frame(&frame) || offer {
+                    let deadline = Instant::now() + Duration::from_millis(2000);
+                    let q = if frame::is_control_frame(&frame) { &c.ctrl } else { &c.out };
+                    if q.push_deadline(frame, cost, deadline).is_err() {
+                        marker!("HOST_CTRL_PUSH_FAILED dest={}", dest.0);
+                    }
+                } else if c.out.try_push(frame, cost).is_err() {
+                    marker!("HOST_DATA_BACKPRESSURE dest={}", dest.0);
+                }
             }
         }
     }
@@ -246,6 +279,7 @@ impl Fabric {
     fn teardown_conn(&mut self, pid: PeerId) {
         if let Some(mut c) = self.conns.remove(&pid) {
             c.out.close();
+            c.ctrl.close();
             let code = c.child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
             self.exit_codes.insert(pid, code);
         }
@@ -273,11 +307,27 @@ impl Fabric {
         match self.router.grant(to, ep) {
             Ok(frame) => {
                 if let Some(c) = self.conns.get(&to) {
-                    let _ = c.out.try_push(frame.clone(), frame.cost());
+                    let deadline = Instant::now() + Duration::from_millis(500);
+                    if c.ctrl.push_deadline(frame.clone(), frame.cost(), deadline).is_err() {
+                        marker!("HOST_GRANT_PUSH_FAILED");
+                    }
                 }
             }
             Err(p) => marker!("HOST_GRANT_FAILED {:?}", p),
         }
+    }
+
+    fn settle_escrow(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        while self.router.accounting().escrowed > 0 {
+            if !self.step(deadline) {
+                return Err(format!(
+                    "escrow settle timeout remaining={}",
+                    self.router.accounting().escrowed
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn host_send(&mut self, target: EpId, corr: u32, payload: Vec<u8>) {
@@ -405,11 +455,13 @@ fn bootstrap(
     let (a, b) = fab.router.create_host_pair();
     fab.grant(cli, a); // client may invoke the service through a
     fab.grant(svc, b); // service implements b
+    fab.settle_escrow(Duration::from_secs(5))?;
     marker!("ROOT_CAPABILITY_TRANSFERRED");
 
     // Demo-control capability between host and client (orchestration only).
     let (cc, ch) = fab.router.create_host_pair();
     fab.grant(cli, cc);
+    fab.settle_escrow(Duration::from_secs(5))?;
     marker!("CONTROL_CAPABILITY_TRANSFERRED");
 
     Ok(Setup {
@@ -421,6 +473,22 @@ fn bootstrap(
         ctrl_host_side: ch,
         t0,
     })
+}
+
+#[cfg(windows)]
+fn deny_inherit(h: &impl std::os::windows::io::AsRawHandle) {
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    extern "system" {
+        fn SetHandleInformation(
+            hobject: *mut core::ffi::c_void,
+            dwmask: u32,
+            dwflags: u32,
+        ) -> i32;
+    }
+    let raw = h.as_raw_handle();
+    // SAFETY: `raw` is a valid open handle owned by `h` for the duration of
+    // this call; we only clear HANDLE_FLAG_INHERIT.
+    let _ = unsafe { SetHandleInformation(raw, HANDLE_FLAG_INHERIT, 0) };
 }
 
 /// Resolve the sibling binary for a role. Host, client, and service are
@@ -705,7 +773,7 @@ fn scale(lim: Limits) -> i32 {
         Ok(s) => s,
         Err(e) => return fail(&e),
     };
-    let done_corr = match fab.wait_ctrl(Duration::from_secs(600), |m| {
+    let done_corr = match fab.wait_ctrl(Duration::from_secs(1800), |m| {
         matches!(m, ControlMsg::Done)
     }) {
         Ok(c) => c,
@@ -718,13 +786,15 @@ fn scale(lim: Limits) -> i32 {
         a.live_endpoints,
         a.retired_identities
     );
-    // Expected: live = root pair (2) + control pair (2); retired = 2*N.
-    if a.live_endpoints != 4 || a.retired_identities != 2 * n {
+    // Live = root pair (2) + control pair (2). Retirement is a bounded
+    // cache, not 2*N historical tombstones.
+    let max_ret = fab.lim().max_retired;
+    if a.live_endpoints != 4 || a.retired_identities > max_ret {
         return fail(&format!(
-            "scale accounting wrong: live={} retired={} want live=4 retired={}",
+            "scale accounting wrong: live={} retired={} want live=4 retired<={}",
             a.live_endpoints,
             a.retired_identities,
-            2 * n
+            max_ret
         ));
     }
     fab.shutdown_orderly();

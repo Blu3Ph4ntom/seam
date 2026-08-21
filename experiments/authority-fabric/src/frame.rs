@@ -11,18 +11,21 @@
 //!
 //! Kinds:
 //! - `Hello        (1)`: u16 magic | u16 version                      child -> host once
-//! - `Data         (2)`: u64 target | u32 corr | u8 natt |
-//!                       natt*(u64 id | u64 partner) | payload bytes  both directions
-//! - `Close        (3)`: u64 target                                   peer -> host
-//! - `ClosedNotify (4)`: u16 count | count*(u64 id | u8 cause)       host -> peer only
-//! - `Grant        (5)`: u64 ep | u64 partner                         host -> peer only
-//! - `Create       (6)`: u64 impl_ep | u64 transferable_ep            peer -> host only
-//! - `Shutdown     (7)`: (empty)                                      either direction
+//! - `Data         (2)`: 16B target | u32 corr | u8 natt |
+//!                       natt*(16B tid | 16B id | 16B partner) | payload
+//! - `Close        (3)`: 16B target
+//! - `ClosedNotify (4)`: u16 count | count*(16B id | u8 cause)
+//! - `Grant        (5)`: 16B ep | 16B partner | 16B tid               host -> peer (offer)
+//! - `Create       (6)`: empty
+//! - `Shutdown     (7)`: empty
+//! - `CreateAck    (8)`: 16B impl | 16B transferable                  host -> peer
+//! - `Error        (9)`: u8 code
+//! - `Xfer        (10)`: u8 sub | 16B tid | optional ids              transfer control
 
 use std::io::Read;
 
 use crate::fabric_error::Cause;
-use crate::id::EpId;
+use crate::id::{EpId, TransferId};
 use crate::limits::Limits;
 
 pub const KIND_HELLO: u8 = 1;
@@ -34,6 +37,20 @@ pub const KIND_CREATE: u8 = 6;
 pub const KIND_SHUTDOWN: u8 = 7;
 pub const KIND_CREATE_ACK: u8 = 8;
 pub const KIND_ERROR: u8 = 9;
+pub const KIND_XFER: u8 = 10;
+
+pub const XFER_ACCEPT: u8 = 1;
+pub const XFER_REJECT: u8 = 2;
+pub const XFER_COMMIT: u8 = 3;
+pub const XFER_COMMITTED: u8 = 4;
+pub const XFER_ABORT: u8 = 5;
+pub const XFER_STATUS: u8 = 6;
+pub const XFER_STATUS_ACK: u8 = 7;
+
+pub const XFER_ST_PENDING: u8 = 0;
+pub const XFER_ST_COMMITTED: u8 = 1;
+pub const XFER_ST_ABORTED: u8 = 2;
+pub const XFER_ST_UNKNOWN: u8 = 3;
 
 /// Error codes carried by `Frame::Error`.
 pub const ERR_CAPACITY: u8 = 1;
@@ -44,6 +61,21 @@ pub fn is_host_only_kind(kind: u8) -> bool {
     matches!(
         kind,
         KIND_CLOSED_NOTIFY | KIND_GRANT | KIND_CREATE_ACK | KIND_ERROR
+    )
+}
+
+/// True for lifecycle/transfer frames that must not be silently dropped.
+pub fn is_control_frame(f: &Frame) -> bool {
+    matches!(
+        f,
+        Frame::ClosedNotify { .. }
+            | Frame::Grant { .. }
+            | Frame::CreateAck { .. }
+            | Frame::Error(_)
+            | Frame::Shutdown
+            | Frame::Xfer(_)
+            | Frame::Close { .. }
+            | Frame::Create
     )
 }
 
@@ -59,8 +91,20 @@ pub struct DataInner {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attachment {
+    pub tid: TransferId,
     pub id: EpId,
     pub partner: EpId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum XferMsg {
+    Accept { tid: TransferId },
+    Reject { tid: TransferId },
+    Commit { tid: TransferId, ep: EpId, partner: EpId },
+    Committed { tid: TransferId },
+    Abort { tid: TransferId },
+    Status { tid: TransferId },
+    StatusAck { tid: TransferId, status: u8 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,11 +113,12 @@ pub enum Frame {
     Data(DataInner),
     Close { target: EpId },
     ClosedNotify { entries: Vec<(EpId, Cause)> },
-    Grant { ep: EpId, partner: EpId },
+    Grant { ep: EpId, partner: EpId, tid: TransferId },
     Create,
     CreateAck { impl_ep: EpId, transferable_ep: EpId },
     Error(u8),
     Shutdown,
+    Xfer(XferMsg),
 }
 
 impl Frame {
@@ -88,6 +133,7 @@ impl Frame {
             Frame::CreateAck { .. } => KIND_CREATE_ACK,
             Frame::Error(_) => KIND_ERROR,
             Frame::Shutdown => KIND_SHUTDOWN,
+            Frame::Xfer(_) => KIND_XFER,
         }
     }
 
@@ -95,13 +141,17 @@ impl Frame {
     pub fn cost(&self) -> usize {
         let body = match self {
             Frame::Hello { .. } => 5,
-            Frame::Data(d) => 8 + 4 + 1 + d.attachments.len() * 16 + d.payload.len(),
-            Frame::Close { .. } => 8,
-            Frame::ClosedNotify { entries } => 2 + entries.len() * 9,
-            Frame::Grant { .. } | Frame::CreateAck { .. } => 16,
+            Frame::Data(d) => 16 + 4 + 1 + d.attachments.len() * 48 + d.payload.len(),
+            Frame::Close { .. } => 16,
+            Frame::ClosedNotify { entries } => 2 + entries.len() * 17,
+            Frame::Grant { .. } => 48,
+            Frame::CreateAck { .. } => 32,
             Frame::Create => 0,
             Frame::Error(_) => 1,
             Frame::Shutdown => 0,
+            Frame::Xfer(XferMsg::Commit { .. }) => 1 + 16 + 32,
+            Frame::Xfer(XferMsg::StatusAck { .. }) => 1 + 16 + 1,
+            Frame::Xfer(_) => 1 + 16,
         };
         4 + 1 + body // length prefix + kind byte + body
     }
@@ -141,8 +191,11 @@ fn put_u16(out: &mut Vec<u8>, v: u16) {
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn put_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
+fn put_ep(out: &mut Vec<u8>, id: EpId) {
+    out.extend_from_slice(&id.0);
+}
+fn put_tid(out: &mut Vec<u8>, id: TransferId) {
+    out.extend_from_slice(&id.0);
 }
 
 struct Cursor<'a> {
@@ -171,8 +224,17 @@ impl<'a> Cursor<'a> {
     fn u32v(&mut self) -> Result<u32, FrameError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn u64v(&mut self) -> Result<u64, FrameError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    fn epid(&mut self) -> Result<EpId, FrameError> {
+        let s = self.take(16)?;
+        let mut b = [0u8; 16];
+        b.copy_from_slice(s);
+        Ok(EpId(b))
+    }
+    fn tid(&mut self) -> Result<TransferId, FrameError> {
+        let s = self.take(16)?;
+        let mut b = [0u8; 16];
+        b.copy_from_slice(s);
+        Ok(TransferId(b))
     }
     fn rest(&mut self) -> &'a [u8] {
         let s = &self.b[self.pos..];
@@ -199,39 +261,74 @@ pub fn encode_into(frame: &Frame, out: &mut Vec<u8>) {
             put_u16(out, *version);
         }
         Frame::Data(d) => {
-            put_u64(out, d.target.0);
+            put_ep(out, d.target);
             put_u32(out, d.corr);
             out.push(d.attachments.len() as u8);
             for a in &d.attachments {
-                put_u64(out, a.id.0);
-                put_u64(out, a.partner.0);
+                put_tid(out, a.tid);
+                put_ep(out, a.id);
+                put_ep(out, a.partner);
             }
             out.extend_from_slice(&d.payload);
         }
-        Frame::Close { target } => put_u64(out, target.0),
+        Frame::Close { target } => put_ep(out, *target),
         Frame::ClosedNotify { entries } => {
             put_u16(out, entries.len() as u16);
             for (id, cause) in entries {
-                put_u64(out, id.0);
+                put_ep(out, *id);
                 out.push(match cause {
                     Cause::Graceful => 0,
                     Cause::PeerLost => 1,
                 });
             }
         }
-        Frame::Grant { ep, partner } => {
-            put_u64(out, ep.0);
-            put_u64(out, partner.0);
+        Frame::Grant { ep, partner, tid } => {
+            put_ep(out, *ep);
+            put_ep(out, *partner);
+            put_tid(out, *tid);
         }
         Frame::Create => {}
         Frame::CreateAck { impl_ep, transferable_ep } => {
-            put_u64(out, impl_ep.0);
-            put_u64(out, transferable_ep.0);
+            put_ep(out, *impl_ep);
+            put_ep(out, *transferable_ep);
         }
         Frame::Error(code) => {
             out.push(*code);
         }
         Frame::Shutdown => {}
+        Frame::Xfer(x) => match x {
+            XferMsg::Accept { tid } => {
+                out.push(XFER_ACCEPT);
+                put_tid(out, *tid);
+            }
+            XferMsg::Reject { tid } => {
+                out.push(XFER_REJECT);
+                put_tid(out, *tid);
+            }
+            XferMsg::Commit { tid, ep, partner } => {
+                out.push(XFER_COMMIT);
+                put_tid(out, *tid);
+                put_ep(out, *ep);
+                put_ep(out, *partner);
+            }
+            XferMsg::Committed { tid } => {
+                out.push(XFER_COMMITTED);
+                put_tid(out, *tid);
+            }
+            XferMsg::Abort { tid } => {
+                out.push(XFER_ABORT);
+                put_tid(out, *tid);
+            }
+            XferMsg::Status { tid } => {
+                out.push(XFER_STATUS);
+                put_tid(out, *tid);
+            }
+            XferMsg::StatusAck { tid, status } => {
+                out.push(XFER_STATUS_ACK);
+                put_tid(out, *tid);
+                out.push(*status);
+            }
+        },
     }
     let len = (out.len() - start - 4) as u32;
     out[start..start + 4].copy_from_slice(&len.to_le_bytes());
@@ -248,7 +345,7 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
             Ok(Frame::Hello { magic, version })
         }
         KIND_DATA => {
-            let target = EpId(c.u64v()?);
+            let target = c.epid()?;
             let corr = c.u32v()?;
             let natt = c.u8v()? as usize;
             if natt > lim.max_attachments {
@@ -256,9 +353,10 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
             }
             let mut attachments = Vec::with_capacity(natt);
             for _ in 0..natt {
-                let id = EpId(c.u64v()?);
-                let partner = EpId(c.u64v()?);
-                attachments.push(Attachment { id, partner });
+                let tid = c.tid()?;
+                let id = c.epid()?;
+                let partner = c.epid()?;
+                attachments.push(Attachment { tid, id, partner });
             }
             for i in 0..attachments.len() {
                 for j in (i + 1)..attachments.len() {
@@ -270,7 +368,7 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
             let payload = c.rest().to_vec();
             Ok(Frame::Data(DataInner { target, corr, attachments, payload }))
         }
-        KIND_CLOSE => Ok(Frame::Close { target: EpId(c.u64v()?) }),
+        KIND_CLOSE => Ok(Frame::Close { target: c.epid()? }),
         KIND_CLOSED_NOTIFY => {
             let count = c.u16v()? as usize;
             if count > lim.max_attachments * 256 {
@@ -278,7 +376,7 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
             }
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
-                let id = EpId(c.u64v()?);
+                let id = c.epid()?;
                 let cause = match c.u8v()? {
                     0 => Cause::Graceful,
                     _ => Cause::PeerLost,
@@ -288,14 +386,15 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
             Ok(Frame::ClosedNotify { entries })
         }
         KIND_GRANT => {
-            let ep = EpId(c.u64v()?);
-            let partner = EpId(c.u64v()?);
-            Ok(Frame::Grant { ep, partner })
+            let ep = c.epid()?;
+            let partner = c.epid()?;
+            let tid = c.tid()?;
+            Ok(Frame::Grant { ep, partner, tid })
         }
         KIND_CREATE => Ok(Frame::Create),
         KIND_CREATE_ACK => {
-            let impl_ep = EpId(c.u64v()?);
-            let transferable_ep = EpId(c.u64v()?);
+            let impl_ep = c.epid()?;
+            let transferable_ep = c.epid()?;
             Ok(Frame::CreateAck { impl_ep, transferable_ep })
         }
         KIND_ERROR => {
@@ -303,6 +402,28 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
             Ok(Frame::Error(code))
         }
         KIND_SHUTDOWN => Ok(Frame::Shutdown),
+        KIND_XFER => {
+            let sub = c.u8v()?;
+            let tid = c.tid()?;
+            let msg = match sub {
+                XFER_ACCEPT => XferMsg::Accept { tid },
+                XFER_REJECT => XferMsg::Reject { tid },
+                XFER_COMMIT => XferMsg::Commit {
+                    tid,
+                    ep: c.epid()?,
+                    partner: c.epid()?,
+                },
+                XFER_COMMITTED => XferMsg::Committed { tid },
+                XFER_ABORT => XferMsg::Abort { tid },
+                XFER_STATUS => XferMsg::Status { tid },
+                XFER_STATUS_ACK => XferMsg::StatusAck {
+                    tid,
+                    status: c.u8v()?,
+                },
+                _ => return Err(FrameError::UnknownKind(KIND_XFER)),
+            };
+            Ok(Frame::Xfer(msg))
+        }
         other => Err(FrameError::UnknownKind(other)),
     }
 }
@@ -358,26 +479,40 @@ mod tests {
         Limits { max_frame_body: 128, ..Limits::default() }
     }
 
+    fn ep(n: u8) -> EpId {
+        let mut b = [0u8; 16];
+        b[15] = n;
+        EpId(b)
+    }
+    fn tid(n: u8) -> TransferId {
+        let mut b = [0u8; 16];
+        b[15] = n;
+        TransferId(b)
+    }
+
     #[test]
     fn roundtrip_all_kinds() {
         let l = lim();
         let frames = vec![
-            Frame::Hello { magic: 0x5345, version: 1 },
+            Frame::Hello { magic: 0x5345, version: 2 },
             Frame::Data(DataInner {
-                target: EpId(7),
+                target: ep(7),
                 corr: 9,
-                attachments: vec![Attachment { id: EpId(100), partner: EpId(101) }],
+                attachments: vec![Attachment { tid: tid(1), id: ep(100), partner: ep(101) }],
                 payload: vec![1, 2, 3],
             }),
-            Frame::Close { target: EpId(7) },
+            Frame::Close { target: ep(7) },
             Frame::ClosedNotify {
-                entries: vec![(EpId(1), Cause::Graceful), (EpId(2), Cause::PeerLost)],
+                entries: vec![(ep(1), Cause::Graceful), (ep(2), Cause::PeerLost)],
             },
-            Frame::Grant { ep: EpId(10), partner: EpId(11) },
+            Frame::Grant { ep: ep(10), partner: ep(11), tid: tid(3) },
             Frame::Create,
-            Frame::CreateAck { impl_ep: EpId(12), transferable_ep: EpId(13) },
+            Frame::CreateAck { impl_ep: ep(12), transferable_ep: ep(13) },
             Frame::Error(ERR_CAPACITY),
             Frame::Shutdown,
+            Frame::Xfer(XferMsg::Accept { tid: tid(4) }),
+            Frame::Xfer(XferMsg::Commit { tid: tid(5), ep: ep(6), partner: ep(7) }),
+            Frame::Xfer(XferMsg::StatusAck { tid: tid(8), status: XFER_ST_COMMITTED }),
         ];
         for f in frames {
             let buf = encode(&f);
@@ -439,17 +574,22 @@ mod tests {
 
     #[test]
     fn attach_count_over_limit_rejected() {
-        let l = Limits { max_attachments: 2, ..lim() };
+        let l = Limits { max_attachments: 2, max_frame_body: 4096, ..lim() };
         let mut buf = Vec::new();
-        let body_len = 8 + 4 + 1 + 3 * 16;
+        let body_len = 16 + 4 + 1 + 3 * 48;
         buf.extend_from_slice(&((1 + body_len) as u32).to_le_bytes());
         buf.push(KIND_DATA);
-        buf.extend_from_slice(&7u64.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 15]);
+        buf.push(7);
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.push(3); // declares 3 > limit 2
-        for i in 0..3u64 {
-            buf.extend_from_slice(&i.to_le_bytes());
-            buf.extend_from_slice(&(i + 50).to_le_bytes());
+        for i in 0..3u8 {
+            buf.extend_from_slice(&[0u8; 15]);
+            buf.push(i); // tid
+            buf.extend_from_slice(&[0u8; 15]);
+            buf.push(i); // id
+            buf.extend_from_slice(&[0u8; 15]);
+            buf.push(i.saturating_add(50)); // partner
         }
         assert_eq!(
             decode(&buf, &l),
@@ -461,15 +601,19 @@ mod tests {
     fn duplicate_attachment_rejected() {
         let l = lim();
         let mut buf = Vec::new();
-        let body_len = 8 + 4 + 1 + 2 * 16;
+        let body_len = 16 + 4 + 1 + 2 * 48;
         buf.extend_from_slice(&((1 + body_len) as u32).to_le_bytes());
         buf.push(KIND_DATA);
-        buf.extend_from_slice(&7u64.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 15]);
+        buf.push(7);
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.push(2);
         for _ in 0..2 {
-            buf.extend_from_slice(&99u64.to_le_bytes());
-            buf.extend_from_slice(&100u64.to_le_bytes());
+            buf.extend_from_slice(&[0u8; 16]); // tid
+            buf.extend_from_slice(&[0u8; 15]);
+            buf.push(99); // duplicate id
+            buf.extend_from_slice(&[0u8; 15]);
+            buf.push(100);
         }
         assert_eq!(decode(&buf, &l), Err(FrameError::DuplicateAttachment));
     }

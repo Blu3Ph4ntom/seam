@@ -41,6 +41,8 @@ fn main() {
     };
 
     let mut counters: HashMap<EpId, u64> = HashMap::new();
+    // RAII: keep implementation-side handles alive; dropping them would Close.
+    let mut held: Vec<Endpoint> = Vec::new();
 
     loop {
         let req: Inbound = match rt.wait_inbound(Duration::from_secs(600)) {
@@ -74,8 +76,7 @@ fn main() {
                                 proto::encode_root_response(RootResponse::Counter),
                                 vec![transferable],
                             );
-                            // `imp` stays here: it IS the implementation.
-                            let _: Endpoint = imp;
+                            held.push(imp);
                         }
                         Err(e) => {
                             eprintln!("SERVICE_FAIL create_endpoint: {e}");

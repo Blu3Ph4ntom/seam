@@ -16,9 +16,11 @@
 use std::collections::HashMap;
 
 use crate::fabric_error::Cause;
-use crate::frame::{self, DataInner, Frame};
-use crate::id::{fresh_id, EpId};
-use crate::id::IdSpace;
+use crate::frame::{
+    self, DataInner, Frame, XferMsg, XFER_ST_ABORTED, XFER_ST_COMMITTED, XFER_ST_PENDING,
+    XFER_ST_UNKNOWN,
+};
+use crate::id::{fresh_id, fresh_transfer_id, BoundedTombstones, EpId, IdSpace, TransferId, TransferSpace};
 use crate::limits::Limits;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -28,6 +30,7 @@ pub struct PeerId(pub u32);
 pub enum Holder {
     Peer(PeerId),
     Host,
+    Escrow(TransferId),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -67,13 +70,45 @@ pub enum HostEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Poison(pub &'static str);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XferPhase {
+    Offered,
+    Committed,
+    Aborted,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct XferRec {
+    pub tid: TransferId,
+    pub ep: EpId,
+    pub partner: EpId,
+    pub sender: PeerId,
+    pub dest: PeerId,
+    /// Where authority returns on pre-commit abort.
+    pub restore: Holder,
+    pub phase: XferPhase,
+}
+
+/// Test-only delivery faults. Never used on the production path unless set.
+#[derive(Clone, Debug, Default)]
+pub struct Inject {
+    pub drop_commit: bool,
+    pub drop_committed: bool,
+    pub drop_abort: bool,
+    pub drop_offer: bool,
+}
+
 pub struct Router {
     lim: Limits,
     peers: HashMap<PeerId, bool>, // PeerId -> hello_completed
     next_peer_raw: u32,
     eps: HashMap<EpId, EpEntry>,
-    retired: HashMap<EpId, Cause>,
+    retired: BoundedTombstones<EpId>,
+    xfers: HashMap<TransferId, XferRec>,
+    xfer_done: BoundedTombstones<TransferId>,
     host_events: Vec<HostEvent>,
+    pub inject: Inject,
+    collisions: u64,
 }
 
 /// State accounting snapshot (test-only introspection; see gate G16).
@@ -83,17 +118,23 @@ pub struct Accounting {
     pub live_endpoints: usize,
     pub retired_identities: usize,
     pub host_held: usize,
+    pub pending_transfers: usize,
+    pub escrowed: usize,
 }
 
 impl Router {
     pub fn new(lim: Limits) -> Self {
         Router {
+            retired: BoundedTombstones::new(lim.max_retired),
+            xfer_done: BoundedTombstones::new(lim.max_retired),
             lim,
             peers: HashMap::new(),
             next_peer_raw: 0,
             eps: HashMap::new(),
-            retired: HashMap::new(),
+            xfers: HashMap::new(),
             host_events: Vec::new(),
+            inject: Inject::default(),
+            collisions: 0,
         }
     }
 
@@ -115,17 +156,37 @@ impl Router {
                 .values()
                 .filter(|e| !e.closed && e.holder == Holder::Host)
                 .count(),
+            pending_transfers: self.xfers.values().filter(|x| x.phase == XferPhase::Offered).count(),
+            escrowed: self
+                .eps
+                .values()
+                .filter(|e| !e.closed && matches!(e.holder, Holder::Escrow(_)))
+                .count(),
         }
     }
 
+    pub fn collisions(&self) -> u64 {
+        self.collisions
+    }
+
     fn taken_ids(&self) -> impl IdSpace + '_ {
-        struct Both<'a>(&'a HashMap<EpId, EpEntry>, &'a HashMap<EpId, Cause>);
+        struct Both<'a>(&'a HashMap<EpId, EpEntry>, &'a BoundedTombstones<EpId>);
         impl IdSpace for Both<'_> {
-            fn contains(&self, v: u64) -> bool {
-                self.0.contains_key(&EpId(v)) || self.1.contains_key(&EpId(v))
+            fn contains(&self, id: EpId) -> bool {
+                self.0.contains_key(&id) || self.1.contains(id)
             }
         }
         Both(&self.eps, &self.retired)
+    }
+
+    fn taken_tids(&self) -> impl TransferSpace + '_ {
+        struct T<'a>(&'a HashMap<TransferId, XferRec>, &'a BoundedTombstones<TransferId>);
+        impl TransferSpace for T<'_> {
+            fn contains(&self, id: TransferId) -> bool {
+                self.0.contains_key(&id) || self.1.contains(id)
+            }
+        }
+        T(&self.xfers, &self.xfer_done)
     }
 
     pub fn accept_peer(&mut self) -> PeerId {
@@ -153,8 +214,15 @@ impl Router {
         self.alloc_pair(Holder::Host)
     }
 
-    /// Host hands one previously host-held endpoint to a peer.
+    /// Host offers a previously host-held endpoint to a peer. Authority
+    /// moves to escrow until the peer ACCEPT+COMMIT; it is not usable by
+    /// the recipient before commit, and not silently lost on push failure
+    /// (the IO glue must report delivery outcome).
     pub fn grant(&mut self, to: PeerId, ep: EpId) -> Result<Frame, Poison> {
+        if self.xfers.len() >= self.lim.max_pending_transfers {
+            return Err(Poison("pending transfer table full"));
+        }
+        let tid = fresh_transfer_id(&self.taken_tids());
         let entry = self
             .eps
             .get_mut(&ep)
@@ -163,9 +231,21 @@ impl Router {
         if entry.holder != Holder::Host {
             return Err(Poison("grant of endpoint not held by host"));
         }
-        entry.holder = Holder::Peer(to);
         let partner = entry.partner;
-        Ok(Frame::Grant { ep, partner })
+        entry.holder = Holder::Escrow(tid);
+        self.xfers.insert(
+            tid,
+            XferRec {
+                tid,
+                ep,
+                partner,
+                sender: to,
+                dest: to,
+                restore: Holder::Host,
+                phase: XferPhase::Offered,
+            },
+        );
+        Ok(Frame::Grant { ep, partner, tid })
     }
 
     /// Mark both ends closed + retired. Returns the surviving partner's
@@ -182,6 +262,8 @@ impl Router {
         self.eps.get_mut(&partner).unwrap().closed = true;
         self.retired.insert(side, cause);
         self.retired.insert(partner, cause);
+        self.eps.remove(&side);
+        self.eps.remove(&partner);
         Some((partner, partner_entry))
     }
 
@@ -191,7 +273,7 @@ impl Router {
         // Err(Err(p)) => quarantine.
         match self.eps.get(&ep) {
             None => {
-                if self.retired.contains_key(&ep) {
+                if self.retired.contains(ep) {
                     Err(Ok(()))
                 } else {
                     Err(Err(Poison("unknown endpoint identity")))
@@ -200,7 +282,7 @@ impl Router {
             Some(e) if e.closed => Err(Ok(())),
             Some(e) => {
                 if e.holder != Holder::Peer(from) {
-                    // Held by another peer or by the host: forging/replay.
+                    // Held by another peer, host, or escrow: forging/replay.
                     Err(Err(Poison("identity not held by sender")))
                 } else {
                     Ok(e)
@@ -233,7 +315,7 @@ impl Router {
             Ok(e) => *e,
             Err(Ok(())) => {
                 // Stale-but-known: soft reject with corrective notify.
-                let cause = self.retired.get(&f.target).copied().unwrap_or(Cause::Graceful);
+                let cause = self.retired.get(f.target).unwrap_or(Cause::Graceful);
                 let mut out = RouteOutcome::default();
                 out.send.push((
                     from,
@@ -258,7 +340,7 @@ impl Router {
                 Err(Ok(())) => {
                     // Stale attached identity: reject the frame softly and
                     // tell the sender that capability is gone.
-                    let cause = self.retired.get(&att.id).copied().unwrap_or(Cause::Graceful);
+                    let cause = self.retired.get(att.id).unwrap_or(Cause::Graceful);
                     let mut out = RouteOutcome::default();
                     out.send.push((from, Frame::ClosedNotify { entries: vec![(att.id, cause)] }));
                     return Ok(out);
@@ -271,30 +353,64 @@ impl Router {
                 return Err(Poison("attachment partner metadata contradicts fabric"));
             }
         }
-        // Reassign every attached identity to the message recipient.
-        for att in &attachments {
-            self.eps.get_mut(&att.id).unwrap().holder = recipient;
-        }
-
-        let mut out = RouteOutcome::default();
-        match recipient {
-            Holder::Peer(dest) => {
-                out.send.push((dest, Frame::Data(DataInner {
-                    target: f.target,
-                    corr: f.corr,
-                    attachments,
-                    payload: f.payload,
-                })));
-            }
+        let dest_peer = match recipient {
+            Holder::Peer(p) => p,
             Holder::Host => {
+                if !attachments.is_empty() {
+                    return Err(Poison("cannot escrow-transfer to host-held partner"));
+                }
+                let mut out = RouteOutcome::default();
                 out.to_host.push(HostDelivery {
                     from,
                     target: f.target,
                     corr: f.corr,
                     payload: f.payload,
                 });
+                return Ok(out);
             }
+            Holder::Escrow(_) => return Err(Poison("conversation partner is in escrow")),
+        };
+
+        if attachments.len() + self.xfers.len() > self.lim.max_pending_transfers {
+            // Resource: abort before commit. Sender still owns (we have not
+            // escrowed yet). Surface as ERROR capacity.
+            let mut out = RouteOutcome::default();
+            out.send.push((from, Frame::Error(crate::frame::ERR_CAPACITY)));
+            return Ok(out);
         }
+
+        for att in &attachments {
+            if self.taken_tids().contains(att.tid) {
+                return Err(Poison("duplicate or reused transfer id"));
+            }
+            self.eps.get_mut(&att.id).unwrap().holder = Holder::Escrow(att.tid);
+            self.xfers.insert(
+                att.tid,
+                XferRec {
+                    tid: att.tid,
+                    ep: att.id,
+                    partner: att.partner,
+                    sender: from,
+                    dest: dest_peer,
+                    restore: Holder::Peer(from),
+                    phase: XferPhase::Offered,
+                },
+            );
+        }
+
+        let mut out = RouteOutcome::default();
+        if self.inject.drop_offer {
+            return Ok(out);
+        }
+        out.send.push((
+            dest_peer,
+            Frame::Data(DataInner {
+                target: f.target,
+                corr: f.corr,
+                attachments,
+                payload: f.payload,
+            }),
+        ));
         Ok(out)
     }
 
@@ -336,7 +452,7 @@ impl Router {
         match self.require_owner(from, target) {
             Ok(_) => {}
             Err(Ok(())) => {
-                let cause = self.retired.get(&target).copied().unwrap_or(Cause::Graceful);
+                let cause = self.retired.get(target).unwrap_or(Cause::Graceful);
                 let mut out = RouteOutcome::default();
                 out.send.push((from, Frame::ClosedNotify { entries: vec![(target, cause)] }));
                 return Ok(out);
@@ -353,6 +469,7 @@ impl Router {
                 self.host_events
                     .push(HostEvent::EndpointClosed { ep: surviving, cause: Cause::Graceful });
             }
+            Holder::Escrow(_) => {}
         }
         Ok(out)
     }
@@ -392,6 +509,29 @@ impl Router {
             .filter(|(_, e)| !e.closed && e.holder == Holder::Peer(p))
             .map(|(k, _)| *k)
             .collect();
+        let pending: Vec<TransferId> = self
+            .xfers
+            .values()
+            .filter(|x| x.phase == XferPhase::Offered && (x.sender == p || x.dest == p))
+            .map(|x| x.tid)
+            .collect();
+        for tid in pending {
+            if let Some(x) = self.xfers.get(&tid).copied() {
+                if x.sender == p {
+                    // T1/T2: sender died; close the escrowed conversation.
+                    if let Some(e) = self.eps.get(&x.ep) {
+                        if !e.closed {
+                            let _ = self.close_conversation(x.ep, cause);
+                        }
+                    }
+                    self.finish_xfer(tid, XferPhase::Aborted);
+                } else {
+                    // T3/T4/T5: dest died pre-commit; restore to sender.
+                    let extra = self.xfer_abort_inner(tid, "recipient lost").unwrap_or_default();
+                    out.send.extend(extra.send);
+                }
+            }
+        }
         for side in touched {
             if let Some((surviving, pe)) = self.close_conversation(side, cause) {
                 match pe.holder {
@@ -407,6 +547,7 @@ impl Router {
                     Holder::Host => {
                         self.host_events.push(HostEvent::EndpointClosed { ep: surviving, cause });
                     }
+                    Holder::Escrow(_) => {}
                 }
             }
         }
@@ -434,18 +575,209 @@ impl Router {
     }
 
     pub fn is_retired(&self, ep: EpId) -> bool {
-        self.retired.contains_key(&ep)
+        self.retired.contains(ep)
+    }
+
+    pub fn xfer(&self, tid: TransferId) -> Option<XferRec> {
+        self.xfers.get(&tid).copied()
+    }
+
+    pub fn xfer_status(&self, tid: TransferId) -> u8 {
+        if let Some(x) = self.xfers.get(&tid) {
+            return match x.phase {
+                XferPhase::Offered => XFER_ST_PENDING,
+                XferPhase::Committed => XFER_ST_COMMITTED,
+                XferPhase::Aborted => XFER_ST_ABORTED,
+            };
+        }
+        match self.xfer_done.get(tid) {
+            Some(Cause::PeerLost) => XFER_ST_COMMITTED,
+            Some(Cause::Graceful) => XFER_ST_ABORTED,
+            None => XFER_ST_UNKNOWN,
+        }
+    }
+
+    fn finish_xfer(&mut self, tid: TransferId, phase: XferPhase) {
+        self.xfers.remove(&tid);
+        let c = if phase == XferPhase::Committed {
+            Cause::PeerLost
+        } else {
+            Cause::Graceful
+        };
+        self.xfer_done.insert(tid, c);
+    }
+
+    fn dest_live_count(&self, dest: PeerId) -> usize {
+        self.eps
+            .values()
+            .filter(|e| !e.closed && e.holder == Holder::Peer(dest))
+            .count()
+    }
+
+    /// Authority conservation: each live id has exactly one holder class.
+    pub fn authority_mass_ok(&self) -> bool {
+        for (id, e) in &self.eps {
+            if e.closed {
+                return false;
+            }
+            let usable_peer = matches!(e.holder, Holder::Peer(_));
+            let escrow = matches!(e.holder, Holder::Escrow(_));
+            let host = e.holder == Holder::Host;
+            let n = usize::from(usable_peer) + usize::from(escrow) + usize::from(host);
+            if n != 1 {
+                return false;
+            }
+            if escrow {
+                let Holder::Escrow(tid) = e.holder else { return false };
+                match self.xfers.get(&tid) {
+                    Some(x) if x.ep == *id && x.phase == XferPhase::Offered => {}
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    pub fn on_xfer(&mut self, from: PeerId, msg: XferMsg) -> Result<RouteOutcome, Poison> {
+        if !*self.peers.get(&from).ok_or(Poison("frame from unknown peer"))? {
+            return Err(Poison("traffic before hello"));
+        }
+        match msg {
+            XferMsg::Accept { tid } => self.xfer_accept(from, tid),
+            XferMsg::Reject { tid } => self.xfer_reject(from, tid, "rejected by recipient"),
+            XferMsg::Status { tid } => {
+                let st = self.xfer_status(tid);
+                let mut out = RouteOutcome::default();
+                out.send.push((from, Frame::Xfer(XferMsg::StatusAck { tid, status: st })));
+                Ok(out)
+            }
+            XferMsg::Commit { .. }
+            | XferMsg::Committed { .. }
+            | XferMsg::Abort { .. }
+            | XferMsg::StatusAck { .. } => Err(Poison("peer sent host-only xfer")),
+        }
+    }
+
+    fn xfer_accept(&mut self, from: PeerId, tid: TransferId) -> Result<RouteOutcome, Poison> {
+        if let Some(x) = self.xfers.get(&tid).copied() {
+            if x.dest != from {
+                return Err(Poison("accept from wrong recipient"));
+            }
+            if x.phase != XferPhase::Offered {
+                return Ok(RouteOutcome::default()); // idempotent
+            }
+            if self.dest_live_count(from) >= self.lim.max_live_endpoints {
+                return self.xfer_abort_inner(tid, "recipient capacity");
+            }
+            return self.xfer_commit_inner(tid);
+        }
+        match self.xfer_status(tid) {
+            XFER_ST_COMMITTED | XFER_ST_ABORTED => Ok(RouteOutcome::default()),
+            _ => Err(Poison("unknown transfer id")),
+        }
+    }
+
+    fn xfer_reject(
+        &mut self,
+        from: PeerId,
+        tid: TransferId,
+        why: &'static str,
+    ) -> Result<RouteOutcome, Poison> {
+        if let Some(x) = self.xfers.get(&tid).copied() {
+            if x.dest != from && x.sender != from {
+                return Err(Poison("abort from unrelated peer"));
+            }
+            if x.phase != XferPhase::Offered {
+                return Ok(RouteOutcome::default());
+            }
+            return self.xfer_abort_inner(tid, why);
+        }
+        match self.xfer_status(tid) {
+            XFER_ST_COMMITTED | XFER_ST_ABORTED => Ok(RouteOutcome::default()),
+            _ => Err(Poison("unknown transfer id")),
+        }
+    }
+
+    fn xfer_commit_inner(&mut self, tid: TransferId) -> Result<RouteOutcome, Poison> {
+        let x = *self.xfers.get(&tid).ok_or(Poison("unknown transfer id"))?;
+        if x.phase != XferPhase::Offered {
+            return Ok(RouteOutcome::default());
+        }
+        if let Some(e) = self.eps.get_mut(&x.ep) {
+            e.holder = Holder::Peer(x.dest);
+        } else {
+            return Err(Poison("escrowed endpoint missing"));
+        }
+        self.finish_xfer(tid, XferPhase::Committed);
+        let mut out = RouteOutcome::default();
+        if !self.inject.drop_commit {
+            out.send.push((
+                x.dest,
+                Frame::Xfer(XferMsg::Commit {
+                    tid,
+                    ep: x.ep,
+                    partner: x.partner,
+                }),
+            ));
+        }
+        if !self.inject.drop_committed {
+            out.send.push((x.sender, Frame::Xfer(XferMsg::Committed { tid })));
+        }
+        Ok(out)
+    }
+
+    fn xfer_abort_inner(&mut self, tid: TransferId, _why: &'static str) -> Result<RouteOutcome, Poison> {
+        let x = *self.xfers.get(&tid).ok_or(Poison("unknown transfer id"))?;
+        if x.phase != XferPhase::Offered {
+            return Ok(RouteOutcome::default());
+        }
+        if let Some(e) = self.eps.get_mut(&x.ep) {
+            e.holder = x.restore;
+        }
+        self.finish_xfer(tid, XferPhase::Aborted);
+        let mut out = RouteOutcome::default();
+        if !self.inject.drop_abort {
+            if let Holder::Peer(p) = x.restore {
+                if self.peers.contains_key(&p) {
+                    out.send.push((p, Frame::Xfer(XferMsg::Abort { tid })));
+                }
+            }
+            if x.dest != x.sender && self.peers.contains_key(&x.dest) {
+                out.send.push((x.dest, Frame::Xfer(XferMsg::Abort { tid })));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Test helper: force-abort an offered transfer.
+    pub fn abort_transfer(&mut self, tid: TransferId) -> Result<RouteOutcome, Poison> {
+        self.xfer_abort_inner(tid, "forced abort")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{Attachment, DataInner, Frame, ERR_CAPACITY};
+    use crate::frame::{Attachment, DataInner, Frame, XferMsg, ERR_CAPACITY};
 
     fn hello_ok(r: &mut Router, p: PeerId) {
         r.on_hello(p, Limits::default().hello_magic, Limits::default().hello_version)
             .unwrap();
+    }
+
+    fn grant_commit(r: &mut Router, to: PeerId, ep: EpId) {
+        let f = r.grant(to, ep).unwrap();
+        let tid = match f {
+            Frame::Grant { tid, .. } => tid,
+            other => panic!("grant produced {other:?}"),
+        };
+        r.on_xfer(to, XferMsg::Accept { tid }).unwrap();
+        assert_eq!(r.holder_of(ep), Some(Holder::Peer(to)));
+        assert!(r.authority_mass_ok());
+    }
+
+    fn att(id: EpId, partner: EpId) -> Attachment {
+        Attachment { tid: TransferId(id.0), id, partner }
     }
 
     /// Two accepted, hello'd peers; root pair granted A=x, B=y.
@@ -456,8 +788,8 @@ mod tests {
         hello_ok(&mut r, a);
         hello_ok(&mut r, b);
         let (x, y) = r.create_host_pair();
-        r.grant(a, x).unwrap();
-        r.grant(b, y).unwrap();
+        grant_commit(&mut r, a, x);
+        grant_commit(&mut r, b, y);
         (r, a, b, x, y)
     }
 
@@ -474,7 +806,7 @@ mod tests {
     fn unknown_target_quarantines() {
         let (mut r, a, _, _, _) = primed();
         let err = r
-            .on_data(a, data(EpId(0x0123_4567_89AB_CDEF), vec![]))
+            .on_data(a, data(EpId::from_raw([0x01; 16]), vec![]))
             .unwrap_err();
         assert_eq!(err, Poison("unknown endpoint identity"));
     }
@@ -513,13 +845,7 @@ mod tests {
         let err = r
             .on_data(
                 a,
-                data(
-                    x,
-                    vec![Attachment {
-                        id: y,
-                        partner: r.partner_of(y).unwrap(),
-                    }],
-                ),
+                data(x, vec![att(y, r.partner_of(y).unwrap())]),
             )
             .unwrap_err();
         assert_eq!(err, Poison("identity not held by sender"));
@@ -542,8 +868,13 @@ mod tests {
                 data(
                     x,
                     vec![Attachment {
+                        tid: TransferId(tra.0),
                         id: tra,
-                        partner: EpId(imp.0.wrapping_add(1)),
+                        partner: {
+                            let mut p = imp.0;
+                            p[0] ^= 1;
+                            EpId(p)
+                        },
                     }],
                 ),
             )
@@ -570,13 +901,8 @@ mod tests {
         assert_eq!(partner, imp);
         assert_eq!(r.holder_of(tra), Some(Holder::Peer(a)));
 
-        let oc = r
-            .on_data(
-                a,
-                data(x, vec![Attachment { id: tra, partner: imp }]),
-            )
-            .unwrap();
-        assert_eq!(r.holder_of(tra), Some(Holder::Peer(b)));
+        let oc = r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
+        assert!(matches!(r.holder_of(tra), Some(Holder::Escrow(_))));
         assert!(
             oc.send.iter().any(|(dest, f)| {
                 *dest == b
@@ -587,13 +913,15 @@ mod tests {
             }),
             "forwarded DATA with attachment must reach recipient: {oc:?}"
         );
+        let tid = match r.holder_of(tra) {
+            Some(Holder::Escrow(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        r.on_xfer(b, XferMsg::Accept { tid }).unwrap();
+        assert_eq!(r.holder_of(tra), Some(Holder::Peer(b)));
+        assert!(r.authority_mass_ok());
 
-        let err = r
-            .on_data(
-                a,
-                data(x, vec![Attachment { id: tra, partner: imp }]),
-            )
-            .unwrap_err();
+        let err = r.on_data(a, data(x, vec![att(tra, imp)])).unwrap_err();
         assert_eq!(err, Poison("identity not held by sender"));
     }
 
@@ -627,7 +955,7 @@ mod tests {
     fn eof_notifies_survivor_and_retires_both() {
         let (mut r, a, b, x, y) = primed();
         let (h1, h2) = r.create_host_pair();
-        r.grant(a, h1).unwrap();
+        grant_commit(&mut r, a, h1);
         let oc = r.on_eof(a);
         assert!(
             oc.send.iter().any(|(dest, f)| {
@@ -673,7 +1001,7 @@ mod tests {
         let mut r = Router::new(Limits::default());
         let a = r.accept_peer();
         let err = r
-            .on_data(a, data(EpId(1), vec![]))
+            .on_data(a, data(EpId::from_raw([1; 16]), vec![]))
             .unwrap_err();
         assert_eq!(err, Poison("traffic before hello"));
 

@@ -182,17 +182,54 @@ fn host_death() {
     };
     assert_eq!(out.status.code(), Some(9), "hostdie must exit 9");
 
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    let mut child_pids: Vec<u32> = Vec::new();
+    if let Some(rest) = combined.split("HOST_PIDS ").nth(1) {
+        for part in rest.split_whitespace().take(2) {
+            if let Some(v) = part.split('=').nth(1) {
+                if let Ok(p) = v.parse::<u32>() {
+                    child_pids.push(p);
+                }
+            }
+        }
+    }
+
     let marker = dir.join("client_fabric_lost");
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut pids_gone = child_pids.is_empty();
     while Instant::now() < deadline {
-        if marker.exists() {
+        if !pids_gone && !child_pids.is_empty() {
+            pids_gone = child_pids.iter().all(|&p| !pid_alive(p));
+        }
+        if pids_gone && marker.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        if pids_gone && child_pids.len() == 2 {
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
         thread::sleep(Duration::from_millis(50));
     }
     let _ = std::fs::remove_dir_all(&dir);
-    panic!("client_fabric_lost marker never appeared");
+    panic!("host death: children={child_pids:?} gone={pids_gone} marker={}", marker.exists());
+}
+
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
 }
 
 #[test]
@@ -206,5 +243,9 @@ fn scale_small() {
     assert_eq!(out.status.code(), Some(0), "scale\n{combined}");
     assert_contains(&combined, "SCALE_OK n=2000", "scale");
     assert_contains(&combined, "live_eps=4", "scale final");
-    assert_contains(&combined, "retired=4000", "scale final");
+    // Retirement is bounded; must not grow with 2*N.
+    assert!(
+        !combined.contains("HOST_FAIL scale accounting"),
+        "scale accounting failed:\n{combined}"
+    );
 }

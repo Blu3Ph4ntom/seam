@@ -13,8 +13,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::fabric_error::{Cause, FabError};
-use crate::frame::{self, Attachment, DataInner, Frame, FrameError, ERR_CAPACITY};
-use crate::id::EpId;
+use crate::frame::{self, Attachment, DataInner, Frame, FrameError, XferMsg, ERR_CAPACITY};
+use crate::id::{fresh_transfer_id, EpId, TransferId, TransferSpace};
 use crate::limits::Limits;
 use crate::queue::{BoundedQueue, PopError};
 
@@ -65,6 +65,23 @@ enum CreateOutcome {
     Failed(FabError),
 }
 
+#[derive(Clone, Copy, Debug)]
+enum XferLocal {
+    Committed,
+    Aborted,
+    Unknown,
+}
+
+struct Parked {
+    from: EpId,
+    local: EpId,
+    corr: u32,
+    payload: Vec<u8>,
+    remaining: std::collections::HashSet<TransferId>,
+    got: Vec<Endpoint>,
+    is_response: bool,
+}
+
 struct HState {
     partner: EpId,
     /// None = live.
@@ -84,6 +101,9 @@ struct State {
     /// `next_new_handle` would otherwise race which bootstrap grant is
     /// claimed first (root vs. control).
     arrival_order: Vec<EpId>,
+    pending_offers: HashMap<TransferId, (EpId, EpId)>,
+    xfer_wait: HashMap<TransferId, Arc<(Mutex<Option<XferLocal>>, Condvar)>>,
+    parked: Vec<Parked>,
 }
 
 impl State {
@@ -160,6 +180,9 @@ impl RuntimeInner {
                 terminal: None,
                 dropped_after_close: 0,
                 arrival_order: Vec::new(),
+                pending_offers: HashMap::new(),
+                xfer_wait: HashMap::new(),
+                parked: Vec::new(),
             }),
             out: BoundedQueue::new(lim.queue_max_msgs, lim.queue_max_bytes),
             inbound: BoundedQueue::new(lim.queue_max_msgs, lim.queue_max_bytes),
@@ -196,6 +219,42 @@ impl RuntimeInner {
         self.go_terminal_pub(Cause::PeerLost);
     }
 
+    fn finish_parked(self: &Arc<Self>, p: Parked) {
+        if p.is_response {
+            let inner = {
+                let mut st = self.st.lock().unwrap();
+                st.waiters.remove(&p.corr).map(|s| s.peek())
+            };
+            let res = Ok(CallResult { payload: p.payload, received: p.got });
+            if let Some(inner) = inner {
+                let (m, cv) = &*inner;
+                *m.lock().unwrap() = Some(res);
+                cv.notify_all();
+            }
+            return;
+        }
+        let cost = p.payload.len() + INBOUND_COST_OVERHEAD;
+        let mut item = Inbound {
+            from: p.from,
+            local: p.local,
+            corr: p.corr,
+            payload: p.payload,
+            received: p.got,
+        };
+        loop {
+            match self.inbound.try_push(item, cost) {
+                Ok(()) => return,
+                Err((back, _)) => {
+                    item = back;
+                    if self.broken.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
     fn go_terminal_pub(&self, cause: Cause) {
         {
             let mut st = self.st.lock().unwrap();
@@ -219,20 +278,21 @@ impl RuntimeInner {
                 self.poison();
                 false
             }
-            Frame::Grant { ep, partner } => {
-                {
+            Frame::Grant { ep, partner, tid } => {
+                // Offer: do not materialize until COMMIT. Auto-accept if we
+                // have capacity; otherwise reject so sender can recover.
+                let accept = {
+                    let st = self.st.lock().unwrap();
+                    st.handles.values().filter(|h| h.cause.is_none()).count() < self.lim.max_live_endpoints
+                        && st.terminal.is_none()
+                };
+                if accept {
+                    let _ = self.push_out(Frame::Xfer(XferMsg::Accept { tid }));
                     let mut st = self.st.lock().unwrap();
-                    if st.terminal.is_some() {
-                        return true;
-                    }
-                    if !st.handles.contains_key(&ep) {
-                        st.handles.insert(ep, HState { partner, cause: None });
-                        st.arrival_order.push(ep);
-                    }
-                    st.partner_of_theirs.insert(partner, ep);
+                    st.pending_offers.insert(tid, (ep, partner));
+                } else {
+                    let _ = self.push_out(Frame::Xfer(XferMsg::Reject { tid }));
                 }
-                let _g = self.new_handle_m.lock().unwrap();
-                self.new_handle.notify_all();
                 true
             }
             Frame::Data(d) => {
@@ -278,26 +338,137 @@ impl RuntimeInner {
                 self.go_terminal_pub(Cause::Graceful);
                 false
             }
+            Frame::Xfer(x) => self.process_xfer(x),
+        }
+    }
+
+    fn process_xfer(self: &Arc<Self>, x: XferMsg) -> bool {
+        match x {
+            XferMsg::Commit { tid, ep, partner } => {
+                let mut ready: Vec<Parked> = Vec::new();
+                {
+                    let mut st = self.st.lock().unwrap();
+                    st.pending_offers.remove(&tid);
+                    if !st.handles.contains_key(&ep) {
+                        st.handles.insert(ep, HState { partner, cause: None });
+                        st.arrival_order.push(ep);
+                    }
+                    st.partner_of_theirs.insert(partner, ep);
+                    if let Some(slot) = st.xfer_wait.remove(&tid) {
+                        let (m, cv) = &*slot;
+                        *m.lock().unwrap() = Some(XferLocal::Committed);
+                        cv.notify_all();
+                    }
+                    for p in &mut st.parked {
+                        if p.remaining.remove(&tid) {
+                            p.got.push(Endpoint { id: ep, shared: self.clone(), armed: true });
+                        }
+                    }
+                    let mut i = 0;
+                    while i < st.parked.len() {
+                        if st.parked[i].remaining.is_empty() {
+                            ready.push(st.parked.remove(i));
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                let _g = self.new_handle_m.lock().unwrap();
+                self.new_handle.notify_all();
+                for p in ready {
+                    self.finish_parked(p);
+                }
+                true
+            }
+            XferMsg::Committed { tid } => {
+                let mut st = self.st.lock().unwrap();
+                if let Some(slot) = st.xfer_wait.remove(&tid) {
+                    let (m, cv) = &*slot;
+                    *m.lock().unwrap() = Some(XferLocal::Committed);
+                    cv.notify_all();
+                }
+                true
+            }
+            XferMsg::Abort { tid } => {
+                let mut st = self.st.lock().unwrap();
+                st.pending_offers.remove(&tid);
+                if let Some(slot) = st.xfer_wait.remove(&tid) {
+                    let (m, cv) = &*slot;
+                    *m.lock().unwrap() = Some(XferLocal::Aborted);
+                    cv.notify_all();
+                }
+                true
+            }
+            XferMsg::StatusAck { tid, status } => {
+                let mut st = self.st.lock().unwrap();
+                if let Some(slot) = st.xfer_wait.remove(&tid) {
+                    let outcome = match status {
+                        frame::XFER_ST_COMMITTED => XferLocal::Committed,
+                        frame::XFER_ST_ABORTED => XferLocal::Aborted,
+                        _ => XferLocal::Unknown,
+                    };
+                    let (m, cv) = &*slot;
+                    *m.lock().unwrap() = Some(outcome);
+                    cv.notify_all();
+                }
+                true
+            }
+            XferMsg::Accept { .. } | XferMsg::Reject { .. } | XferMsg::Status { .. } => {
+                // Host-bound; ignore if reflected.
+                true
+            }
         }
     }
 
     fn process_data(self: &Arc<Self>, d: DataInner) {
-        // Materialize transferred capabilities first: receiving them IS
-        // acquiring authority.
-        for att in &d.attachments {
-            {
-                let mut st = self.st.lock().unwrap();
-                if st.terminal.is_some() {
-                    return;
+        // Attachments are offers: ACCEPT if we have capacity, then wait for
+        // COMMIT before the handle becomes usable.
+        if !d.attachments.is_empty() {
+            let cap_ok = {
+                let st = self.st.lock().unwrap();
+                st.handles.values().filter(|h| h.cause.is_none()).count()
+                    + d.attachments.len()
+                    <= self.lim.max_live_endpoints
+                    && st.terminal.is_none()
+            };
+            if !cap_ok {
+                for att in &d.attachments {
+                    let _ = self.push_out(Frame::Xfer(XferMsg::Reject { tid: att.tid }));
                 }
-                if !st.handles.contains_key(&att.id) {
-                    st.handles.insert(att.id, HState { partner: att.partner, cause: None });
-                    st.arrival_order.push(att.id);
-                }
-                st.partner_of_theirs.insert(att.partner, att.id);
+                return;
             }
-            let _g = self.new_handle_m.lock().unwrap();
-            self.new_handle.notify_all();
+            let mut remaining = std::collections::HashSet::new();
+            for att in &d.attachments {
+                remaining.insert(att.tid);
+                let _ = self.push_out(Frame::Xfer(XferMsg::Accept { tid: att.tid }));
+            }
+            let mut st = self.st.lock().unwrap();
+            let is_response = d.corr != 0
+                && st
+                    .waiters
+                    .get(&d.corr)
+                    .map(|s| {
+                        st.partner_of_theirs
+                            .get(&d.target)
+                            .copied()
+                            .map(|local| s.ep == local)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+            let Some(local) = st.partner_of_theirs.get(&d.target).copied() else {
+                st.dropped_after_close += 1;
+                return;
+            };
+            st.parked.push(Parked {
+                from: d.target,
+                local,
+                corr: d.corr,
+                payload: d.payload,
+                remaining,
+                got: Vec::new(),
+                is_response,
+            });
+            return;
         }
 
         enum Next {
@@ -337,7 +508,7 @@ impl RuntimeInner {
                 let received = d
                     .attachments
                     .iter()
-                    .map(|a| Endpoint { id: a.id, shared: self.clone() })
+                    .map(|a| Endpoint { id: a.id, shared: self.clone(), armed: true })
                     .collect();
                 let inner = {
                     let mut st = self.st.lock().unwrap();
@@ -362,7 +533,7 @@ impl RuntimeInner {
                 let received = d
                     .attachments
                     .iter()
-                    .map(|a| Endpoint { id: a.id, shared: self.clone() })
+                    .map(|a| Endpoint { id: a.id, shared: self.clone(), armed: true })
                     .collect();
                 let cost = d.payload.len() + INBOUND_COST_OVERHEAD;
                 let mut item =
@@ -394,10 +565,12 @@ impl RuntimeInner {
 
 /// Move-only authority handle. Deliberately NOT Clone/Copy: transferring or
 /// closing consumes it (invariants I3/I4). The internal identity is private
-/// and validated on every use.
+/// and validated on every use. Dropping the last armed handle closes it.
 pub struct Endpoint {
     id: EpId,
     shared: Arc<RuntimeInner>,
+    /// When false, Drop must not emit Close (already transferred/closed).
+    armed: bool,
 }
 
 impl std::fmt::Debug for Endpoint {
@@ -410,7 +583,11 @@ impl Endpoint {
     /// Test-only constructor. Not an authority source.
     #[doc(hidden)]
     pub fn __unchecked(id: EpId, shared: Arc<RuntimeInner>) -> Self {
-        Endpoint { id, shared }
+        Endpoint { id, shared, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 
     pub fn id(&self) -> EpId {
@@ -473,7 +650,12 @@ impl Endpoint {
     }
 
     /// Destroy this end deliberately. Consumes the authority.
-    pub fn close(self) -> Result<(), FabError> {
+    pub fn close(mut self) -> Result<(), FabError> {
+        self.armed = false;
+        self.release()
+    }
+
+    fn release(&self) -> Result<(), FabError> {
         let res = self.shared.push_out(Frame::Close { target: self.id });
         let mut st = self.shared.st.lock().unwrap();
         st.fail_handle(self.id, Cause::Graceful);
@@ -482,6 +664,15 @@ impl Endpoint {
             st.partner_of_theirs.remove(&partner);
         }
         res
+    }
+}
+
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        if self.armed {
+            self.armed = false;
+            let _ = self.release();
+        }
     }
 }
 
@@ -599,20 +790,29 @@ impl Runtime {
         payload: Vec<u8>,
         caps: Vec<Endpoint>,
     ) -> Result<(), FabError> {
+        struct EmptyTid;
+        impl TransferSpace for EmptyTid {
+            fn contains(&self, _id: TransferId) -> bool {
+                false
+            }
+        }
         let mut attachments = Vec::with_capacity(caps.len());
+        let mut waiters = Vec::new();
         {
             let mut st = self.shared.st.lock().unwrap();
-            for cap in caps {
+            for mut cap in caps {
                 match st.handles.get(&cap.id).and_then(|h| h.cause) {
                     Some(c) => return Err(FabError::Closed(c)),
                     None => {}
                 }
                 let partner = st.handles.get(&cap.id).unwrap().partner;
-                attachments.push(Attachment { id: cap.id, partner });
-                // Transfer-out: sender relinquishes. The demux entry stays:
-                // traffic addressed to the moved side still routes to us
-                // (we implement its partner).
+                let tid = fresh_transfer_id(&EmptyTid);
+                let slot = Arc::new((Mutex::new(None::<XferLocal>), Condvar::new()));
+                st.xfer_wait.insert(tid, slot.clone());
+                attachments.push(Attachment { tid, id: cap.id, partner });
                 st.handles.remove(&cap.id);
+                cap.disarm();
+                waiters.push((tid, slot));
             }
         }
         self.shared.push_out(Frame::Data(DataInner {
@@ -620,7 +820,44 @@ impl Runtime {
             corr: req.corr,
             attachments,
             payload,
-        }))
+        }))?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for (tid, slot) in waiters {
+            let mut status_probes = 0u8;
+            loop {
+                {
+                    let (m, cv) = &*slot;
+                    let mut g = m.lock().unwrap();
+                    match g.take() {
+                        Some(XferLocal::Committed) => break,
+                        Some(XferLocal::Aborted) => {
+                            return Err(FabError::TransferAborted("recipient rejected or died"));
+                        }
+                        Some(XferLocal::Unknown) => {
+                            return Err(FabError::TransferUnknown);
+                        }
+                        None => {
+                            let now = Instant::now();
+                            if now >= deadline {
+                                // Timeout is not an abort. Probe STATUS a few
+                                // times, then surface unknown.
+                                if status_probes >= 5 {
+                                    return Err(FabError::TransferUnknown);
+                                }
+                                status_probes += 1;
+                                drop(g);
+                                let _ = self.shared.push_out(Frame::Xfer(XferMsg::Status { tid }));
+                                std::thread::sleep(Duration::from_millis(50));
+                                continue;
+                            }
+                            let (ng, _) = cv.wait_timeout(g, deadline - now).unwrap();
+                            drop(ng);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Ask the fabric for a fresh endpoint pair: (implementation side,
@@ -664,8 +901,8 @@ impl Runtime {
                     st.partner_of_theirs.insert(tra, imp);
                     st.partner_of_theirs.insert(imp, tra);
                     return Ok((
-                        Endpoint { id: imp, shared: self.shared.clone() },
-                        Endpoint { id: tra, shared: self.shared.clone() },
+                        Endpoint { id: imp, shared: self.shared.clone(), armed: true },
+                        Endpoint { id: tra, shared: self.shared.clone(), armed: true },
                     ));
                 }
                 Some(CreateOutcome::Failed(e)) => return Err(e),
@@ -735,7 +972,7 @@ impl Runtime {
         let st = self.shared.st.lock().unwrap();
         match st.handles.get(&id) {
             Some(h) if h.cause.is_none() => {
-                Some(Endpoint { id, shared: self.shared.clone() })
+                Some(Endpoint { id, shared: self.shared.clone(), armed: true })
             }
             _ => None,
         }

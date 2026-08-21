@@ -18,6 +18,13 @@ pub struct Limits {
     /// Handshake validation values.
     pub hello_magic: u16,
     pub hello_version: u16,
+    /// Recent-retirement cache size (bounded independently of churn).
+    pub max_retired: usize,
+    /// In-flight transfer transactions per fabric instance.
+    pub max_pending_transfers: usize,
+    /// Reserved control-plane queue (lifecycle/transfer); never silently dropped.
+    pub control_queue_max_msgs: usize,
+    pub control_queue_max_bytes: usize,
 }
 
 impl Default for Limits {
@@ -30,7 +37,11 @@ impl Default for Limits {
             queue_max_bytes: 1024 * 1024,
             max_outstanding_requests: 64,
             hello_magic: 0x5345, // "SE"
-            hello_version: 1,
+            hello_version: 2,
+            max_retired: 4096,
+            max_pending_transfers: 256,
+            control_queue_max_msgs: 64,
+            control_queue_max_bytes: 64 * 1024,
         }
     }
 }

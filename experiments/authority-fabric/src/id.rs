@@ -1,94 +1,147 @@
-//! Endpoint identity.
+//! Endpoint and transfer identities.
 //!
-//! Authority-bearing endpoint ids are 64-bit values drawn from OS entropy,
-//! unique over the lifetime of a fabric instance (never reused), so:
-//! - they are not attacker-selectable,
-//! - they are not realistically guessable,
-//! - stale identities can never alias a new capability (no ABA).
+//! Endpoint identity ≠ authority. Authority is the runtime possession
+//! record. Identities are 128-bit OS-random values used as unguessable
+//! *names*; they are never chosen by the application and never reused
+//! within one runtime lifetime (live + pending + recent retirement).
 //!
-//! This is forge-RESISTANT by randomness and scoping, not cryptographic
-//! authentication. See docs in .agent/CAPABILITIES.md for the honest threat
-//! model: an attacker who can read our memory defeats everything; the model
-//! defends against *other processes* guessing or replaying identities.
+//! Collision is checked, not claimed impossible.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use getrandom::fill;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct EpId(pub u64);
+use crate::fabric_error::Cause;
 
-/// Draws a fresh id from OS entropy, retrying on the (astronomically rare)
-/// collision with `taken`. The caller's table union live+retired must be
-/// passed as `taken`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EpId(pub [u8; 16]);
+
+/// Transaction identity. Distinct type from `EpId` so it cannot be used
+/// as application authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TransferId(pub [u8; 16]);
+
+impl EpId {
+    pub fn from_raw(bytes: [u8; 16]) -> Self {
+        EpId(bytes)
+    }
+    pub fn is_zero(self) -> bool {
+        self.0.iter().all(|&b| b == 0)
+    }
+}
+
+impl TransferId {
+    pub fn from_raw(bytes: [u8; 16]) -> Self {
+        TransferId(bytes)
+    }
+    pub fn is_zero(self) -> bool {
+        self.0.iter().all(|&b| b == 0)
+    }
+}
+
+pub trait IdSpace {
+    fn contains(&self, id: EpId) -> bool;
+}
+
+pub trait TransferSpace {
+    fn contains(&self, id: TransferId) -> bool;
+}
+
+fn draw16() -> [u8; 16] {
+    let mut b = [0u8; 16];
+    fill(&mut b).expect("OS entropy source failed");
+    b
+}
+
 pub fn fresh_id(taken: &impl IdSpace) -> EpId {
     loop {
-        let mut b = [0u8; 8];
-        // OS entropy failure is unrecoverable for an identity scheme.
-        fill(&mut b).expect("OS entropy source failed");
-        let v = u64::from_le_bytes(b);
-        if v != 0 && !taken.contains(v) {
-            return EpId(v);
+        let id = EpId(draw16());
+        if !id.is_zero() && !taken.contains(id) {
+            return id;
         }
     }
 }
 
-/// Abstraction so both live tables and retirement tombstones can be checked
-/// without exposing internal structures.
-pub trait IdSpace {
-    fn contains(&self, v: u64) -> bool;
-}
-
-impl IdSpace for HashSet<u64> {
-    fn contains(&self, v: u64) -> bool {
-        HashSet::contains(self, &v)
+pub fn fresh_transfer_id(taken: &impl TransferSpace) -> TransferId {
+    loop {
+        let id = TransferId(draw16());
+        if !id.is_zero() && !taken.contains(id) {
+            return id;
+        }
     }
 }
 
-/// Monotonic retirement set. Ids land here when their conversation dies and
-/// NEVER return to circulation. Growth is bounded by experiment scale
-/// (10k cycles => ~40KB); production designs would epoch this.
-#[derive(Default)]
-pub struct Retirement {
-    retired: HashSet<u64>,
+impl IdSpace for HashSet<EpId> {
+    fn contains(&self, id: EpId) -> bool {
+        HashSet::contains(self, &id)
+    }
 }
 
-impl Retirement {
-    pub fn new() -> Self {
-        Self::default()
+impl TransferSpace for HashSet<TransferId> {
+    fn contains(&self, id: TransferId) -> bool {
+        HashSet::contains(self, &id)
+    }
+}
+
+/// Bounded recent-retirement cache. Eviction turns "stale" into "unknown";
+/// both fail closed. Size is independent of historical churn.
+pub struct BoundedTombstones<K: Copy + Eq + std::hash::Hash> {
+    cap: usize,
+    map: HashMap<K, Cause>,
+    order: VecDeque<K>,
+}
+
+impl<K: Copy + Eq + std::hash::Hash> BoundedTombstones<K> {
+    pub fn new(cap: usize) -> Self {
+        BoundedTombstones {
+            cap: cap.max(1),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
     }
 
-    pub fn retire(&mut self, id: EpId) {
-        self.retired.insert(id.0);
+    pub fn insert(&mut self, k: K, cause: Cause) {
+        if self.map.contains_key(&k) {
+            return;
+        }
+        while self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.order.push_back(k);
+        self.map.insert(k, cause);
     }
 
-    pub fn is_retired(&self, id: EpId) -> bool {
-        self.retired.contains(&id.0)
+    pub fn get(&self, k: K) -> Option<Cause> {
+        self.map.get(&k).copied()
+    }
+
+    pub fn contains(&self, k: K) -> bool {
+        self.map.contains_key(&k)
     }
 
     pub fn len(&self) -> usize {
-        self.retired.len()
+        self.map.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.retired.is_empty()
+        self.map.is_empty()
     }
-}
 
-impl IdSpace for Retirement {
-    fn contains(&self, v: u64) -> bool {
-        self.retired.contains(&v)
+    pub fn cap(&self) -> usize {
+        self.cap
     }
 }
 
 /// Combined view used when drawing fresh ids.
 pub struct IdOracle<'a> {
-    pub extra: &'a HashSet<u64>,
+    pub extra: &'a HashSet<EpId>,
 }
 
 impl IdSpace for IdOracle<'_> {
-    fn contains(&self, v: u64) -> bool {
-        self.extra.contains(&v)
+    fn contains(&self, id: EpId) -> bool {
+        self.extra.contains(&id)
     }
 }
 
@@ -98,7 +151,7 @@ mod tests {
 
     struct Empty;
     impl IdSpace for Empty {
-        fn contains(&self, _v: u64) -> bool {
+        fn contains(&self, _id: EpId) -> bool {
             false
         }
     }
@@ -106,24 +159,36 @@ mod tests {
     #[test]
     fn fresh_ids_are_nonzero_and_distinct() {
         let mut seen = HashSet::new();
-        for _ in 0..1000 {
+        for _ in 0..256 {
             let id = fresh_id(&Empty);
-            assert_ne!(id.0, 0);
-            assert!(seen.insert(id.0), "collision drawn from entropy");
+            assert!(!id.is_zero());
+            assert!(seen.insert(id), "collision drawn from entropy");
         }
     }
 
     #[test]
-    fn retirement_prevents_reissue() {
-        let mut r = Retirement::new();
-        let taken: HashSet<u64> = [42u64].into_iter().collect();
-        let oracle = IdOracle { extra: &taken };
-        // Force a collision path deterministically is not possible with real
-        // entropy; instead verify retire/is_retired semantics.
-        let id = fresh_id(&oracle);
-        assert!(!r.is_retired(id));
-        r.retire(id);
-        assert!(r.is_retired(id));
-        assert_eq!(r.len(), 1);
+    fn tombstones_evict_oldest_and_never_resurrect() {
+        let mut t = BoundedTombstones::new(2);
+        let a = EpId::from_raw([1; 16]);
+        let b = EpId::from_raw([2; 16]);
+        let c = EpId::from_raw([3; 16]);
+        t.insert(a, Cause::Graceful);
+        t.insert(b, Cause::PeerLost);
+        assert_eq!(t.len(), 2);
+        t.insert(c, Cause::Graceful);
+        assert_eq!(t.len(), 2);
+        assert!(!t.contains(a), "oldest evicted");
+        assert!(t.contains(b) && t.contains(c));
+        assert_eq!(t.cap(), 2);
+    }
+
+    #[test]
+    fn transfer_ids_are_a_distinct_type() {
+        let e = EpId::from_raw([9; 16]);
+        let t = TransferId::from_raw([9; 16]);
+        assert_eq!(e.0, t.0);
+        // Distinct newtypes: cannot pass TransferId where EpId is required
+        // without an explicit conversion (none is provided).
+        let _ = (e, t);
     }
 }

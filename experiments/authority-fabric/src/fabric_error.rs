@@ -34,6 +34,11 @@ pub enum FabError {
     /// message only.
     InvalidMessage(&'static str),
     Io(io::Error),
+    /// Transfer was aborted before commit. Authority is recoverable via the
+    /// accompanying handle (see `TransferAbort`).
+    TransferAborted(&'static str),
+    /// Status lookup could not yet say committed vs aborted. Not an abort.
+    TransferUnknown,
 }
 
 impl From<io::Error> for FabError {
@@ -56,6 +61,8 @@ impl std::fmt::Display for FabError {
             FabError::ProtocolViolation(why) => write!(f, "protocol violation: {why}"),
             FabError::InvalidMessage(why) => write!(f, "invalid message payload: {why}"),
             FabError::Io(e) => write!(f, "io error: {e}"),
+            FabError::TransferAborted(why) => write!(f, "transfer aborted: {why}"),
+            FabError::TransferUnknown => write!(f, "transfer status unknown (not an abort)"),
         }
     }
 }

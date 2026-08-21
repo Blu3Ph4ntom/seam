@@ -1,7 +1,7 @@
 error[E0382]: borrow of moved value: `ep`
   --> tests/compile-fail/use_after_transfer.rs:11:13
    |
- 9 |     let ep = Endpoint::__unchecked(EpId(42), sh);
+ 9 |     let ep = Endpoint::__unchecked(EpId::from_raw([42; 16]), sh);
    |         -- move occurs because `ep` has type `Endpoint`, which does not implement the `Copy` trait
 10 |     consume(ep);
    |             -- value moved here

@@ -63,8 +63,47 @@ impl<T> BoundedQueue<T> {
         g.msgs += 1;
         g.bytes += cost;
         drop(g);
-        self.space.notify_one();
+        self.space.notify_all();
         Ok(())
+    }
+
+    /// Enqueue, waiting until space exists or `deadline`. Control-plane
+    /// frames use this so they are never silently dropped.
+    pub fn push_deadline(&self, item: T, cost: usize, deadline: Instant) -> Result<(), (T, Backlog)> {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if g.closed {
+                return Err((item, Backlog { msgs: g.msgs, bytes: g.bytes }));
+            }
+            if g.msgs < self.max_msgs && g.bytes + cost <= self.max_bytes {
+                g.q.push_back((item, cost));
+                g.msgs += 1;
+                g.bytes += cost;
+                drop(g);
+                self.space.notify_one();
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err((item, Backlog { msgs: g.msgs, bytes: g.bytes }));
+            }
+            let wait = std::cmp::min(deadline - now, Duration::from_millis(50));
+            let (ng, _) = self.space.wait_timeout(g, wait).unwrap();
+            g = ng;
+        }
+    }
+
+    pub fn try_pop(&self) -> Option<T> {
+        let mut g = self.inner.lock().unwrap();
+        if let Some((item, cost)) = g.q.pop_front() {
+            g.msgs -= 1;
+            g.bytes -= cost;
+            drop(g);
+            self.space.notify_all();
+            Some(item)
+        } else {
+            None
+        }
     }
 
     /// Pop with deadline.
@@ -75,6 +114,7 @@ impl<T> BoundedQueue<T> {
                 g.msgs -= 1;
                 g.bytes -= cost;
                 drop(g);
+                self.space.notify_all();
                 return Ok(item);
             }
             if g.closed {
