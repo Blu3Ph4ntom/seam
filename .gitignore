@@ -2,7 +2,7 @@
 .agent/
 
 # Build artifacts
-/target
+target/
 
 # OS junk
 .DS_Store
