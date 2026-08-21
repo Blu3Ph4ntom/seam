@@ -189,7 +189,7 @@ fn full_demo(rt: &Runtime) -> i32 {
     } else {
         marker!("CLIENT_DONE_ACKED");
     }
-    println!("CLIENT_OK");
+    marker!("CLIENT_OK");
     0
 }
 
@@ -210,19 +210,19 @@ fn root_closed(rt: &Runtime, strict: bool) -> i32 {
                 1
             } else {
                 marker!("CLIENT_GRANT_NEVER_ARRIVED");
-                println!("CLIENT_OK");
+                marker!("CLIENT_OK");
                 0
             }
         }
         Err(e) => {
             marker!("CLIENT_FABRIC_LOST_WAITING_GRANT {e}");
-            println!("CLIENT_OK");
+            marker!("CLIENT_OK");
             0
         }
         Ok(id) => {
             let Some(root) = rt.endpoint_for(id) else {
                 marker!("CLIENT_ROOT_CLOSED_OBSERVED");
-                println!("CLIENT_OK");
+                marker!("CLIENT_OK");
                 return 0;
             };
             if !strict {
@@ -231,7 +231,7 @@ fn root_closed(rt: &Runtime, strict: bool) -> i32 {
             match root.call(proto::encode_root_request(RootRequest::Ping), CALL_TIMEOUT) {
                 Err(FabError::Closed(_)) => {
                     marker!("CLIENT_ROOT_CLOSED_OBSERVED");
-                    println!("CLIENT_OK");
+                    marker!("CLIENT_OK");
                     0
                 }
                 Err(e) => {
@@ -261,7 +261,7 @@ fn outstanding_request(rt: &Runtime) -> i32 {
                 "CLIENT_OUTSTANDING_FAILED_MS {}",
                 started.elapsed().as_millis()
             );
-            println!("CLIENT_OK");
+            marker!("CLIENT_OK");
             0
         }
         Err(e) => {
@@ -340,7 +340,7 @@ fn kill_after_first_increment(rt: &Runtime) -> i32 {
             return 1;
         }
     }
-    println!("CLIENT_OK");
+    marker!("CLIENT_OK");
     0
 }
 
@@ -388,7 +388,7 @@ fn graceful_done(rt: &Runtime) -> i32 {
     };
     match send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done) {
         Ok(()) => {
-            println!("CLIENT_OK");
+            marker!("CLIENT_OK");
             0
         }
         Err(e) => {
@@ -406,7 +406,7 @@ fn watchdog(rt: &Runtime) -> i32 {
             let Some(root) = rt.endpoint_for(id) else {
                 marker!("CLIENT_FABRIC_LOST_OBSERVED");
                 write_marker_file("client_fabric_lost");
-                println!("CLIENT_OK");
+                marker!("CLIENT_OK");
                 return 0;
             };
             // Poll until the fabric is gone (bounded).
@@ -434,7 +434,7 @@ fn watchdog(rt: &Runtime) -> i32 {
     }
     marker!("CLIENT_FABRIC_LOST_OBSERVED");
     write_marker_file("client_fabric_lost");
-    println!("CLIENT_OK");
+    marker!("CLIENT_OK");
     0
 }
 
@@ -495,7 +495,7 @@ fn churn(rt: &Runtime) -> i32 {
         eprintln!("CLIENT_FAIL churn done signal");
         return 1;
     }
-    println!("CLIENT_OK");
+    marker!("CLIENT_OK");
     0
 }
 
@@ -566,7 +566,7 @@ fn perf(rt: &Runtime) -> i32 {
     if send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done).is_err() {
         return 1;
     }
-    println!("CLIENT_OK");
+    marker!("CLIENT_OK");
     0
 }
 

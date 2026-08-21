@@ -100,6 +100,12 @@ fn demo_full() {
     ] {
         assert_contains(&combined, m, "demo marker");
     }
+    // RUN 002 shutdown anomaly: ASCII on the protocol pipe must not appear
+    // as an oversized frame after a successful demo.
+    assert!(
+        !combined.contains("HOST_QUARANTINED_PEER"),
+        "clean demo shutdown quarantined a peer:\n{combined}"
+    );
 }
 
 fn scenario(case: &str) {

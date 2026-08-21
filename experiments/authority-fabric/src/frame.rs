@@ -414,6 +414,20 @@ mod tests {
     }
 
     #[test]
+    fn ascii_stdout_pollution_is_oversized_not_a_frame() {
+        // "CLIENT_OK\n" on the protocol pipe: first 4 bytes are ASCII
+        // 'C','L','I','E' = 0x45494C43 >> 64KiB cap.
+        let l = lim();
+        let buf = b"CLIENT_OK\n";
+        match decode(buf, &l) {
+            Err(FrameError::TooLarge { declared, .. }) => {
+                assert_eq!(declared, u32::from_le_bytes(*b"CLIE"));
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_kind_rejected() {
         let l = lim();
         let mut buf = Vec::new();
