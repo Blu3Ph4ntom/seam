@@ -25,6 +25,10 @@ pub struct Limits {
     /// Reserved control-plane queue (lifecycle/transfer); never silently dropped.
     pub control_queue_max_msgs: usize,
     pub control_queue_max_bytes: usize,
+    /// Maximum live native resources per fabric (Host table).
+    pub max_native_resources: usize,
+    /// Maximum native resources in escrow (Host).
+    pub max_resources_in_escrow: usize,
 }
 
 impl Default for Limits {
@@ -42,6 +46,8 @@ impl Default for Limits {
             max_pending_transfers: 256,
             control_queue_max_msgs: 64,
             control_queue_max_bytes: 64 * 1024,
+            max_native_resources: 256,
+            max_resources_in_escrow: 64,
         }
     }
 }

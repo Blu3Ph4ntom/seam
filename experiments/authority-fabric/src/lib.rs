@@ -4,8 +4,9 @@
 //! format, or transport. See `.agent/` (local-only) for the run charter.
 
 pub mod fabric_error;
-pub mod frame;
 pub mod id;
+pub mod native;
+pub mod frame;
 pub mod limits;
 pub mod memstream;
 pub mod peer;

@@ -36,7 +36,8 @@ fn att(id: EpId, partner: EpId) -> Attachment {
 }
 
 fn data(target: EpId, atts: Vec<Attachment>) -> DataInner {
-    DataInner { target, corr: 1, attachments: atts, payload: b"x".to_vec() }
+    DataInner { target, corr: 1, attachments: atts, payload: b"x".to_vec(),
+    native: None }
 }
 
 #[test]

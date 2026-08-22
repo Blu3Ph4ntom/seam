@@ -13,9 +13,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::fabric_error::{Cause, FabError};
-use crate::frame::{self, Attachment, DataInner, Frame, FrameError, XferMsg, ERR_CAPACITY};
+use crate::frame::{self, Attachment, DataInner, Frame, FrameError, NativeAttachment, XferMsg, ERR_CAPACITY};
 use crate::id::{fresh_transfer_id, EpId, TransferId, TransferSpace};
 use crate::limits::Limits;
+use crate::native::{NativeFile, ResourceId};
 use crate::queue::{BoundedQueue, PopError};
 
 /// A message delivered to a locally-implemented endpoint.
@@ -31,6 +32,7 @@ pub struct Inbound {
     /// Capabilities transferred inside this message. Possessing them IS the
     /// authority; they arrived only because someone transferred them.
     pub received: Vec<Endpoint>,
+    pub received_native: Option<NativeFile>,
 }
 
 /// Successful call result: response payload plus capabilities transferred
@@ -39,6 +41,7 @@ pub struct Inbound {
 pub struct CallResult {
     pub payload: Vec<u8>,
     pub received: Vec<Endpoint>,
+    pub received_native: Option<NativeFile>,
 }
 
 pub(crate) struct WaitSlot {
@@ -288,7 +291,7 @@ impl RuntimeInner {
                 let mut st = self.st.lock().unwrap();
                 st.waiters.remove(&p.corr).map(|s| s.peek())
             };
-            let res = Ok(CallResult { payload: p.payload, received: p.got });
+            let res = Ok(CallResult { payload: p.payload, received: p.got, received_native: None });
             if let Some(inner) = inner {
                 let (m, cv) = &*inner;
                 *m.lock().unwrap() = Some(res);
@@ -303,6 +306,7 @@ impl RuntimeInner {
             corr: p.corr,
             payload: p.payload,
             received: p.got,
+            received_native: None,
         };
         loop {
             match self.inbound.try_push(item, cost) {
@@ -648,7 +652,7 @@ impl RuntimeInner {
                     let mut st = self.st.lock().unwrap();
                     st.waiters.remove(&d.corr).map(|s| s.peek())
                 };
-                let res = Ok(CallResult { payload: d.payload, received });
+                let res = Ok(CallResult { payload: d.payload, received, received_native: None });
                 match inner {
                     Some(inner) => {
                         let (m, cv) = &*inner;
@@ -671,7 +675,7 @@ impl RuntimeInner {
                     .collect();
                 let cost = d.payload.len() + INBOUND_COST_OVERHEAD;
                 let mut item =
-                    Inbound { from: d.target, local, corr: d.corr, payload: d.payload, received };
+                    Inbound { from: d.target, local, corr: d.corr, payload: d.payload, received, received_native: None };
                 // Backpressure: retry WITHOUT holding the state lock; bounded
                 // forever because the fabric eventually goes terminal.
                 loop {
@@ -757,6 +761,7 @@ impl Endpoint {
             corr,
             attachments: vec![],
             payload,
+            native: None,
         }))
         .map_err(|e| {
             let mut st = self.shared.st.lock().unwrap();
@@ -937,6 +942,7 @@ impl Runtime {
                 corr: req.corr,
                 attachments: vec![],
                 payload,
+                native: None,
             }))?;
             return Ok(TransferOutcome::Committed);
         }
@@ -969,6 +975,7 @@ impl Runtime {
             corr: req.corr,
             attachments,
             payload,
+            native: None,
         }))?;
         xfer_trace("sender_reply_emitted");
         let deadline = Instant::now() + Duration::from_secs(10);

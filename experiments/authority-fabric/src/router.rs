@@ -433,6 +433,7 @@ impl Router {
                 corr: f.corr,
                 attachments,
                 payload: f.payload,
+                native: None,
             }),
         ));
         Ok(out)
@@ -462,6 +463,7 @@ impl Router {
                 corr,
                 attachments: vec![],
                 payload,
+                native: None,
             })));
         }
         Ok(out)
@@ -846,6 +848,7 @@ mod tests {
             corr: 1,
             attachments: atts,
             payload: b"x".to_vec(),
+            native: None,
         }
     }
 

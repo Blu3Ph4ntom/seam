@@ -27,6 +27,7 @@ use std::io::Read;
 use crate::fabric_error::Cause;
 use crate::id::{EpId, TransferId};
 use crate::limits::Limits;
+use crate::native::ResourceId;
 
 pub const KIND_HELLO: u8 = 1;
 pub const KIND_DATA: u8 = 2;
@@ -77,7 +78,7 @@ pub fn is_control_frame(f: &Frame) -> bool {
             | Frame::Xfer(_)
             | Frame::Close { .. }
             | Frame::Create
-    )
+    ) || matches!(f, Frame::Data(d) if d.native.is_some() || !d.attachments.is_empty())
 }
 
 /// Payload-bearing routed message body (kept separate so the router can take
@@ -88,6 +89,7 @@ pub struct DataInner {
     pub corr: u32,
     pub attachments: Vec<Attachment>,
     pub payload: Vec<u8>,
+    pub native: Option<NativeAttachment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +97,13 @@ pub struct Attachment {
     pub tid: TransferId,
     pub id: EpId,
     pub partner: EpId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeAttachment {
+    pub tid: TransferId,
+    pub rid: ResourceId,
+    pub handle_value: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,7 +152,10 @@ impl Frame {
     pub fn cost(&self) -> usize {
         let body = match self {
             Frame::Hello { .. } => 5,
-            Frame::Data(d) => 16 + 4 + 1 + d.attachments.len() * 48 + d.payload.len(),
+            Frame::Data(d) => {
+                let native_len = if d.native.is_some() { 1 + 40 } else { 1 };
+                16 + 4 + 1 + d.attachments.len() * 48 + native_len + d.payload.len()
+            }
             Frame::Close { .. } => 16,
             Frame::ClosedNotify { entries } => 2 + entries.len() * 17,
             Frame::Grant { .. } => 48,
@@ -199,6 +211,12 @@ fn put_ep(out: &mut Vec<u8>, id: EpId) {
 fn put_tid(out: &mut Vec<u8>, id: TransferId) {
     out.extend_from_slice(&id.0);
 }
+fn put_rid(out: &mut Vec<u8>, id: ResourceId) {
+    out.extend_from_slice(&id.0);
+}
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
 
 struct Cursor<'a> {
     b: &'a [u8],
@@ -238,6 +256,15 @@ impl<'a> Cursor<'a> {
         b.copy_from_slice(s);
         Ok(TransferId(b))
     }
+    fn rid(&mut self) -> Result<ResourceId, FrameError> {
+        let s = self.take(16)?;
+        let mut b = [0u8; 16];
+        b.copy_from_slice(s);
+        Ok(ResourceId(b))
+    }
+    fn u64v(&mut self) -> Result<u64, FrameError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
     fn rest(&mut self) -> &'a [u8] {
         let s = &self.b[self.pos..];
         self.pos = self.b.len();
@@ -270,6 +297,14 @@ pub fn encode_into(frame: &Frame, out: &mut Vec<u8>) {
                 put_tid(out, a.tid);
                 put_ep(out, a.id);
                 put_ep(out, a.partner);
+            }
+            if let Some(n) = &d.native {
+                out.push(1);
+                put_tid(out, n.tid);
+                put_rid(out, n.rid);
+                put_u64(out, n.handle_value);
+            } else {
+                out.push(0);
             }
             out.extend_from_slice(&d.payload);
         }
@@ -371,8 +406,19 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
                     }
                 }
             }
+            let has_native = c.u8v()?;
+            let native = if has_native == 1 {
+                let tid = c.tid()?;
+                let rid = c.rid()?;
+                let handle_value = c.u64v()?;
+                Some(NativeAttachment { tid, rid, handle_value })
+            } else if has_native == 0 {
+                None
+            } else {
+                return Err(FrameError::UnknownKind(KIND_DATA));
+            };
             let payload = c.rest().to_vec();
-            Ok(Frame::Data(DataInner { target, corr, attachments, payload }))
+            Ok(Frame::Data(DataInner { target, corr, attachments, payload, native }))
         }
         KIND_CLOSE => Ok(Frame::Close { target: c.epid()? }),
         KIND_CLOSED_NOTIFY => {
@@ -507,6 +553,7 @@ mod tests {
                 corr: 9,
                 attachments: vec![Attachment { tid: tid(1), id: ep(100), partner: ep(101) }],
                 payload: vec![1, 2, 3],
+                native: None,
             }),
             Frame::Close { target: ep(7) },
             Frame::ClosedNotify {
@@ -583,7 +630,7 @@ mod tests {
     fn attach_count_over_limit_rejected() {
         let l = Limits { max_attachments: 2, max_frame_body: 4096, ..lim() };
         let mut buf = Vec::new();
-        let body_len = 16 + 4 + 1 + 3 * 48;
+        let body_len = 16 + 4 + 1 + 3 * 48 + 1;
         buf.extend_from_slice(&((1 + body_len) as u32).to_le_bytes());
         buf.push(KIND_DATA);
         buf.extend_from_slice(&[0u8; 15]);
@@ -598,6 +645,7 @@ mod tests {
             buf.extend_from_slice(&[0u8; 15]);
             buf.push(i.saturating_add(50)); // partner
         }
+        buf.push(0); // has_native = 0
         assert_eq!(
             decode(&buf, &l),
             Err(FrameError::AttachCountExceedsLimit(3))
@@ -608,7 +656,7 @@ mod tests {
     fn duplicate_attachment_rejected() {
         let l = lim();
         let mut buf = Vec::new();
-        let body_len = 16 + 4 + 1 + 2 * 48;
+        let body_len = 16 + 4 + 1 + 2 * 48 + 1;
         buf.extend_from_slice(&((1 + body_len) as u32).to_le_bytes());
         buf.push(KIND_DATA);
         buf.extend_from_slice(&[0u8; 15]);
@@ -622,6 +670,7 @@ mod tests {
             buf.extend_from_slice(&[0u8; 15]);
             buf.push(100);
         }
+        buf.push(0); // has_native = 0
         assert_eq!(decode(&buf, &l), Err(FrameError::DuplicateAttachment));
     }
 
