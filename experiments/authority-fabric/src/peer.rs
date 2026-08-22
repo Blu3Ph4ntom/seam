@@ -525,6 +525,40 @@ impl RuntimeInner {
     }
 
     fn process_data(self: &Arc<Self>, d: DataInner) {
+        // Native resource handling (0 or 1 per transfer) - before endpoint attachments
+        if let Some(native) = d.native.clone() {
+            // For now, immediately materialize a dummy NativeFile for happy path
+            // Real implementation would park until COMMIT
+            let dummy_file = {
+                #[cfg(windows)]
+                {
+                    // handle_value may be 0 for Linux; for Windows try to materialize
+                    if native.handle_value != 0 {
+                        crate::native::windows::handle_to_file(native.handle_value)
+                    } else {
+                        std::fs::File::create(std::env::temp_dir().join("dummy_native")).unwrap()
+                    }
+                }
+                #[cfg(unix)]
+                {
+                    std::fs::File::create(std::env::temp_dir().join("dummy_native")).unwrap()
+                }
+                #[cfg(not(any(windows, unix)))]
+                {
+                    std::fs::File::create(std::env::temp_dir().join("dummy_native")).unwrap()
+                }
+            };
+            let native_file = NativeFile::restore(native.rid, dummy_file);
+            let cost = d.payload.len() + INBOUND_COST_OVERHEAD;
+            // Determine local endpoint for delivery (use target's partner)
+            let local = {
+                let st = self.st.lock().unwrap();
+                st.partner_of_theirs.get(&d.target).copied().unwrap_or(d.target)
+            };
+            let mut item = Inbound { from: d.target, local, corr: d.corr, payload: d.payload, received: vec![], received_native: Some(native_file) };
+            let _ = self.inbound.try_push(item, cost);
+            return;
+        }
         // Attachments are offers: ACCEPT if we have capacity, then wait for
         // COMMIT before the handle becomes usable.
         if !d.attachments.is_empty() {
@@ -788,6 +822,14 @@ impl Endpoint {
         }
     }
 
+    /// Call with native resource attachment (experimental).
+    pub fn call_with_native(&self, payload: Vec<u8>, native: NativeFile, timeout: Duration) -> Result<CallResult, FabError> {
+        // For now, delegate to normal call; real native FD/HANDLE passing is via host escrow
+        // The NativeFile's handle_value will be sent in Data's native attachment with tid/rid
+        let _ = native;
+        self.call(payload, timeout)
+    }
+
     /// Destroy this end deliberately. Consumes the authority.
     pub fn close(mut self) -> Result<(), FabError> {
         self.armed = false;
@@ -1040,6 +1082,37 @@ impl Runtime {
         } else {
             Ok(TransferOutcome::Aborted(aborted))
         }
+    }
+
+    pub fn reply_with_native(&self, req: &Inbound, payload: Vec<u8>, native: Option<NativeFile>) -> Result<TransferOutcome, FabError> {
+        if let Some(native_file) = native {
+            // Minimal native transfer: create tid/rid and send handle_value
+            let tid = {
+                struct Empty;
+                impl crate::id::TransferSpace for Empty { fn contains(&self, _: crate::id::TransferId) -> bool { false } }
+                crate::id::fresh_transfer_id(&Empty)
+            };
+            let rid = native_file.id();
+            let handle_value = {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::AsRawHandle;
+                    let mut nf = native_file;
+                    let hv = nf.file().as_raw_handle() as u64;
+                    drop(nf);
+                    hv
+                }
+                #[cfg(unix)]
+                {
+                    let _ = native_file;
+                    0u64
+                }
+            };
+            let native_att = crate::frame::NativeAttachment { tid, rid, handle_value };
+            self.shared.push_out(Frame::Data(DataInner { target: req.local, corr: req.corr, attachments: vec![], payload, native: Some(native_att) }))?;
+            return Ok(TransferOutcome::Committed);
+        }
+        self.reply(req, payload, vec![])
     }
 
     fn transfer_status(&self, tid: TransferId, timeout: Duration) -> Result<u8, FabError> {

@@ -22,6 +22,7 @@ use crate::frame::{
 };
 use crate::id::{fresh_id, fresh_transfer_id, BoundedTombstones, EpId, IdSpace, TransferId, TransferSpace};
 use crate::limits::Limits;
+use crate::native::{ResourceId, ResourceSpace, fresh_resource_id};
 
 fn barrier_wait(name: &str) {
     if let Ok(dir) = std::env::var("SEAM_BARRIER_DIR") {
@@ -103,6 +104,22 @@ pub struct XferRec {
     pub phase: XferPhase,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeState {
+    Escrowed,
+    Committed,
+    Aborted,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeRec {
+    pub tid: TransferId,
+    pub rid: ResourceId,
+    pub sender: PeerId,
+    pub dest: PeerId,
+    pub state: NativeState,
+}
+
 /// Test-only delivery faults. Never used on the production path unless set.
 #[derive(Clone, Debug, Default)]
 pub struct Inject {
@@ -121,6 +138,11 @@ pub struct Router {
     xfers: HashMap<TransferId, XferRec>,
     /// Terminal results retained until sender ACKs. Bounded, never LRU-evicted.
     results: HashMap<TransferId, (PeerId, Cause)>,
+    // Native resource tracking (Host escrow, same transactional semantics)
+    native_pending: HashMap<TransferId, NativeRec>,
+    native_results: HashMap<TransferId, (PeerId, Cause)>,
+    native_live: HashMap<ResourceId, PeerId>,
+    native_retired: BoundedTombstones<ResourceId>,
     host_events: Vec<HostEvent>,
     pub inject: Inject,
     collisions: u64,
@@ -136,6 +158,9 @@ pub struct Accounting {
     pub pending_transfers: usize,
     pub escrowed: usize,
     pub unacked_results: usize,
+    pub native_live: usize,
+    pub native_pending: usize,
+    pub native_unacked: usize,
 }
 
 impl Router {
@@ -148,6 +173,10 @@ impl Router {
             eps: HashMap::new(),
             xfers: HashMap::new(),
             results: HashMap::new(),
+            native_pending: HashMap::new(),
+            native_results: HashMap::new(),
+            native_live: HashMap::new(),
+            native_retired: BoundedTombstones::new(lim.max_retired),
             host_events: Vec::new(),
             inject: Inject::default(),
             collisions: 0,
@@ -172,13 +201,17 @@ impl Router {
                 .values()
                 .filter(|e| !e.closed && e.holder == Holder::Host)
                 .count(),
-            pending_transfers: self.xfers.values().filter(|x| x.phase == XferPhase::Offered).count(),
+            pending_transfers: self.xfers.values().filter(|x| x.phase == XferPhase::Offered).count()
+                + self.native_pending.values().filter(|n| n.state == NativeState::Escrowed).count(),
             escrowed: self
                 .eps
                 .values()
                 .filter(|e| !e.closed && matches!(e.holder, Holder::Escrow(_)))
                 .count(),
-            unacked_results: self.results.len(),
+            unacked_results: self.results.len() + self.native_results.len(),
+            native_live: self.native_live.len(),
+            native_pending: self.native_pending.len(),
+            native_unacked: self.native_results.len(),
         }
     }
 
@@ -200,13 +233,31 @@ impl Router {
         struct T<'a>(
             &'a HashMap<TransferId, XferRec>,
             &'a HashMap<TransferId, (PeerId, Cause)>,
+            &'a HashMap<TransferId, NativeRec>,
+            &'a HashMap<TransferId, (PeerId, Cause)>,
         );
         impl TransferSpace for T<'_> {
             fn contains(&self, id: TransferId) -> bool {
-                self.0.contains_key(&id) || self.1.contains_key(&id)
+                self.0.contains_key(&id)
+                    || self.1.contains_key(&id)
+                    || self.2.contains_key(&id)
+                    || self.3.contains_key(&id)
             }
         }
-        T(&self.xfers, &self.results)
+        T(&self.xfers, &self.results, &self.native_pending, &self.native_results)
+    }
+
+    fn taken_rids(&self) -> impl ResourceSpace + '_ {
+        struct R<'a>(
+            &'a HashMap<ResourceId, PeerId>,
+            &'a BoundedTombstones<ResourceId>,
+        );
+        impl ResourceSpace for R<'_> {
+            fn contains(&self, id: ResourceId) -> bool {
+                self.0.contains_key(&id) || self.1.contains(id)
+            }
+        }
+        R(&self.native_live, &self.native_retired)
     }
 
     pub fn accept_peer(&mut self) -> PeerId {
@@ -418,6 +469,42 @@ impl Router {
             );
         }
 
+        // Native resource handling (0 or 1 per transfer)
+        if let Some(native) = f.native.take() {
+            // Validate resource id not reused and tid not duplicate
+            if self.taken_rids().contains(native.rid) || self.taken_tids().contains(native.tid) {
+                return Err(Poison("duplicate or reused native resource id"));
+            }
+            // Capacity checks for native
+            if self.native_pending.len() + self.native_results.len() >= self.lim.max_native_resources
+                || self.native_pending.len() >= self.lim.max_resources_in_escrow
+            {
+                let mut out = RouteOutcome::default();
+                out.send.push((from, Frame::Error(crate::frame::ERR_CAPACITY)));
+                return Ok(out);
+            }
+            // Windows handle_value validation: must be non-zero if present, but allow 0 for Linux
+            // For now, just check tid/rid not zero
+            if native.rid.is_zero() || native.tid.is_zero() {
+                return Err(Poison("zero native id"));
+            }
+            self.native_pending.insert(
+                native.tid,
+                NativeRec {
+                    tid: native.tid,
+                    rid: native.rid,
+                    sender: from,
+                    dest: dest_peer,
+                    state: NativeState::Escrowed,
+                },
+            );
+            // Also track that this tid is now pending for native
+            // The actual File handle is held by host IO layer, not router
+            f.native = Some(native);
+        } else {
+            f.native = None;
+        }
+
         if std::env::var("SEAM_PAUSE_AFTER_ESCROW").map(|v| v == "1").unwrap_or(false) {
             barrier_wait("host_after_escrow");
         }
@@ -433,7 +520,7 @@ impl Router {
                 corr: f.corr,
                 attachments,
                 payload: f.payload,
-                native: None,
+                native: f.native,
             }),
         ));
         Ok(out)
@@ -532,6 +619,7 @@ impl Router {
         self.peers.remove(&p);
         // A dead sender can never observe its result: clean retained results.
         self.results.retain(|_, (s, _)| *s != p);
+        self.native_results.retain(|_, (s, _)| *s != p);
         // Collect conversations touching this peer.
         let touched: Vec<EpId> = self
             .eps
@@ -559,6 +647,26 @@ impl Router {
                     // T3/T4/T5: dest died pre-commit; restore to sender.
                     let extra = self.xfer_abort_inner(tid, "recipient lost").unwrap_or_default();
                     out.send.extend(extra.send);
+                }
+            }
+        }
+        // Native pending handling
+        let native_pending: Vec<TransferId> = self
+            .native_pending
+            .values()
+            .filter(|n| n.state == NativeState::Escrowed && (n.sender == p || n.dest == p))
+            .map(|n| n.tid)
+            .collect();
+        for tid in native_pending {
+            if let Some(n) = self.native_pending.get(&tid).copied() {
+                if n.sender == p {
+                    // Sender died pre-commit: close escrow, abort
+                    self.native_pending.remove(&tid);
+                    self.native_results.insert(tid, (n.sender, Cause::Graceful));
+                    self.native_retired.insert(n.rid, Cause::Graceful);
+                } else {
+                    // Dest died pre-commit: restore to sender
+                    let _ = self.native_abort_inner(tid, "recipient lost");
                 }
             }
         }
@@ -620,11 +728,20 @@ impl Router {
                 XferPhase::Aborted => XFER_ST_ABORTED,
             };
         }
-        match self.results.get(&tid) {
-            Some((_, Cause::PeerLost)) => XFER_ST_COMMITTED,
-            Some((_, Cause::Graceful)) => XFER_ST_ABORTED,
-            None => XFER_ST_UNKNOWN,
+        if let Some(n) = self.native_pending.get(&tid) {
+            return match n.state {
+                NativeState::Escrowed => XFER_ST_PENDING,
+                NativeState::Committed => XFER_ST_COMMITTED,
+                NativeState::Aborted => XFER_ST_ABORTED,
+            };
         }
+        if let Some((_, c)) = self.results.get(&tid).or_else(|| self.native_results.get(&tid)) {
+            return match c {
+                Cause::PeerLost => XFER_ST_COMMITTED,
+                Cause::Graceful => XFER_ST_ABORTED,
+            };
+        }
+        XFER_ST_UNKNOWN
     }
 
     fn finish_xfer(&mut self, tid: TransferId, sender: PeerId, phase: XferPhase) {
@@ -689,6 +806,11 @@ impl Router {
                         self.results.remove(&tid);
                     }
                 }
+                if let Some((sender, _)) = self.native_results.get(&tid).copied() {
+                    if sender == from {
+                        self.native_results.remove(&tid);
+                    }
+                }
                 Ok(RouteOutcome::default())
             }
             XferMsg::Commit { .. }
@@ -714,6 +836,21 @@ impl Router {
             }
             return self.xfer_commit_inner(tid);
         }
+        if let Some(n) = self.native_pending.get(&tid).copied() {
+            if n.dest != from {
+                return Err(Poison("accept from wrong recipient"));
+            }
+            if n.state != NativeState::Escrowed {
+                return Ok(RouteOutcome::default());
+            }
+            if self.native_live.len() >= self.lim.max_native_resources {
+                return self.native_abort_inner(tid, "recipient capacity");
+            }
+            if std::env::var("SEAM_PAUSE_BEFORE_COMMIT").map(|v| v == "1").unwrap_or(false) {
+                barrier_wait("host_before_commit");
+            }
+            return self.native_commit_inner(tid);
+        }
         match self.xfer_status(tid) {
             XFER_ST_COMMITTED | XFER_ST_ABORTED => Ok(RouteOutcome::default()),
             _ => Err(Poison("unknown transfer id")),
@@ -734,6 +871,15 @@ impl Router {
                 return Ok(RouteOutcome::default());
             }
             return self.xfer_abort_inner(tid, why);
+        }
+        if let Some(n) = self.native_pending.get(&tid).copied() {
+            if n.dest != from && n.sender != from {
+                return Err(Poison("abort from unrelated peer"));
+            }
+            if n.state != NativeState::Escrowed {
+                return Ok(RouteOutcome::default());
+            }
+            return self.native_abort_inner(tid, why);
         }
         match self.xfer_status(tid) {
             XFER_ST_COMMITTED | XFER_ST_ABORTED => Ok(RouteOutcome::default()),
@@ -795,9 +941,59 @@ impl Router {
         Ok(out)
     }
 
+    fn native_commit_inner(&mut self, tid: TransferId) -> Result<RouteOutcome, Poison> {
+        let rec = *self.native_pending.get(&tid).ok_or(Poison("unknown native transfer"))?;
+        if rec.state != NativeState::Escrowed {
+            return Ok(RouteOutcome::default());
+        }
+        // Move from pending to committed, and live to dest
+        self.native_pending.remove(&tid);
+        self.native_results.insert(tid, (rec.sender, Cause::PeerLost));
+        self.native_live.insert(rec.rid, rec.dest);
+        // Retire the old rid if it was previously live (should not happen for new rid)
+        if std::env::var("SEAM_PAUSE_AFTER_COMMIT").map(|v| v == "1").unwrap_or(false) {
+            barrier_wait("host_after_commit");
+        }
+        let mut out = RouteOutcome::default();
+        if !self.inject.drop_commit {
+            out.send.push((rec.dest, Frame::Xfer(XferMsg::Commit { tid, ep: EpId(rec.rid.0), partner: EpId([0u8;16]) })));
+        }
+        if !self.inject.drop_committed {
+            out.send.push((rec.sender, Frame::Xfer(XferMsg::Committed { tid })));
+        }
+        Ok(out)
+    }
+
+    fn native_abort_inner(&mut self, tid: TransferId, _why: &'static str) -> Result<RouteOutcome, Poison> {
+        let rec = *self.native_pending.get(&tid).ok_or(Poison("unknown native transfer"))?;
+        if rec.state != NativeState::Escrowed {
+            return Ok(RouteOutcome::default());
+        }
+        self.native_pending.remove(&tid);
+        self.native_results.insert(tid, (rec.sender, Cause::Graceful));
+        // No live entry for rid yet, so nothing to remove; on abort, rid returns to sender implicitly
+        // For abort, we don't insert into native_live; sender will recreate on restore
+        let mut out = RouteOutcome::default();
+        if !self.inject.drop_abort {
+            if self.peers.contains_key(&rec.sender) {
+                out.send.push((rec.sender, Frame::Xfer(XferMsg::Abort { tid })));
+            }
+            if rec.dest != rec.sender && self.peers.contains_key(&rec.dest) {
+                out.send.push((rec.dest, Frame::Xfer(XferMsg::Abort { tid })));
+            }
+        }
+        Ok(out)
+    }
+
     /// Test helper: force-abort an offered transfer.
     pub fn abort_transfer(&mut self, tid: TransferId) -> Result<RouteOutcome, Poison> {
-        self.xfer_abort_inner(tid, "forced abort")
+        if self.xfers.contains_key(&tid) {
+            return self.xfer_abort_inner(tid, "forced abort");
+        }
+        if self.native_pending.contains_key(&tid) {
+            return self.native_abort_inner(tid, "forced abort");
+        }
+        Err(Poison("unknown transfer id"))
     }
 }
 
@@ -805,6 +1001,8 @@ impl Router {
 mod tests {
     use super::*;
     use crate::frame::{Attachment, DataInner, Frame, XferMsg, ERR_CAPACITY};
+    use crate::native::ResourceId;
+    use crate::id::TransferId;
 
     fn hello_ok(r: &mut Router, p: PeerId) {
         r.on_hello(p, Limits::default().hello_magic, Limits::default().hello_version)
@@ -1361,5 +1559,22 @@ mod tests {
         let oc = r3.on_data(a3, data(x3, vec![att(tra4, imp4)])).unwrap();
         assert!(matches!(oc.send[0].1, Frame::Error(ERR_CAPACITY)));
         let _ = tid3;
+    }
+
+    #[test]
+    fn native_happy_path() {
+        let (mut r, a, b, x, _) = primed();
+        let rid = ResourceId([9u8; 16]);
+        let tid = TransferId([10u8; 16]);
+        let native = crate::frame::NativeAttachment { tid, rid, handle_value: 12345 };
+        let f = DataInner { target: x, corr: 1, attachments: vec![], payload: b"x".to_vec(), native: Some(native) };
+        let out = r.on_data(a, f).unwrap();
+        assert!(out.send.iter().any(|(dest, f)| *dest == b && matches!(f, Frame::Data(d) if d.native.is_some())));
+        assert_eq!(r.native_pending.len(), 1);
+        r.on_xfer(b, XferMsg::Accept { tid }).unwrap();
+        assert_eq!(r.native_live.get(&rid), Some(&b));
+        assert_eq!(r.native_results.len(), 1);
+        r.on_xfer(a, XferMsg::ResultAck { tid }).unwrap();
+        assert_eq!(r.native_results.len(), 0);
     }
 }

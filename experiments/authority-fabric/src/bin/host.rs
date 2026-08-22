@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use authority_fabric::frame::{self, Frame, FrameError, XferMsg};
-use authority_fabric::id::EpId;
+use authority_fabric::id::{EpId, TransferId};
 use authority_fabric::proto::{self, ControlMsg};
 use authority_fabric::queue::DualQueue;
 use authority_fabric::router::{PeerId, Router};
@@ -40,6 +40,8 @@ struct Conn {
     child: Child,
     /// Wake-driven; ctrl compartment has reserved capacity.
     q: Arc<DualQueue<Frame>>,
+    #[cfg(unix)]
+    resource_lane: Option<std::os::unix::net::UnixStream>,
 }
 
 struct Fabric {
@@ -53,6 +55,7 @@ struct Fabric {
     /// (corr, payload) of DATA delivered to host-held endpoints.
     ctrl_drain: VecDeque<(u32, Vec<u8>)>,
     exit_codes: HashMap<PeerId, i32>,
+    native_escrow: HashMap<TransferId, std::fs::File>,
 }
 
 impl Fabric {
@@ -68,6 +71,7 @@ impl Fabric {
             hellos: HashSet::new(),
             ctrl_drain: VecDeque::new(),
             exit_codes: HashMap::new(),
+            native_escrow: HashMap::new(),
         }
     }
 
@@ -151,7 +155,7 @@ impl Fabric {
             });
         }
 
-        self.conns.insert(pid, Conn { child, q });
+        self.conns.insert(pid, Conn { child, q, #[cfg(unix)] resource_lane: None });
         Ok(pid)
     }
 

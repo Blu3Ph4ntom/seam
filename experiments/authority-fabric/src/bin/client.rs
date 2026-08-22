@@ -58,7 +58,7 @@ fn main() {
         "churn" => churn(&rt),
         "perf" => perf(&rt),
         "abort_cycle" => abort_cycle(&rt),
-        "txn_once" => txn_once(&rt),
+        "txn_once" => txn_once(&rt),`r`n        "native_happy" => native_happy(&rt),
         "preflight_p1_client" => preflight_p1_client(&rt),
         "preflight_p3_client" => preflight_p3_client(&rt),
         _ => full_demo(&rt),

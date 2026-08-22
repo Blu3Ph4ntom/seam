@@ -9,6 +9,7 @@ use authority_fabric::fabric_error::FabError;
 use authority_fabric::id::EpId;
 use authority_fabric::peer::{Endpoint, Inbound, Runtime, TransferOutcome};
 use authority_fabric::marker;
+use authority_fabric::native::NativeFile;
 use authority_fabric::proto::{
     self, CounterRequest, RootRequest, RootResponse,
 };
@@ -69,6 +70,20 @@ fn main() {
                     );
                 }
                 Ok(RootRequest::OpenCounter) => {
+                    if mode == "native" {
+                        let nonce = b"SEAM_NATIVE_NONCE";
+                        match NativeFile::new_temp(nonce) {
+                            Ok(nf) => {
+                                let outcome = rt.reply_with_native(&req, proto::encode_root_response(RootResponse::Counter), Some(nf));
+                                match outcome {
+                                    Ok(_) => {},
+                                    Err(e) => eprintln!("SERVICE_FAIL native reply: {e}"),
+                                }
+                            }
+                            Err(e) => eprintln!("SERVICE_FAIL native create: {e}"),
+                        }
+                        continue;
+                    }
                     // Prefer re-transferring a previously aborted capability
                     // before creating a new one: proves restored authority is
                     // the same logical capability and is retransferrable.
