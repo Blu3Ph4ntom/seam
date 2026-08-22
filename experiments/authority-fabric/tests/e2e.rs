@@ -260,3 +260,21 @@ fn abort_cycle() {
     assert_contains(&combined, "SVC_AUTHORITY_RESTORED", "abort_cycle");
     assert_contains(&combined, "CLIENT_ABORT_RESTORED_USABLE", "abort_cycle");
 }
+
+#[test]
+fn barrier_harness_smoke() {
+    // Smoke: SEAM_BARRIER_DIR without pausing must not break abort_cycle.
+    let dir = std::env::temp_dir().join(format!("seam-barrier-smoke-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let dir_s = dir.to_string_lossy().to_string();
+    let out = run_host(
+        &["abort_cycle"],
+        &[("SEAM_BARRIER_DIR", dir_s.as_str())],
+        Duration::from_secs(60),
+    );
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "barrier_smoke\n{combined}");
+    assert_contains(&combined, "ABORT_CYCLE_OK", "barrier_smoke");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -458,6 +458,10 @@ fn bootstrap(
     let svc_os = fab.conns.get(&svc).map(|c| c.child.id()).unwrap_or(0);
     let cli_os = fab.conns.get(&cli).map(|c| c.child.id()).unwrap_or(0);
     marker!("HOST_PIDS svc={} cli={}", svc_os, cli_os);
+    if let Ok(dir) = std::env::var("SEAM_BARRIER_DIR") {
+        let p = std::path::Path::new(&dir).join("pids.txt");
+        let _ = std::fs::write(p, format!("svc={} cli={} host={}", svc_os, cli_os, std::process::id()));
+    }
     fab.wait_hellos(2, Duration::from_secs(10))?;
     marker!("SERVICE_BOOTSTRAPPED");
     marker!("CLIENT_BOOTSTRAPPED");
