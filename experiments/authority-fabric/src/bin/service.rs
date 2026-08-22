@@ -2,11 +2,13 @@
 //! created through it. Modes via SEAM_SERVICE_MODE: "normal" | "hold".
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::time::Duration;
 
 use authority_fabric::fabric_error::FabError;
 use authority_fabric::id::EpId;
-use authority_fabric::peer::{Endpoint, Inbound, Runtime};
+use authority_fabric::peer::{Endpoint, Inbound, Runtime, TransferOutcome};
+use authority_fabric::marker;
 use authority_fabric::proto::{
     self, CounterRequest, RootRequest, RootResponse,
 };
@@ -43,6 +45,7 @@ fn main() {
     let mut counters: HashMap<EpId, u64> = HashMap::new();
     // RAII: keep implementation-side handles alive; dropping them would Close.
     let mut held: Vec<Endpoint> = Vec::new();
+    let mut restored_q: Vec<Endpoint> = Vec::new();
 
     loop {
         let req: Inbound = match rt.wait_inbound(Duration::from_secs(600)) {
@@ -66,20 +69,52 @@ fn main() {
                     );
                 }
                 Ok(RootRequest::OpenCounter) => {
-                    match rt.create_endpoint(Duration::from_secs(5)) {
-                        Ok((imp, transferable)) => {
-                            counters.insert(imp.id(), 0);
-                            // Transfer invocation authority inside an
-                            // ordinary reply. No registry involved.
-                            let _ = rt.reply(
-                                &req,
-                                proto::encode_root_response(RootResponse::Counter),
-                                vec![transferable],
-                            );
-                            held.push(imp);
+                    // Prefer re-transferring a previously aborted capability
+                    // before creating a new one: proves restored authority is
+                    // the same logical capability and is retransferrable.
+                    let attempt = if let Some(cap) = restored_q.pop() {
+                        rt.reply(
+                            &req,
+                            proto::encode_root_response(RootResponse::Counter),
+                            vec![cap],
+                        )
+                    } else {
+                        match rt.create_endpoint(Duration::from_secs(5)) {
+                            Ok((imp, transferable)) => {
+                                counters.insert(imp.id(), 0);
+                                held.push(imp);
+                                rt.reply(
+                                    &req,
+                                    proto::encode_root_response(RootResponse::Counter),
+                                    vec![transferable],
+                                )
+                            }
+                            Err(e) => {
+                                eprintln!("SERVICE_FAIL create_endpoint: {e}");
+                                continue;
+                            }
+                        }
+                    };
+                    match attempt {
+                        Ok(TransferOutcome::Committed) => {}
+                        Ok(TransferOutcome::Aborted(back)) => {
+                            marker!("SVC_AUTHORITY_RESTORED n={}", back.len());
+                            // Keep restored handles alive for re-transfer.
+                            // Drop-after-abort case: handled via env hook below.
+                            if std::env::var("SEAM_SVC_DROP_RESTORED")
+                                .map(|v| v == "1")
+                                .unwrap_or(false)
+                            {
+                                drop(back);
+                            } else {
+                                restored_q.extend(back);
+                            }
+                        }
+                        Ok(TransferOutcome::AuthorityLost(c)) => {
+                            eprintln!("SERVICE_FAIL authority lost: {c:?}");
                         }
                         Err(e) => {
-                            eprintln!("SERVICE_FAIL create_endpoint: {e}");
+                            eprintln!("SERVICE_FAIL transfer error: {e}");
                         }
                     }
                 }

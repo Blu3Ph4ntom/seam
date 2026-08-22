@@ -35,7 +35,10 @@ fn main() {
     }
     let lim = Limits {
         // Churn needs more concurrent capacity than the default.
-        max_live_endpoints: 64,
+        max_live_endpoints: std::env::var("SEAM_CLI_MAX_EPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64),
         ..Limits::default()
     };
     let rt = match Runtime::connect_as_child(std::io::stdin(), std::io::stdout(), lim) {
@@ -54,6 +57,7 @@ fn main() {
         "watchdog" => watchdog(&rt),
         "churn" => churn(&rt),
         "perf" => perf(&rt),
+        "abort_cycle" => abort_cycle(&rt),
         _ => full_demo(&rt),
     };
     rt.shutdown();
@@ -567,6 +571,105 @@ fn perf(rt: &Runtime) -> i32 {
         return 1;
     }
     marker!("CLIENT_OK");
+    0
+}
+
+fn abort_cycle(rt: &Runtime) -> i32 {
+    let mut seen = HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL no root: {e}");
+            return 1;
+        }
+    };
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL no ctrl: {e}");
+            return 1;
+        }
+    };
+    // Fill to capacity: 2 held counters + root + ctrl = 4 live.
+    let mut held = Vec::new();
+    for i in 0..2 {
+        let res = match root.call(
+            proto::encode_root_request(RootRequest::OpenCounter),
+            CALL_TIMEOUT,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("CLIENT_FAIL fill[{i}]: {e}");
+                return 1;
+            }
+        };
+        if let Some(cap) = res.received.into_iter().next() {
+            held.push(cap);
+        } else {
+            eprintln!("CLIENT_FAIL fill[{i}] no cap");
+            return 1;
+        }
+    }
+    // Next transfer should be rejected due to recipient capacity.
+    // The call itself should fail with TransferAborted, not hang.
+    match root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        CALL_TIMEOUT,
+    ) {
+        Err(FabError::TransferAborted(_)) => {
+            marker!("CLIENT_ABORT_OBSERVED");
+        }
+        Ok(r) if r.received.is_empty() => {
+            marker!("CLIENT_ABORT_OBSERVED_EMPTY");
+        }
+        Ok(_) => {
+            eprintln!("CLIENT_FAIL expected abort, got success with cap");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL abort probe unexpected {e}");
+            return 1;
+        }
+    }
+    // Free one slot and retransmit: should succeed and be usable.
+    drop(held.pop());
+    let res = match root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        CALL_TIMEOUT,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL retransmit: {e}");
+            return 1;
+        }
+    };
+    let Some(counter) = res.received.into_iter().next() else {
+        eprintln!("CLIENT_FAIL no cap after retransmit");
+        return 1;
+    };
+    let cres = match counter.call(
+        proto::encode_counter_request(CounterRequest::Increment),
+        CALL_TIMEOUT,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL increment after restore: {e}");
+            return 1;
+        }
+    };
+    match proto::decode_counter_response(&cres.payload) {
+        Ok(CounterResponse::Incremented(1)) => {}
+        other => {
+            eprintln!("CLIENT_FAIL increment value {other:?}");
+            return 1;
+        }
+    }
+    marker!("CLIENT_ABORT_RESTORED_USABLE");
+    if send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done).is_err() {
+        eprintln!("CLIENT_FAIL done signal");
+        return 1;
+    }
+    marker!("CLIENT_ABORT_CYCLE_OK");
     0
 }
 

@@ -23,6 +23,20 @@ use crate::frame::{
 use crate::id::{fresh_id, fresh_transfer_id, BoundedTombstones, EpId, IdSpace, TransferId, TransferSpace};
 use crate::limits::Limits;
 
+fn barrier_wait(name: &str) {
+    if let Ok(dir) = std::env::var("SEAM_BARRIER_DIR") {
+        let path = std::path::Path::new(&dir).join(name);
+        let go = std::path::Path::new(&dir).join(format!("{}.go", name));
+        let _ = std::fs::write(&path, b"1");
+        for _ in 0..600 {
+            if go.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PeerId(pub u32);
 
@@ -105,7 +119,8 @@ pub struct Router {
     eps: HashMap<EpId, EpEntry>,
     retired: BoundedTombstones<EpId>,
     xfers: HashMap<TransferId, XferRec>,
-    xfer_done: BoundedTombstones<TransferId>,
+    /// Terminal results retained until sender ACKs. Bounded, never LRU-evicted.
+    results: HashMap<TransferId, (PeerId, Cause)>,
     host_events: Vec<HostEvent>,
     pub inject: Inject,
     collisions: u64,
@@ -120,18 +135,19 @@ pub struct Accounting {
     pub host_held: usize,
     pub pending_transfers: usize,
     pub escrowed: usize,
+    pub unacked_results: usize,
 }
 
 impl Router {
     pub fn new(lim: Limits) -> Self {
         Router {
             retired: BoundedTombstones::new(lim.max_retired),
-            xfer_done: BoundedTombstones::new(lim.max_retired),
-            lim,
+            lim: lim.clone(),
             peers: HashMap::new(),
             next_peer_raw: 0,
             eps: HashMap::new(),
             xfers: HashMap::new(),
+            results: HashMap::new(),
             host_events: Vec::new(),
             inject: Inject::default(),
             collisions: 0,
@@ -162,6 +178,7 @@ impl Router {
                 .values()
                 .filter(|e| !e.closed && matches!(e.holder, Holder::Escrow(_)))
                 .count(),
+            unacked_results: self.results.len(),
         }
     }
 
@@ -180,13 +197,16 @@ impl Router {
     }
 
     fn taken_tids(&self) -> impl TransferSpace + '_ {
-        struct T<'a>(&'a HashMap<TransferId, XferRec>, &'a BoundedTombstones<TransferId>);
+        struct T<'a>(
+            &'a HashMap<TransferId, XferRec>,
+            &'a HashMap<TransferId, (PeerId, Cause)>,
+        );
         impl TransferSpace for T<'_> {
             fn contains(&self, id: TransferId) -> bool {
-                self.0.contains_key(&id) || self.1.contains(id)
+                self.0.contains_key(&id) || self.1.contains_key(&id)
             }
         }
-        T(&self.xfers, &self.xfer_done)
+        T(&self.xfers, &self.results)
     }
 
     pub fn accept_peer(&mut self) -> PeerId {
@@ -219,7 +239,7 @@ impl Router {
     /// the recipient before commit, and not silently lost on push failure
     /// (the IO glue must report delivery outcome).
     pub fn grant(&mut self, to: PeerId, ep: EpId) -> Result<Frame, Poison> {
-        if self.xfers.len() >= self.lim.max_pending_transfers {
+        if self.xfers.len() + self.results.len() >= self.lim.max_pending_transfers {
             return Err(Poison("pending transfer table full"));
         }
         let tid = fresh_transfer_id(&self.taken_tids());
@@ -371,7 +391,7 @@ impl Router {
             Holder::Escrow(_) => return Err(Poison("conversation partner is in escrow")),
         };
 
-        if attachments.len() + self.xfers.len() > self.lim.max_pending_transfers {
+        if attachments.len() + self.xfers.len() + self.results.len() > self.lim.max_pending_transfers {
             // Resource: abort before commit. Sender still owns (we have not
             // escrowed yet). Surface as ERROR capacity.
             let mut out = RouteOutcome::default();
@@ -396,6 +416,10 @@ impl Router {
                     phase: XferPhase::Offered,
                 },
             );
+        }
+
+        if std::env::var("SEAM_PAUSE_AFTER_ESCROW").map(|v| v == "1").unwrap_or(false) {
+            barrier_wait("host_after_escrow");
         }
 
         let mut out = RouteOutcome::default();
@@ -480,7 +504,9 @@ impl Router {
         if !*self.peers.get(&from).ok_or(Poison("frame from unknown peer"))? {
             return Err(Poison("traffic before hello"));
         }
-        if self.eps.values().filter(|e| !e.closed).count() + 2 > self.lim.max_live_endpoints {
+        if self.eps.values().filter(|e| !e.closed).count() + 2 > self.lim.max_live_endpoints
+            || self.results.len() >= self.lim.max_pending_transfers
+        {
             // Capacity exhaustion is a resource condition, not corruption.
             // Surface as ERROR(code=capacity) to the requester.
             let mut out = RouteOutcome::default();
@@ -502,6 +528,8 @@ impl Router {
     fn peer_gone(&mut self, p: PeerId, cause: Cause) -> RouteOutcome {
         let mut out = RouteOutcome::default();
         self.peers.remove(&p);
+        // A dead sender can never observe its result: clean retained results.
+        self.results.retain(|_, (s, _)| *s != p);
         // Collect conversations touching this peer.
         let touched: Vec<EpId> = self
             .eps
@@ -524,7 +552,7 @@ impl Router {
                             let _ = self.close_conversation(x.ep, cause);
                         }
                     }
-                    self.finish_xfer(tid, XferPhase::Aborted);
+                    self.finish_xfer(tid, x.sender, XferPhase::Aborted);
                 } else {
                     // T3/T4/T5: dest died pre-commit; restore to sender.
                     let extra = self.xfer_abort_inner(tid, "recipient lost").unwrap_or_default();
@@ -590,21 +618,21 @@ impl Router {
                 XferPhase::Aborted => XFER_ST_ABORTED,
             };
         }
-        match self.xfer_done.get(tid) {
-            Some(Cause::PeerLost) => XFER_ST_COMMITTED,
-            Some(Cause::Graceful) => XFER_ST_ABORTED,
+        match self.results.get(&tid) {
+            Some((_, Cause::PeerLost)) => XFER_ST_COMMITTED,
+            Some((_, Cause::Graceful)) => XFER_ST_ABORTED,
             None => XFER_ST_UNKNOWN,
         }
     }
 
-    fn finish_xfer(&mut self, tid: TransferId, phase: XferPhase) {
+    fn finish_xfer(&mut self, tid: TransferId, sender: PeerId, phase: XferPhase) {
         self.xfers.remove(&tid);
         let c = if phase == XferPhase::Committed {
             Cause::PeerLost
         } else {
             Cause::Graceful
         };
-        self.xfer_done.insert(tid, c);
+        self.results.insert(tid, (sender, c));
     }
 
     fn dest_live_count(&self, dest: PeerId) -> usize {
@@ -651,6 +679,16 @@ impl Router {
                 out.send.push((from, Frame::Xfer(XferMsg::StatusAck { tid, status: st })));
                 Ok(out)
             }
+            XferMsg::ResultAck { tid } => {
+                // Idempotent: only the recorded sender's ACK retires the
+                // retained result. Duplicates or third-party ACKs are no-ops.
+                if let Some((sender, _)) = self.results.get(&tid).copied() {
+                    if sender == from {
+                        self.results.remove(&tid);
+                    }
+                }
+                Ok(RouteOutcome::default())
+            }
             XferMsg::Commit { .. }
             | XferMsg::Committed { .. }
             | XferMsg::Abort { .. }
@@ -668,6 +706,9 @@ impl Router {
             }
             if self.dest_live_count(from) >= self.lim.max_live_endpoints {
                 return self.xfer_abort_inner(tid, "recipient capacity");
+            }
+            if std::env::var("SEAM_PAUSE_BEFORE_COMMIT").map(|v| v == "1").unwrap_or(false) {
+                barrier_wait("host_before_commit");
             }
             return self.xfer_commit_inner(tid);
         }
@@ -708,7 +749,10 @@ impl Router {
         } else {
             return Err(Poison("escrowed endpoint missing"));
         }
-        self.finish_xfer(tid, XferPhase::Committed);
+        self.finish_xfer(tid, x.sender, XferPhase::Committed);
+        if std::env::var("SEAM_PAUSE_AFTER_COMMIT").map(|v| v == "1").unwrap_or(false) {
+            barrier_wait("host_after_commit");
+        }
         let mut out = RouteOutcome::default();
         if !self.inject.drop_commit {
             out.send.push((
@@ -734,7 +778,7 @@ impl Router {
         if let Some(e) = self.eps.get_mut(&x.ep) {
             e.holder = x.restore;
         }
-        self.finish_xfer(tid, XferPhase::Aborted);
+        self.finish_xfer(tid, x.sender, XferPhase::Aborted);
         let mut out = RouteOutcome::default();
         if !self.inject.drop_abort {
             if let Holder::Peer(p) = x.restore {

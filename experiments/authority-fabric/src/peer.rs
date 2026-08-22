@@ -72,6 +72,17 @@ enum XferLocal {
     Unknown,
 }
 
+/// Terminal, application-visible result of a transactional transfer.
+#[derive(Debug)]
+pub enum TransferOutcome {
+    /// Authority now belongs to the recipient.
+    Committed,
+    /// Pre-commit abort: same logical authority restored, returned armed.
+    Aborted(Vec<Endpoint>),
+    /// Restoration impossible (peer/runtime gone).
+    AuthorityLost(Cause),
+}
+
 struct Parked {
     from: EpId,
     local: EpId,
@@ -88,6 +99,13 @@ struct HState {
     cause: Option<Cause>,
 }
 
+struct XferSlot {
+    m: Mutex<Option<XferLocal>>,
+    cv: Condvar,
+    ep: EpId,
+    partner: EpId,
+}
+
 struct State {
     handles: HashMap<EpId, HState>,
     /// their-side id -> our-side handle (receive demux).
@@ -102,7 +120,8 @@ struct State {
     /// claimed first (root vs. control).
     arrival_order: Vec<EpId>,
     pending_offers: HashMap<TransferId, (EpId, EpId)>,
-    xfer_wait: HashMap<TransferId, Arc<(Mutex<Option<XferLocal>>, Condvar)>>,
+    xfer_wait: HashMap<TransferId, Arc<XferSlot>>,
+    status_wait: HashMap<TransferId, Arc<(Mutex<Option<u8>>, Condvar)>>,
     parked: Vec<Parked>,
 }
 
@@ -163,7 +182,6 @@ pub struct RuntimeInner {
     broken: AtomicBool,
     pub sent_frames: AtomicU64,
     pub received_frames: AtomicU64,
-    born: Instant,
 }
 
 const INBOUND_COST_OVERHEAD: usize = 96;
@@ -175,7 +193,42 @@ fn xfer_trace(stage: &'static str) {
     }
 }
 
+fn resolve_slot(sl: &XferSlot, v: XferLocal) {
+    *sl.m.lock().unwrap() = Some(v);
+    sl.cv.notify_all();
+}
+
+fn barrier_wait(name: &str) {
+    let Ok(dir) = std::env::var("SEAM_BARRIER_DIR") else {
+        return;
+    };
+    let path = std::path::Path::new(&dir).join(name);
+    let go = std::path::Path::new(&dir).join(format!("{name}.go"));
+    let _ = std::fs::write(&path, b"1");
+    for _ in 0..600 {
+        if go.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 impl RuntimeInner {
+    fn restore_local(self: &Arc<Self>, id: EpId, partner: EpId) -> Option<Endpoint> {
+        let mut st = self.st.lock().unwrap();
+        if st.terminal.is_some() {
+            return None;
+        }
+        if !st.handles.contains_key(&id) {
+            st.handles.insert(id, HState { partner, cause: None });
+            st.arrival_order.push(id);
+        }
+        st.partner_of_theirs.insert(partner, id);
+        drop(st);
+        let _g = self.new_handle_m.lock().unwrap();
+        self.new_handle.notify_all();
+        Some(Endpoint { id, shared: self.clone(), armed: true })
+    }
     fn new_inner(lim: Limits) -> Self {
         RuntimeInner {
             lim: lim.clone(),
@@ -190,6 +243,7 @@ impl RuntimeInner {
                 arrival_order: Vec::new(),
                 pending_offers: HashMap::new(),
                 xfer_wait: HashMap::new(),
+                status_wait: HashMap::new(),
                 parked: Vec::new(),
             }),
             out: BoundedQueue::new(lim.queue_max_msgs, lim.queue_max_bytes),
@@ -199,7 +253,6 @@ impl RuntimeInner {
             broken: AtomicBool::new(false),
             sent_frames: AtomicU64::new(0),
             received_frames: AtomicU64::new(0),
-            born: Instant::now(),
         }
     }
 
@@ -357,6 +410,7 @@ impl RuntimeInner {
             XferMsg::Commit { tid, ep, partner } => {
                 xfer_trace("recipient_commit_received");
                 let mut ready: Vec<Parked> = Vec::new();
+                let mut ack = false;
                 {
                     let mut st = self.st.lock().unwrap();
                     st.pending_offers.remove(&tid);
@@ -366,9 +420,8 @@ impl RuntimeInner {
                     }
                     st.partner_of_theirs.insert(partner, ep);
                     if let Some(slot) = st.xfer_wait.remove(&tid) {
-                        let (m, cv) = &*slot;
-                        *m.lock().unwrap() = Some(XferLocal::Committed);
-                        cv.notify_all();
+                        resolve_slot(&slot, XferLocal::Committed);
+                        ack = true;
                     }
                     for p in &mut st.parked {
                         if p.remaining.remove(&tid) {
@@ -389,45 +442,81 @@ impl RuntimeInner {
                 for p in ready {
                     self.finish_parked(p);
                 }
+                // Host committed to us: acknowledge so it can retire the result.
+                let _ = self.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
+                let _ = ack;
                 true
             }
             XferMsg::Committed { tid } => {
-                let mut st = self.st.lock().unwrap();
-                if let Some(slot) = st.xfer_wait.remove(&tid) {
-                    let (m, cv) = &*slot;
-                    *m.lock().unwrap() = Some(XferLocal::Committed);
-                    cv.notify_all();
+                let ack = {
+                    let mut st = self.st.lock().unwrap();
+                    if let Some(slot) = st.xfer_wait.remove(&tid) {
+                        resolve_slot(&slot, XferLocal::Committed);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if ack {
+                    let _ = self.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
                 }
                 true
             }
             XferMsg::Abort { tid } => {
-                let mut st = self.st.lock().unwrap();
-                st.pending_offers.remove(&tid);
-                if let Some(slot) = st.xfer_wait.remove(&tid) {
-                    let (m, cv) = &*slot;
-                    *m.lock().unwrap() = Some(XferLocal::Aborted);
-                    cv.notify_all();
+                let mut ack = false;
+                let mut fail_waiters: Vec<u32> = Vec::new();
+                {
+                    let mut st = self.st.lock().unwrap();
+                    st.pending_offers.remove(&tid);
+                    if let Some(slot) = st.xfer_wait.remove(&tid) {
+                        resolve_slot(&slot, XferLocal::Aborted);
+                        ack = true;
+                    }
+                    let mut i = 0;
+                    while i < st.parked.len() {
+                        if st.parked[i].remaining.remove(&tid) && st.parked[i].remaining.is_empty() {
+                            let p = st.parked.remove(i);
+                            if p.is_response {
+                                fail_waiters.push(p.corr);
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                for corr in fail_waiters {
+                    let inner = {
+                        let mut st = self.st.lock().unwrap();
+                        st.waiters.remove(&corr).map(|s| s.peek())
+                    };
+                    if let Some(inner) = inner {
+                        let (m, cv) = &*inner;
+                        *m.lock().unwrap() = Some(Err(FabError::TransferAborted("recipient rejected")));
+                        cv.notify_all();
+                    }
+                }
+                if ack {
+                    let _ = self.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
                 }
                 true
             }
             XferMsg::StatusAck { tid, status } => {
                 let mut st = self.st.lock().unwrap();
                 if let Some(slot) = st.xfer_wait.remove(&tid) {
-                    let outcome = match status {
-                        frame::XFER_ST_COMMITTED => XferLocal::Committed,
-                        frame::XFER_ST_ABORTED => XferLocal::Aborted,
-                        _ => XferLocal::Unknown,
-                    };
-                    let (m, cv) = &*slot;
-                    *m.lock().unwrap() = Some(outcome);
-                    cv.notify_all();
+                    match status {
+                        frame::XFER_ST_COMMITTED => resolve_slot(&slot, XferLocal::Committed),
+                        frame::XFER_ST_ABORTED => resolve_slot(&slot, XferLocal::Aborted),
+                        _ => {}
+                    }
+                }
+                if let Some(sw) = st.status_wait.remove(&tid) {
+                    *sw.0.lock().unwrap() = Some(status);
+                    sw.1.notify_all();
                 }
                 true
             }
-            XferMsg::Accept { .. } | XferMsg::Reject { .. } | XferMsg::Status { .. } => {
-                // Host-bound; ignore if reflected.
-                true
-            }
+            XferMsg::ResultAck { .. } => true,
+            XferMsg::Accept { .. } | XferMsg::Reject { .. } | XferMsg::Status { .. } => true,
         }
     }
 
@@ -436,6 +525,13 @@ impl RuntimeInner {
         // COMMIT before the handle becomes usable.
         if !d.attachments.is_empty() {
             xfer_trace("recipient_offer_received");
+            // Test-only barrier: pause before ACCEPT so supervisor can kill at known point.
+            if std::env::var("SEAM_BARRIER_OFFER").map(|v| v == "1").unwrap_or(false) {
+                barrier_wait("peer_at_offer");
+                if self.broken.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
             let cap_ok = {
                 let st = self.st.lock().unwrap();
                 st.handles.values().filter(|h| h.cause.is_none()).count()
@@ -446,6 +542,32 @@ impl RuntimeInner {
             if !cap_ok {
                 for att in &d.attachments {
                     let _ = self.push_out(Frame::Xfer(XferMsg::Reject { tid: att.tid }));
+                }
+                // If this Data was a response to a waiting call, fail it
+                // explicitly instead of leaving it to timeout.
+                let mut st = self.st.lock().unwrap();
+                let is_response = d.corr != 0
+                    && st
+                        .waiters
+                        .get(&d.corr)
+                        .map(|s| {
+                            st.partner_of_theirs
+                                .get(&d.target)
+                                .copied()
+                                .map(|local| s.ep == local)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                if is_response {
+                    if let Some(slot) = st.waiters.remove(&d.corr) {
+                        drop(st);
+                        let inner = slot.peek();
+                        let (m, cv) = &*inner;
+                        *m.lock().unwrap() = Some(Err(FabError::TransferAborted(
+                            "recipient at capacity",
+                        )));
+                        cv.notify_all();
+                    }
                 }
                 return;
             }
@@ -796,20 +918,30 @@ impl Runtime {
     /// Reply to a request ON THE HANDLE THAT RECEIVED IT (pair-routing makes
     /// this symmetric). Consumes any capabilities attached to the reply:
     /// after this call the sender no longer holds them (I4).
+    /// Returns the terminal outcome: Committed, or Aborted with restored endpoints.
     pub fn reply(
         &self,
         req: &Inbound,
         payload: Vec<u8>,
         caps: Vec<Endpoint>,
-    ) -> Result<(), FabError> {
+    ) -> Result<TransferOutcome, FabError> {
         struct EmptyTid;
         impl TransferSpace for EmptyTid {
             fn contains(&self, _id: TransferId) -> bool {
                 false
             }
         }
+        if caps.is_empty() {
+            self.shared.push_out(Frame::Data(DataInner {
+                target: req.local,
+                corr: req.corr,
+                attachments: vec![],
+                payload,
+            }))?;
+            return Ok(TransferOutcome::Committed);
+        }
         let mut attachments = Vec::with_capacity(caps.len());
-        let mut waiters = Vec::new();
+        let mut waiters: Vec<(TransferId, Arc<XferSlot>)> = Vec::new();
         {
             let mut st = self.shared.st.lock().unwrap();
             for mut cap in caps {
@@ -819,7 +951,12 @@ impl Runtime {
                 }
                 let partner = st.handles.get(&cap.id).unwrap().partner;
                 let tid = fresh_transfer_id(&EmptyTid);
-                let slot = Arc::new((Mutex::new(None::<XferLocal>), Condvar::new()));
+                let slot = Arc::new(XferSlot {
+                    m: Mutex::new(None),
+                    cv: Condvar::new(),
+                    ep: cap.id,
+                    partner,
+                });
                 st.xfer_wait.insert(tid, slot.clone());
                 attachments.push(Attachment { tid, id: cap.id, partner });
                 st.handles.remove(&cap.id);
@@ -833,47 +970,101 @@ impl Runtime {
             attachments,
             payload,
         }))?;
-        if !waiters.is_empty() {
-            xfer_trace("sender_reply_emitted");
-        }
+        xfer_trace("sender_reply_emitted");
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut aborted: Vec<Endpoint> = Vec::new();
         for (tid, slot) in waiters {
-            let mut status_probes = 0u8;
-            loop {
+            let outcome = loop {
                 {
-                    let (m, cv) = &*slot;
-                    let mut g = m.lock().unwrap();
-                    match g.take() {
-                        Some(XferLocal::Committed) => break,
-                        Some(XferLocal::Aborted) => {
-                            return Err(FabError::TransferAborted("recipient rejected or died"));
+                    let g = slot.m.lock().unwrap();
+                    if let Some(v) = *g {
+                        break v;
+                    }
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    match self.transfer_status(tid, Duration::from_secs(2)) {
+                        Ok(frame::XFER_ST_COMMITTED) => break XferLocal::Committed,
+                        Ok(frame::XFER_ST_ABORTED) => break XferLocal::Aborted,
+                        Ok(frame::XFER_ST_PENDING) => {
+                            std::thread::sleep(Duration::from_millis(50));
+                            continue;
                         }
-                        Some(XferLocal::Unknown) => {
-                            return Err(FabError::TransferUnknown);
+                        _ => break XferLocal::Unknown,
+                    }
+                }
+                let g = slot.m.lock().unwrap();
+                let (ng, _) = slot.cv.wait_timeout(g, deadline - now).unwrap();
+                drop(ng);
+            };
+            match outcome {
+                XferLocal::Committed => {
+                    xfer_trace("sender_saw_committed");
+                    let _ = self.shared.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
+                }
+                XferLocal::Aborted => {
+                    if let Some(ep) = self.shared.restore_local(slot.ep, slot.partner) {
+                        aborted.push(ep);
+                    } else {
+                        return Ok(TransferOutcome::AuthorityLost(Cause::Graceful));
+                    }
+                    let _ = self.shared.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
+                }
+                XferLocal::Unknown => {
+                    match self.transfer_status(tid, Duration::from_secs(2)) {
+                        Ok(frame::XFER_ST_COMMITTED) => {
+                            let _ = self.shared.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
                         }
-                        None => {
-                            let now = Instant::now();
-                            if now >= deadline {
-                                // Timeout is not an abort. Probe STATUS a few
-                                // times, then surface unknown.
-                                if status_probes >= 5 {
-                                    return Err(FabError::TransferUnknown);
-                                }
-                                status_probes += 1;
-                                drop(g);
-                                let _ = self.shared.push_out(Frame::Xfer(XferMsg::Status { tid }));
-                                std::thread::sleep(Duration::from_millis(50));
-                                continue;
+                        Ok(frame::XFER_ST_ABORTED) => {
+                            if let Some(ep) = self.shared.restore_local(slot.ep, slot.partner) {
+                                aborted.push(ep);
+                            } else {
+                                return Ok(TransferOutcome::AuthorityLost(Cause::Graceful));
                             }
-                            let (ng, _) = cv.wait_timeout(g, deadline - now).unwrap();
-                            drop(ng);
+                            let _ = self.shared.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
                         }
+                        _ => return Err(FabError::TransferUnknown),
                     }
                 }
             }
         }
-        xfer_trace("sender_saw_committed");
-        Ok(())
+        if aborted.is_empty() {
+            Ok(TransferOutcome::Committed)
+        } else {
+            Ok(TransferOutcome::Aborted(aborted))
+        }
+    }
+
+    fn transfer_status(&self, tid: TransferId, timeout: Duration) -> Result<u8, FabError> {
+        let sw = Arc::new((Mutex::new(None::<u8>), Condvar::new()));
+        {
+            let mut st = self.shared.st.lock().unwrap();
+            if st.terminal.is_some() {
+                return Err(FabError::FabricLost);
+            }
+            st.status_wait.insert(tid, sw.clone());
+        }
+        if let Err(e) = self.shared.push_out(Frame::Xfer(XferMsg::Status { tid })) {
+            let mut st = self.shared.st.lock().unwrap();
+            st.status_wait.remove(&tid);
+            return Err(e);
+        }
+        let deadline = Instant::now() + timeout;
+        let (m, cv) = &*sw;
+        let mut g = m.lock().unwrap();
+        loop {
+            if let Some(s) = *g {
+                return Ok(s);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let mut st = self.shared.st.lock().unwrap();
+                st.status_wait.remove(&tid);
+                return Err(FabError::TransferUnknown);
+            }
+            let (ng, _) = cv.wait_timeout(g, deadline - now).unwrap();
+            g = ng;
+        }
     }
 
     /// Ask the fabric for a fresh endpoint pair: (implementation side,

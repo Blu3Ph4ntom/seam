@@ -539,6 +539,7 @@ fn main() {
         "scale" => scale(lim),
         "hostdie" => hostdie(lim),
         "quarantine" => quarantine(lim),
+        "abort_cycle" => abort_cycle_case(lim),
         other => fail(&format!("unknown host mode {other:?}")),
     };
     std::process::exit(code);
@@ -589,6 +590,7 @@ fn demo(lim: Limits) -> i32 {
     };
     fab.ack_ctrl(&setup, done_corr);
     marker!("CLIENT_ACKNOWLEDGED_FAILURES");
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(20));
     fab.shutdown_orderly();
     fab.print_accounting("final");
     let a = fab.router.accounting();
@@ -732,6 +734,11 @@ fn crash_g(lim: Limits) -> Result<(), String> {
     )?;
     let done_corr = fab.wait_ctrl(Duration::from_secs(30), |m| matches!(m, ControlMsg::Done))?;
     fab.ack_ctrl(&setup, done_corr);
+    // Ack is a DATA frame, Shutdown is CONTROL (prioritized). Without
+    // waiting, Shutdown can overtake the Ack and the client sees
+    // Closed(Graceful) before its Done call completes. Wait for the
+    // client to exit (it exits after ack) before tearing down.
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(20));
     fab.shutdown_orderly();
     let c = fab.exit_codes.get(&setup.cli).copied();
     let s = fab.exit_codes.get(&setup.svc).copied();
@@ -764,6 +771,7 @@ fn perf(lim: Limits) -> i32 {
         Err(e) => return fail(&e),
     };
     fab.ack_ctrl(&setup, done_corr);
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(20));
     fab.shutdown_orderly();
     marker!("PERF_DONE");
     0
@@ -809,6 +817,7 @@ fn scale(lim: Limits) -> i32 {
             max_ret
         ));
     }
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(20));
     fab.shutdown_orderly();
     let a = fab.router.accounting();
     if a.peers != 0 || a.live_endpoints != 0 {
@@ -869,5 +878,33 @@ fn quarantine(lim: Limits) -> i32 {
     }
     let _ = (x, y);
     marker!("HOST_SURVIVED_QUARANTINE");
+    0
+}
+
+fn abort_cycle_case(lim: Limits) -> i32 {
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[],
+        &[
+            ("SEAM_CLIENT_MODE", "abort_cycle".into()),
+            ("SEAM_CLI_MAX_EPS", "4".into()),
+        ],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    let done_corr = match fab.wait_ctrl(Duration::from_secs(30), |m| matches!(m, ControlMsg::Done)) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    fab.ack_ctrl(&setup, done_corr);
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(20));
+    fab.shutdown_orderly();
+    let a = fab.router.accounting();
+    if a.peers != 0 || a.live_endpoints != 0 || a.unacked_results != 0 {
+        return fail(&format!("leak: {a:?}"));
+    }
+    println!("ABORT_CYCLE_OK");
     0
 }

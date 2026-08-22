@@ -249,3 +249,14 @@ fn scale_small() {
         "scale accounting failed:\n{combined}"
     );
 }
+
+#[test]
+fn abort_cycle() {
+    let out = run_host(&["abort_cycle"], &[], Duration::from_secs(60));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "abort_cycle\n{combined}");
+    assert_contains(&combined, "ABORT_CYCLE_OK", "abort_cycle");
+    assert_contains(&combined, "CLIENT_ABORT_OBSERVED", "abort_cycle");
+    assert_contains(&combined, "SVC_AUTHORITY_RESTORED", "abort_cycle");
+    assert_contains(&combined, "CLIENT_ABORT_RESTORED_USABLE", "abort_cycle");
+}

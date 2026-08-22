@@ -46,6 +46,7 @@ pub const XFER_COMMITTED: u8 = 4;
 pub const XFER_ABORT: u8 = 5;
 pub const XFER_STATUS: u8 = 6;
 pub const XFER_STATUS_ACK: u8 = 7;
+pub const XFER_RESULT_ACK: u8 = 8;
 
 pub const XFER_ST_PENDING: u8 = 0;
 pub const XFER_ST_COMMITTED: u8 = 1;
@@ -105,6 +106,7 @@ pub enum XferMsg {
     Abort { tid: TransferId },
     Status { tid: TransferId },
     StatusAck { tid: TransferId, status: u8 },
+    ResultAck { tid: TransferId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,6 +330,10 @@ pub fn encode_into(frame: &Frame, out: &mut Vec<u8>) {
                 put_tid(out, *tid);
                 out.push(*status);
             }
+            XferMsg::ResultAck { tid } => {
+                out.push(XFER_RESULT_ACK);
+                put_tid(out, *tid);
+            }
         },
     }
     let len = (out.len() - start - 4) as u32;
@@ -420,6 +426,7 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
                     tid,
                     status: c.u8v()?,
                 },
+                XFER_RESULT_ACK => XferMsg::ResultAck { tid },
                 _ => return Err(FrameError::UnknownKind(KIND_XFER)),
             };
             Ok(Frame::Xfer(msg))
