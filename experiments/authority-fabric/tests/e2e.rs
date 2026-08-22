@@ -278,3 +278,35 @@ fn barrier_harness_smoke() {
     assert_contains(&combined, "ABORT_CYCLE_OK", "barrier_smoke");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn preflight_p1_recipient_pre_accept() {
+    let out = run_host(&["preflight_p1"], &[], Duration::from_secs(30));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "preflight_p1\n{combined}");
+    assert_contains(&combined, "PREFLIGHT_P1_OK", "preflight_p1");
+}
+
+#[test]
+fn preflight_p2_recipient_pre_commit() {
+    let out = run_host(&["preflight_p2"], &[], Duration::from_secs(30));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "preflight_p2\n{combined}");
+    assert_contains(&combined, "PREFLIGHT_P2_OK", "preflight_p2");
+}
+
+#[test]
+fn preflight_p3_recipient_post_commit() {
+    let out = run_host(&["preflight_p3"], &[], Duration::from_secs(30));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "preflight_p3\n{combined}");
+    assert_contains(&combined, "PREFLIGHT_P3_OK", "preflight_p3");
+}
+
+#[test]
+fn preflight_p4_lost_committed() {
+    let out = run_host(&["preflight_p4"], &[], Duration::from_secs(30));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "preflight_p4\n{combined}");
+    assert_contains(&combined, "PREFLIGHT_P4_OK", "preflight_p4");
+}

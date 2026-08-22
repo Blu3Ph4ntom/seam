@@ -58,6 +58,9 @@ fn main() {
         "churn" => churn(&rt),
         "perf" => perf(&rt),
         "abort_cycle" => abort_cycle(&rt),
+        "txn_once" => txn_once(&rt),
+        "preflight_p1_client" => preflight_p1_client(&rt),
+        "preflight_p3_client" => preflight_p3_client(&rt),
         _ => full_demo(&rt),
     };
     rt.shutdown();
@@ -670,6 +673,101 @@ fn abort_cycle(rt: &Runtime) -> i32 {
         return 1;
     }
     marker!("CLIENT_ABORT_CYCLE_OK");
+    0
+}
+
+fn txn_once(rt: &Runtime) -> i32 {
+    let mut seen = HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL txn_once no root: {e}");
+            return 1;
+        }
+    };
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL txn_once no ctrl: {e}");
+            return 1;
+        }
+    };
+    match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+        Ok(res) => match proto::decode_root_response(&res.payload) {
+            Ok(RootResponse::Counter) => {
+                if let Some(cap) = res.received.into_iter().next() {
+                    marker!("CLIENT_TXN_ONCE_COMMITTED");
+                    // prove usable
+                    let _ = cap.call(
+                        proto::encode_counter_request(CounterRequest::Get),
+                        CALL_TIMEOUT,
+                    );
+                    let _ = send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done);
+                    marker!("CLIENT_TXN_ONCE_OK");
+                    return 0;
+                } else {
+                    eprintln!("CLIENT_FAIL txn_once no cap");
+                    return 1;
+                }
+            }
+            other => {
+                eprintln!("CLIENT_FAIL txn_once bad response {other:?}");
+                return 1;
+            }
+        },
+        Err(FabError::TransferAborted(_)) => {
+            marker!("CLIENT_TXN_ONCE_ABORTED");
+            let _ = send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done);
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL txn_once {e}");
+            return 1;
+        }
+    }
+}
+
+fn preflight_p1_client(rt: &Runtime) -> i32 {
+    // Recipient that will be killed pre-accept; just do one txn and report.
+    txn_once(rt)
+}
+
+fn preflight_p3_client(rt: &Runtime) -> i32 {
+    let mut seen = HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL p3 no root: {e}");
+            return 1;
+        }
+    };
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL p3 no ctrl: {e}");
+            return 1;
+        }
+    };
+    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_FAIL p3 open {e}");
+            return 1;
+        }
+    };
+    let Some(cap) = res.received.into_iter().next() else {
+        eprintln!("CLIENT_FAIL p3 no cap");
+        return 1;
+    };
+    marker!("CLIENT_P3_COMMITTED");
+    // Now committed; host will kill us after commit. Keep cap alive a bit then signal.
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = cap.call(
+        proto::encode_counter_request(CounterRequest::Increment),
+        CALL_TIMEOUT,
+    );
+    marker!("CLIENT_P3_USED");
+    let _ = send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done);
     0
 }
 
