@@ -816,8 +816,11 @@ mod tests {
             other => panic!("grant produced {other:?}"),
         };
         r.on_xfer(to, XferMsg::Accept { tid }).unwrap();
+        // retire terminal result (real peers ack via ResultAck)
+        r.on_xfer(to, XferMsg::ResultAck { tid }).unwrap();
         assert_eq!(r.holder_of(ep), Some(Holder::Peer(to)));
         assert!(r.authority_mass_ok());
+        assert_eq!(r.accounting().unacked_results, 0);
     }
 
     fn att(id: EpId, partner: EpId) -> Attachment {
@@ -1063,5 +1066,297 @@ mod tests {
             .on_hello(c, Limits::default().hello_magic, 99)
             .unwrap_err();
         assert_eq!(err, Poison("bad protocol version"));
+    }
+
+    #[test]
+    fn results_retained_until_sender_ack_and_bounds_new_work() {
+        let mut r = Router::new(Limits {
+            max_pending_transfers: 2,
+            max_live_endpoints: 4096,
+            ..Limits::default()
+        });
+        let a = r.accept_peer();
+        let b = r.accept_peer();
+        hello_ok(&mut r, a);
+        hello_ok(&mut r, b);
+        let (x, y) = r.create_host_pair();
+        grant_commit(&mut r, a, x);
+        grant_commit(&mut r, b, y);
+        // first transfer A->B
+        let oc = r.on_create(a).unwrap();
+        let (imp1, tra1) = match &oc.send[0].1 {
+            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            other => panic!("{other:?}"),
+        };
+        let oc = r.on_data(a, data(x, vec![att(tra1, imp1)])).unwrap();
+        let tid1 = match r.holder_of(tra1) {
+            Some(Holder::Escrow(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        let _ = oc; // forwarded
+        r.on_xfer(b, XferMsg::Accept { tid: tid1 }).unwrap();
+        assert_eq!(r.accounting().unacked_results, 1);
+        assert_eq!(r.xfer_status(tid1), crate::frame::XFER_ST_COMMITTED);
+        // second transfer
+        let oc = r.on_create(a).unwrap();
+        let (imp2, tra2) = match &oc.send[0].1 {
+            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            other => panic!("{other:?}"),
+        };
+        let oc = r.on_data(a, data(x, vec![att(tra2, imp2)])).unwrap();
+        let tid2 = match r.holder_of(tra2) {
+            Some(Holder::Escrow(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        let _ = oc;
+        r.on_xfer(b, XferMsg::Accept { tid: tid2 }).unwrap();
+        assert_eq!(r.accounting().unacked_results, 2);
+        // bounded: next grant/create must be rejected, not silently queued
+        let (h1, _h2) = r.create_host_pair();
+        // grant should fail due to results table full (pending+results >= cap)
+        let err = r.grant(b, h1).unwrap_err();
+        assert_eq!(err, Poison("pending transfer table full"));
+        // create path also surfaces capacity error, not poison
+        let oc = r.on_create(a).unwrap();
+        assert!(matches!(oc.send[0].1, Frame::Error(ERR_CAPACITY)));
+        // sender ack retires one slot, new work can proceed
+        r.on_xfer(a, XferMsg::ResultAck { tid: tid1 }).unwrap();
+        assert_eq!(r.accounting().unacked_results, 1);
+        let (h3, _) = r.create_host_pair();
+        // now grant should succeed
+        assert!(r.grant(b, h3).is_ok());
+        assert!(r.authority_mass_ok());
+    }
+
+    #[test]
+    fn result_ack_idempotent_and_sender_bound() {
+        let (mut r, a, b, x, _) = primed();
+        let oc = r.on_create(a).unwrap();
+        let (imp, tra) = match &oc.send[0].1 {
+            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            other => panic!("{other:?}"),
+        };
+        let oc = r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
+        let tid = match r.holder_of(tra) {
+            Some(Holder::Escrow(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        let _ = oc;
+        r.on_xfer(b, XferMsg::Accept { tid }).unwrap();
+        assert_eq!(r.xfer_status(tid), crate::frame::XFER_ST_COMMITTED);
+        // third-party ack is no-op
+        r.on_xfer(b, XferMsg::ResultAck { tid }).unwrap();
+        assert_eq!(r.accounting().unacked_results, 1);
+        assert_eq!(r.xfer_status(tid), crate::frame::XFER_ST_COMMITTED);
+        // sender ack retires
+        r.on_xfer(a, XferMsg::ResultAck { tid }).unwrap();
+        assert_eq!(r.accounting().unacked_results, 0);
+        assert_eq!(r.xfer_status(tid), crate::frame::XFER_ST_UNKNOWN);
+        // duplicate is idempotent no-op
+        r.on_xfer(a, XferMsg::ResultAck { tid }).unwrap();
+        assert_eq!(r.accounting().unacked_results, 0);
+        // abort case also idempotent
+        let oc = r.on_create(a).unwrap();
+        let (imp2, tra2) = match &oc.send[0].1 {
+            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            other => panic!("{other:?}"),
+        };
+        let oc = r.on_data(a, data(x, vec![att(tra2, imp2)])).unwrap();
+        let tid2 = match r.holder_of(tra2) {
+            Some(Holder::Escrow(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        let _ = oc;
+        r.on_xfer(b, XferMsg::Reject { tid: tid2 }).unwrap();
+        assert_eq!(r.xfer_status(tid2), crate::frame::XFER_ST_ABORTED);
+        r.on_xfer(b, XferMsg::ResultAck { tid: tid2 }).unwrap();
+        assert_eq!(r.accounting().unacked_results, 1); // not retired by dest
+        r.on_xfer(a, XferMsg::ResultAck { tid: tid2 }).unwrap();
+        assert_eq!(r.accounting().unacked_results, 0);
+    }
+
+    #[test]
+    fn lost_committed_still_reported_as_committed_via_status() {
+        let (mut r, a, b, x, _) = primed();
+        r.inject.drop_committed = true;
+        let oc = r.on_create(a).unwrap();
+        let (imp, tra) = match &oc.send[0].1 {
+            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            other => panic!("{other:?}"),
+        };
+        let oc = r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
+        let tid = match r.holder_of(tra) {
+            Some(Holder::Escrow(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        let _ = oc;
+        let out = r.on_xfer(b, XferMsg::Accept { tid }).unwrap();
+        // Committed dropped, but status still COMMITTED via retained result
+        assert!(out.send.iter().all(|(_, f)| !matches!(f, Frame::Xfer(XferMsg::Committed { .. }))));
+        assert_eq!(r.xfer_status(tid), crate::frame::XFER_ST_COMMITTED);
+        let oc = r.on_xfer(a, XferMsg::Status { tid }).unwrap();
+        assert!(oc.send.iter().any(|(dest, f)| {
+            *dest == a && matches!(f, Frame::Xfer(XferMsg::StatusAck { tid: t, status }) if *t==tid && *status==crate::frame::XFER_ST_COMMITTED)
+        }));
+        // sender ack retires
+        r.on_xfer(a, XferMsg::ResultAck { tid }).unwrap();
+        assert_eq!(r.accounting().unacked_results, 0);
+        let oc = r.on_xfer(a, XferMsg::Status { tid }).unwrap();
+        assert!(oc.send.iter().any(|(_, f)| matches!(f, Frame::Xfer(XferMsg::StatusAck { status, .. }) if *status==crate::frame::XFER_ST_UNKNOWN)));
+        r.inject.drop_committed = false;
+    }
+
+    #[test]
+    fn abort_restores_to_sender_and_commit_does_not() {
+        let (mut r, a, b, x, y) = primed();
+        // Pre-commit abort: dest Rejects -> holder returns to sender
+        let oc = r.on_create(a).unwrap();
+        let (imp, tra) = match &oc.send[0].1 {
+            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            other => panic!("{other:?}"),
+        };
+        let oc = r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
+        let tid = match r.holder_of(tra) {
+            Some(Holder::Escrow(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        let _ = oc;
+        r.on_xfer(b, XferMsg::Reject { tid }).unwrap();
+        assert_eq!(r.holder_of(tra), Some(Holder::Peer(a)));
+        assert_eq!(r.xfer_status(tid), crate::frame::XFER_ST_ABORTED);
+        r.on_xfer(a, XferMsg::ResultAck { tid }).unwrap();
+        // Post-commit death: authority dies with dest, not restored
+        let oc = r.on_create(a).unwrap();
+        let (imp2, tra2) = match &oc.send[0].1 {
+            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            other => panic!("{other:?}"),
+        };
+        let oc = r.on_data(a, data(x, vec![att(tra2, imp2)])).unwrap();
+        let tid2 = match r.holder_of(tra2) {
+            Some(Holder::Escrow(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        let _ = oc;
+        r.on_xfer(b, XferMsg::Accept { tid: tid2 }).unwrap();
+        assert_eq!(r.holder_of(tra2), Some(Holder::Peer(b)));
+        // kill dest
+        let _ = r.on_eof(b);
+        // y's pair was B-held, tra2 dies with B if we killed B after commit
+        // tra2 was also B-held; after peer gone, its conversation is closed
+        assert!(r.holder_of(tra2).is_none());
+        // tid2 still terminal COMMITTED in results until sender ack, but authority not restored
+        assert_eq!(r.xfer_status(tid2), crate::frame::XFER_ST_COMMITTED);
+        // sender ack retires
+        r.on_xfer(a, XferMsg::ResultAck { tid: tid2 }).unwrap();
+        assert_eq!(r.holder_of(tra2), None);
+        let _ = y;
+    }
+
+    #[test]
+    fn churn_and_drop_storm_keep_accounting_clean() {
+        let mut r = Router::new(Limits {
+            max_live_endpoints: 64,
+            max_pending_transfers: 256,
+            ..Limits::default()
+        });
+        let a = r.accept_peer();
+        let b = r.accept_peer();
+        hello_ok(&mut r, a);
+        hello_ok(&mut r, b);
+        let (x, y) = r.create_host_pair();
+        grant_commit(&mut r, a, x);
+        grant_commit(&mut r, b, y);
+        // churn 500 transfers
+        for _ in 0..500 {
+            let oc = r.on_create(a).unwrap();
+            let (imp, tra) = match &oc.send[0].1 {
+                Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+                other => panic!("{other:?}"),
+            };
+            let oc = r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
+            let tid = match r.holder_of(tra) {
+                Some(Holder::Escrow(t)) => t,
+                other => panic!("{other:?}"),
+            };
+            let _ = oc;
+            r.on_xfer(b, XferMsg::Accept { tid }).unwrap();
+            assert_eq!(r.holder_of(tra), Some(Holder::Peer(b)));
+            r.on_xfer(a, XferMsg::ResultAck { tid }).unwrap();
+            // simulate recipient closing then mass stays ok
+            let _ = r.on_close(b, tra);
+            assert!(r.authority_mass_ok());
+        }
+        assert_eq!(r.accounting().unacked_results, 0);
+        assert!(r.authority_mass_ok());
+        assert!(r.accounting().retired_identities <= Limits::default().max_retired);
+        // ancient replay: unknown tid Accept should be Poison, not silent success
+        let fake = TransferId([0xFF; 16]);
+        let err = r.on_xfer(b, XferMsg::Accept { tid: fake }).unwrap_err();
+        assert_eq!(err, Poison("unknown transfer id"));
+    }
+
+    #[test]
+    fn capacity_abort_reports_aborted_and_no_parked_hang() {
+        let (_r, _a, _b, _x, _) = primed();
+        // Abort via explicit Reject must restore to sender and be ackable.
+        let mut r2 = Router::new(Limits::default());
+        let a2 = r2.accept_peer();
+        let b2 = r2.accept_peer();
+        hello_ok(&mut r2, a2);
+        hello_ok(&mut r2, b2);
+        let (x2, y2) = r2.create_host_pair();
+        grant_commit(&mut r2, a2, x2);
+        grant_commit(&mut r2, b2, y2);
+        let oc = r2.on_create(a2).unwrap();
+        let (imp, tra) = match &oc.send[0].1 {
+            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            other => panic!("{other:?}"),
+        };
+        let oc = r2.on_data(a2, data(x2, vec![att(tra, imp)])).unwrap();
+        let tid = match r2.holder_of(tra) {
+            Some(Holder::Escrow(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        let _ = oc;
+        let out = r2.on_xfer(b2, XferMsg::Reject { tid }).unwrap();
+        assert_eq!(r2.holder_of(tra), Some(Holder::Peer(a2)));
+        assert_eq!(r2.xfer_status(tid), crate::frame::XFER_ST_ABORTED);
+        let _ = out;
+        r2.on_xfer(a2, XferMsg::ResultAck { tid }).unwrap();
+        assert_eq!(r2.accounting().unacked_results, 0);
+        assert!(r2.authority_mass_ok());
+        // pending table full also surfaces as capacity Error, not hang
+        let mut r3 = Router::new(Limits {
+            max_pending_transfers: 1,
+            ..Limits::default()
+        });
+        let a3 = r3.accept_peer();
+        let b3 = r3.accept_peer();
+        hello_ok(&mut r3, a3);
+        hello_ok(&mut r3, b3);
+        let (x3, y3) = r3.create_host_pair();
+        grant_commit(&mut r3, a3, x3);
+        grant_commit(&mut r3, b3, y3);
+        let oc = r3.on_create(a3).unwrap();
+        let (imp3, tra3) = match &oc.send[0].1 {
+            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            other => panic!("{other:?}"),
+        };
+        let oc = r3.on_data(a3, data(x3, vec![att(tra3, imp3)])).unwrap();
+        let tid3 = match r3.holder_of(tra3) {
+            Some(Holder::Escrow(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        let _ = oc;
+        assert_eq!(r3.accounting().pending_transfers, 1);
+        // next transfer must be rejected via Error, not queued
+        let oc2 = r3.on_create(a3).unwrap();
+        let (imp4, tra4) = match &oc2.send[0].1 {
+            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            other => panic!("{other:?}"),
+        };
+        let oc = r3.on_data(a3, data(x3, vec![att(tra4, imp4)])).unwrap();
+        assert!(matches!(oc.send[0].1, Frame::Error(ERR_CAPACITY)));
+        let _ = tid3;
     }
 }
