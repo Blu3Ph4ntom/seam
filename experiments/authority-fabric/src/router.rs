@@ -716,6 +716,10 @@ impl Router {
         self.retired.contains(ep)
     }
 
+    pub fn is_native_pending(&self, tid: TransferId) -> bool {
+        self.native_pending.contains_key(&tid)
+    }
+
     pub fn xfer(&self, tid: TransferId) -> Option<XferRec> {
         self.xfers.get(&tid).copied()
     }
@@ -816,7 +820,9 @@ impl Router {
             XferMsg::Commit { .. }
             | XferMsg::Committed { .. }
             | XferMsg::Abort { .. }
-            | XferMsg::StatusAck { .. } => Err(Poison("peer sent host-only xfer")),
+            | XferMsg::StatusAck { .. }
+            | XferMsg::NativeCommit { .. }
+            | XferMsg::NativeAbort { .. } => Err(Poison("peer sent host-only xfer")),
         }
     }
 

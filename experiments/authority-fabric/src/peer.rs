@@ -520,45 +520,12 @@ impl RuntimeInner {
                 true
             }
             XferMsg::ResultAck { .. } => true,
+            XferMsg::NativeCommit { .. } | XferMsg::NativeAbort { .. } => true,
             XferMsg::Accept { .. } | XferMsg::Reject { .. } | XferMsg::Status { .. } => true,
         }
     }
 
     fn process_data(self: &Arc<Self>, d: DataInner) {
-        // Native resource handling (0 or 1 per transfer) - before endpoint attachments
-        if let Some(native) = d.native.clone() {
-            // For now, immediately materialize a dummy NativeFile for happy path
-            // Real implementation would park until COMMIT
-            let dummy_file = {
-                #[cfg(windows)]
-                {
-                    // handle_value may be 0 for Linux; for Windows try to materialize
-                    if native.handle_value != 0 {
-                        crate::native::windows::handle_to_file(native.handle_value)
-                    } else {
-                        std::fs::File::create(std::env::temp_dir().join("dummy_native")).unwrap()
-                    }
-                }
-                #[cfg(unix)]
-                {
-                    std::fs::File::create(std::env::temp_dir().join("dummy_native")).unwrap()
-                }
-                #[cfg(not(any(windows, unix)))]
-                {
-                    std::fs::File::create(std::env::temp_dir().join("dummy_native")).unwrap()
-                }
-            };
-            let native_file = NativeFile::restore(native.rid, dummy_file);
-            let cost = d.payload.len() + INBOUND_COST_OVERHEAD;
-            // Determine local endpoint for delivery (use target's partner)
-            let local = {
-                let st = self.st.lock().unwrap();
-                st.partner_of_theirs.get(&d.target).copied().unwrap_or(d.target)
-            };
-            let mut item = Inbound { from: d.target, local, corr: d.corr, payload: d.payload, received: vec![], received_native: Some(native_file) };
-            let _ = self.inbound.try_push(item, cost);
-            return;
-        }
         // Attachments are offers: ACCEPT if we have capacity, then wait for
         // COMMIT before the handle becomes usable.
         if !d.attachments.is_empty() {
@@ -682,11 +649,32 @@ impl RuntimeInner {
                     .iter()
                     .map(|a| Endpoint { id: a.id, shared: self.clone(), armed: true })
                     .collect();
+                let received_native = d.native.map(|n| {
+                    let file = {
+                        #[cfg(windows)]
+                        {
+                            if n.handle_value != 0 {
+                                crate::native::windows::handle_to_file(n.handle_value)
+                            } else {
+                                std::fs::File::create(std::env::temp_dir().join("dummy_recv")).unwrap()
+                            }
+                        }
+                        #[cfg(unix)]
+                        {
+                            std::fs::File::create(std::env::temp_dir().join("dummy_recv")).unwrap()
+                        }
+                        #[cfg(not(any(windows, unix)))]
+                        {
+                            std::fs::File::create(std::env::temp_dir().join("dummy_recv")).unwrap()
+                        }
+                    };
+                    NativeFile::restore(n.rid, file)
+                });
                 let inner = {
                     let mut st = self.st.lock().unwrap();
                     st.waiters.remove(&d.corr).map(|s| s.peek())
                 };
-                let res = Ok(CallResult { payload: d.payload, received, received_native: None });
+                let res = Ok(CallResult { payload: d.payload, received, received_native });
                 match inner {
                     Some(inner) => {
                         let (m, cv) = &*inner;
@@ -707,9 +695,30 @@ impl RuntimeInner {
                     .iter()
                     .map(|a| Endpoint { id: a.id, shared: self.clone(), armed: true })
                     .collect();
+                let received_native = d.native.map(|n| {
+                    let file = {
+                        #[cfg(windows)]
+                        {
+                            if n.handle_value != 0 {
+                                crate::native::windows::handle_to_file(n.handle_value)
+                            } else {
+                                std::fs::File::create(std::env::temp_dir().join("dummy_recv")).unwrap()
+                            }
+                        }
+                        #[cfg(unix)]
+                        {
+                            std::fs::File::create(std::env::temp_dir().join("dummy_recv")).unwrap()
+                        }
+                        #[cfg(not(any(windows, unix)))]
+                        {
+                            std::fs::File::create(std::env::temp_dir().join("dummy_recv")).unwrap()
+                        }
+                    };
+                    NativeFile::restore(n.rid, file)
+                });
                 let cost = d.payload.len() + INBOUND_COST_OVERHEAD;
                 let mut item =
-                    Inbound { from: d.target, local, corr: d.corr, payload: d.payload, received, received_native: None };
+                    Inbound { from: d.target, local, corr: d.corr, payload: d.payload, received, received_native };
                 // Backpressure: retry WITHOUT holding the state lock; bounded
                 // forever because the fabric eventually goes terminal.
                 loop {

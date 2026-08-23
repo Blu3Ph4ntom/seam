@@ -310,3 +310,11 @@ fn preflight_p4_lost_committed() {
     assert_eq!(out.status.code(), Some(0), "preflight_p4\n{combined}");
     assert_contains(&combined, "PREFLIGHT_P4_OK", "preflight_p4");
 }
+
+#[test]
+fn native_happy() {
+    let out = run_host(&["native_happy"], &[], Duration::from_secs(30));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "native_happy\n{combined}");
+    assert_contains(&combined, "NATIVE_HAPPY_OK", "native_happy");
+}

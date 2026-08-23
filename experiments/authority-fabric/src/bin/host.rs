@@ -7,6 +7,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
@@ -201,18 +203,51 @@ impl Fabric {
                     Err(p) => Some(p),
                 }
             }
-            Frame::Data(d) => match self.router.on_data(pid, d) {
-                Ok(mut oc) => {
-                    if prepare_in {
-                        host_trace("host_prepare_received");
+            Frame::Data(d) => {
+                // Native staging: if Data carries native attachment, stage the kernel object now
+                let native_tid = d.native.as_ref().map(|n| n.tid);
+                let native_rid = d.native.as_ref().map(|n| n.rid);
+                let native_handle = d.native.as_ref().map(|n| n.handle_value);
+                let res = self.router.on_data(pid, d);
+                // After logical escrow, do platform staging for native
+                if let (Ok(_), Some(tid), Some(_rid), Some(hval)) = (&res, native_tid, native_rid, native_handle) {
+                    // Windows: duplicate handle from sender into host escrow
+                    #[cfg(windows)]
+                    {
+                        if let Some(conn) = self.conns.get(&pid) {
+                            let proc_handle = conn.child.as_raw_handle() as *mut winapi::ctypes::c_void;
+                            if hval != 0 {
+                                if let Ok(escrow) = authority_fabric::native::windows::stage_from_sender(proc_handle, hval) {
+                                    self.native_escrow.insert(tid, escrow.0.into());
+                                }
+                            }
+                        }
                     }
-                    for h in oc.to_host.drain(..) {
-                        self.ctrl_drain.push_back((h.corr, h.payload));
+                    #[cfg(unix)]
+                    {
+                        // Linux: recv FD from sender lane (blocking with timeout)
+                        if let Some(conn) = self.conns.get(&pid) {
+                            if let Some(lane) = conn.resource_lane.as_ref() {
+                                if let Ok(escrow) = authority_fabric::native::unix::recv_fd(lane) {
+                                    self.native_escrow.insert(tid, std::fs::File::from(escrow.0));
+                                }
+                            }
+                        }
                     }
-                    self.dispatch_sends(&oc);
-                    None
                 }
-                Err(p) => Some(p),
+                match res {
+                    Ok(mut oc) => {
+                        if prepare_in {
+                            host_trace("host_prepare_received");
+                        }
+                        for h in oc.to_host.drain(..) {
+                            self.ctrl_drain.push_back((h.corr, h.payload));
+                        }
+                        self.dispatch_sends(&oc);
+                        None
+                    }
+                    Err(p) => Some(p),
+                }
             },
             Frame::Close { target } => match self.router.on_close(pid, target) {
                 Ok(oc) => {
@@ -552,6 +587,7 @@ fn main() {
         "preflight_p2" => preflight_p2(lim),
         "preflight_p3" => preflight_p3(lim),
         "preflight_p4" => preflight_p4(lim),
+        "native_happy" => native_happy_case(lim),
         other => fail(&format!("unknown host mode {other:?}")),
     };
     std::process::exit(code);
@@ -1259,5 +1295,35 @@ fn preflight_p4(lim: Limits) -> i32 {
     }
     marker!("PREFLIGHT_P4_OK");
     println!("PREFLIGHT_P4_OK");
+    0
+}
+
+fn native_happy_case(lim: Limits) -> i32 {
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "native".into())],
+        &[("SEAM_CLIENT_MODE", "native_happy".into())],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    let done_corr = match fab.wait_ctrl(Duration::from_secs(20), |m| matches!(m, ControlMsg::Done)) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    fab.ack_ctrl(&setup, done_corr);
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(10));
+    let code = fab.exit_codes.get(&setup.cli).copied().unwrap_or(-1);
+    if code != 0 {
+        return fail(&format!("native_happy client exit {code}"));
+    }
+    fab.shutdown_orderly();
+    let a = fab.router.accounting();
+    if a.peers != 0 {
+        return fail(&format!("native_happy leak {a:?}"));
+    }
+    marker!("NATIVE_HAPPY_OK");
+    println!("NATIVE_HAPPY_OK");
     0
 }

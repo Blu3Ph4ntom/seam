@@ -58,7 +58,8 @@ fn main() {
         "churn" => churn(&rt),
         "perf" => perf(&rt),
         "abort_cycle" => abort_cycle(&rt),
-        "txn_once" => txn_once(&rt),`r`n        "native_happy" => native_happy(&rt),
+        "txn_once" => txn_once(&rt),
+        "native_happy" => native_happy(&rt),
         "preflight_p1_client" => preflight_p1_client(&rt),
         "preflight_p3_client" => preflight_p3_client(&rt),
         _ => full_demo(&rt),
@@ -725,6 +726,31 @@ fn txn_once(rt: &Runtime) -> i32 {
             return 1;
         }
     }
+}
+
+fn native_happy(rt: &Runtime) -> i32 {
+    let mut seen = std::collections::HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("CLIENT_FAIL native_happy no root: {e}"); return 1; }
+    };
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("CLIENT_FAIL native_happy no ctrl: {e}"); return 1; }
+    };
+    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("CLIENT_FAIL native_happy open: {e}"); return 1; }
+    };
+    if let Some(mut nf) = res.received_native {
+        let data = nf.read_all().unwrap_or_default();
+        if data.starts_with(b"SEAM_NATIVE_NONCE") {
+            marker!("CLIENT_NATIVE_HAPPY_OK");
+        }
+        let _ = nf.write_marker(b"_CLIENT");
+    }
+    let _ = send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done);
+    0
 }
 
 fn preflight_p1_client(rt: &Runtime) -> i32 {

@@ -48,6 +48,8 @@ pub const XFER_ABORT: u8 = 5;
 pub const XFER_STATUS: u8 = 6;
 pub const XFER_STATUS_ACK: u8 = 7;
 pub const XFER_RESULT_ACK: u8 = 8;
+pub const XFER_NATIVE_COMMIT: u8 = 9;
+pub const XFER_NATIVE_ABORT: u8 = 10;
 
 pub const XFER_ST_PENDING: u8 = 0;
 pub const XFER_ST_COMMITTED: u8 = 1;
@@ -116,6 +118,8 @@ pub enum XferMsg {
     Status { tid: TransferId },
     StatusAck { tid: TransferId, status: u8 },
     ResultAck { tid: TransferId },
+    NativeCommit { tid: TransferId, rid: ResourceId, handle_value: u64 },
+    NativeAbort { tid: TransferId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +169,8 @@ impl Frame {
             Frame::Shutdown => 0,
             Frame::Xfer(XferMsg::Commit { .. }) => 1 + 16 + 32,
             Frame::Xfer(XferMsg::StatusAck { .. }) => 1 + 16 + 1,
+            Frame::Xfer(XferMsg::NativeCommit { .. }) => 1 + 16 + 16 + 8,
+            Frame::Xfer(XferMsg::NativeAbort { .. }) => 1 + 16,
             Frame::Xfer(_) => 1 + 16,
         };
         4 + 1 + body // length prefix + kind byte + body
@@ -369,6 +375,16 @@ pub fn encode_into(frame: &Frame, out: &mut Vec<u8>) {
                 out.push(XFER_RESULT_ACK);
                 put_tid(out, *tid);
             }
+            XferMsg::NativeCommit { tid, rid, handle_value } => {
+                out.push(XFER_NATIVE_COMMIT);
+                put_tid(out, *tid);
+                put_rid(out, *rid);
+                put_u64(out, *handle_value);
+            }
+            XferMsg::NativeAbort { tid } => {
+                out.push(XFER_NATIVE_ABORT);
+                put_tid(out, *tid);
+            }
         },
     }
     let len = (out.len() - start - 4) as u32;
@@ -473,6 +489,8 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
                     status: c.u8v()?,
                 },
                 XFER_RESULT_ACK => XferMsg::ResultAck { tid },
+                XFER_NATIVE_COMMIT => XferMsg::NativeCommit { tid, rid: c.rid()?, handle_value: c.u64v()? },
+                XFER_NATIVE_ABORT => XferMsg::NativeAbort { tid },
                 _ => return Err(FrameError::UnknownKind(KIND_XFER)),
             };
             Ok(Frame::Xfer(msg))
