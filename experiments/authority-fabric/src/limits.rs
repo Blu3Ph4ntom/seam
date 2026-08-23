@@ -29,6 +29,14 @@ pub struct Limits {
     pub max_native_resources: usize,
     /// Maximum native resources in escrow (Host).
     pub max_resources_in_escrow: usize,
+    /// Maximum live shared-memory regions per fabric instance.
+    pub max_regions: usize,
+    /// Maximum bytes in a single shared region (checked arithmetic; usize::MAX rejected).
+    pub max_region_size: u64,
+    /// Maximum live region-capability authorities per region.
+    pub max_region_capabilities: usize,
+    /// Maximum total mapped/backing bytes across all regions.
+    pub max_total_region_bytes: u64,
 }
 
 impl Default for Limits {
@@ -48,6 +56,10 @@ impl Default for Limits {
             control_queue_max_bytes: 64 * 1024,
             max_native_resources: 256,
             max_resources_in_escrow: 64,
+            max_regions: 64,
+            max_region_size: 256 * 1024 * 1024,
+            max_region_capabilities: 16,
+            max_total_region_bytes: 64 * 1024 * 1024 * 1024,
         }
     }
 }

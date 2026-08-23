@@ -10,6 +10,7 @@ pub mod limits;
 pub mod memstream;
 pub mod native;
 pub mod peer;
+pub mod shared;
 pub mod proto;
 pub mod queue;
 pub mod router;
