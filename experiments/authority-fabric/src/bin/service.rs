@@ -194,12 +194,18 @@ fn main() {
 /// Adopt the inherited native resource lane (unix).
 #[cfg(unix)]
 fn adopt_native_lane(rt: &Runtime) {
+    eprintln!(
+        "SVC_DEBUG lane_env={:?} fd3={}",
+        std::env::var("SEAM_NATIVE_LANE_FD"),
+        std::fs::metadata("/proc/self/fd/3").is_ok()
+    );
     if let Ok(fd_str) = std::env::var("SEAM_NATIVE_LANE_FD") {
         if let Ok(fd) = fd_str.parse::<i32>() {
             use std::os::unix::io::FromRawFd;
             // SAFETY: fd 3 dup2'd by host pre-exec solely for us; sole owner.
             let lane = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
             rt.install_native_lane(lane);
+            eprintln!("SVC_DEBUG lane_installed");
         }
     }
 }

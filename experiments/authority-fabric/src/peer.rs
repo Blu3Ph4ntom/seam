@@ -391,6 +391,10 @@ impl RuntimeInner {
     #[cfg(unix)]
     pub fn install_native_lane(&self, lane: std::os::unix::net::UnixStream) {
         use crate::native::{NativeFile as NF, LANE_KIND_RESTORE};
+        // Keep a sender-side clone so reply_with_native can stage over it.
+        *self.native_lane.lock().unwrap() = Some(
+            lane.try_clone().expect("lane try_clone"),
+        );
         let sh = match self.self_weak.lock().unwrap().upgrade() {
             Some(a) => a,
             None => return,

@@ -48,7 +48,8 @@ fn main() {
             std::process::exit(2);
         }
     };
-    
+    adopt_native_lane(&rt);
+
     let code = match mode().as_str() {
         "root_closed_tolerant" => root_closed(&rt, false),
         "root_closed_strict" => root_closed(&rt, true),
@@ -798,6 +799,11 @@ fn native_abort(rt: &Runtime) -> i32 {
 /// metadata only; authority comes from possessing the descriptor itself.
 #[cfg(unix)]
 fn adopt_native_lane(rt: &Runtime) {
+    eprintln!(
+        "CLI_DEBUG lane_env={:?} fd3={}",
+        std::env::var("SEAM_NATIVE_LANE_FD"),
+        std::fs::metadata("/proc/self/fd/3").is_ok()
+    );
     if let Ok(fd_str) = std::env::var("SEAM_NATIVE_LANE_FD") {
         if let Ok(fd) = fd_str.parse::<i32>() {
             use std::os::unix::io::FromRawFd;
