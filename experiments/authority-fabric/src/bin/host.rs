@@ -126,7 +126,7 @@ impl Fabric {
                             if libc_dup2(raw_child, 3) == -1 {
                                 return Err(std::io::Error::last_os_error());
                             }
-                            let flags = libc_fcntl(3, libc_shim::F_GETFD);
+                            let flags = libc_fcntl(3, libc_shim::F_GETFD, 0);
                             if flags < 0 || libc_fcntl(3, libc_shim::F_SETFD, flags & !libc_shim::FD_CLOEXEC) < 0 {
                                 return Err(std::io::Error::last_os_error());
                             }
