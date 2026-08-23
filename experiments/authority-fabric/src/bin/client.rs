@@ -48,7 +48,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    adopt_native_lane(&rt);
+    
     let code = match mode().as_str() {
         "root_closed_tolerant" => root_closed(&rt, false),
         "root_closed_strict" => root_closed(&rt, true),

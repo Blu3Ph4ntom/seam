@@ -113,7 +113,7 @@ impl Fabric {
         }
         #[cfg(unix)]
         let resource_lane: Option<std::os::unix::net::UnixStream> = {
-            use std::os::unix::io::IntoRawFd;
+            use std::os::unix::io::{FromRawFd, IntoRawFd};
             use std::os::unix::process::CommandExt;
             match std::os::unix::net::UnixStream::pair() {
                 Ok((host_end, child_end)) => {
@@ -410,7 +410,7 @@ impl Fabric {
                         let dest_lane = self.conns.get(dest).and_then(|c| c.resource_lane.clone());
                         match dest_lane {
                             Some(lane) => {
-                                use std::os::unix::io::IntoRawFd;
+                                use std::os::unix::io::{FromRawFd, IntoRawFd};
                                 // SAFETY: sole ownership of escrow fd moves
                                 // into OwnedFd for the sendmsg; no second
                                 // wrapper is created.
@@ -464,7 +464,7 @@ impl Fabric {
                             let sender_lane = self.conns.get(dest).and_then(|c| c.resource_lane.clone());
                             match sender_lane {
                                 Some(lane) => {
-                                    use std::os::unix::io::IntoRawFd;
+                                    use std::os::unix::io::{FromRawFd, IntoRawFd};
                                     let owned = unsafe {
                                         std::os::fd::OwnedFd::from_raw_fd(escrow_file.into_raw_fd())
                                     };

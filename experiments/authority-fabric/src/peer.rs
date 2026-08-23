@@ -209,6 +209,8 @@ pub struct RuntimeInner {
     /// Sender-side native resource lane (unix). Set once at startup.
     #[cfg(unix)]
     native_lane: std::sync::Mutex<Option<std::os::unix::net::UnixStream>>,
+    #[cfg(unix)]
+    self_weak: std::sync::Mutex<std::sync::Weak<RuntimeInner>>,
 }
 
 const INBOUND_COST_OVERHEAD: usize = 96;
@@ -287,6 +289,8 @@ impl RuntimeInner {
             received_frames: AtomicU64::new(0),
             #[cfg(unix)]
             native_lane: std::sync::Mutex::new(None),
+            #[cfg(unix)]
+            self_weak: std::sync::Mutex::new(std::sync::Weak::new()),
         }
     }
 
@@ -387,7 +391,10 @@ impl RuntimeInner {
     #[cfg(unix)]
     pub fn install_native_lane(&self, lane: std::os::unix::net::UnixStream) {
         use crate::native::{NativeFile as NF, LANE_KIND_RESTORE};
-        let sh = self.clone();
+        let sh = match self.self_weak.lock().unwrap().upgrade() {
+            Some(a) => a,
+            None => return,
+        };
         std::thread::spawn(move || {
             loop {
                 let msg = match crate::native::recv_lane_msg(&lane) {
@@ -395,7 +402,7 @@ impl RuntimeInner {
                     Err(_) => return, // host death or lane close: EOF
                 };
                 let Some(fd) = msg.fd else { continue }; // malformed: closed inside recv
-                let file = NF::restore(msg.rid, File::from(fd));
+                let file = NF::restore(msg.rid, std::fs::File::from(fd));
                 if msg.kind == LANE_KIND_RESTORE {
                     // Abort restoration: resolve sender wait slot.
                     let mut st = sh.st.lock().unwrap();
@@ -1114,6 +1121,10 @@ impl Runtime {
         tx.flush()?;
 
         let shared = Arc::new(RuntimeInner::new_inner(lim.clone()));
+        #[cfg(unix)]
+        {
+            *shared.self_weak.lock().unwrap() = Arc::downgrade(&shared);
+        }
 
         {
             let sh = shared.clone();
@@ -1132,6 +1143,11 @@ impl Runtime {
         &self.lim
     }
 
+    /// Bind this runtime's native resource lane (unix). See RuntimeInner.
+    #[cfg(unix)]
+    pub fn install_native_lane(&self, lane: std::os::unix::net::UnixStream) {
+        self.shared.install_native_lane(lane);
+    }
     /// Blocks until a message arrives on any locally-implemented endpoint.
     pub fn wait_inbound(&self, timeout: Duration) -> Result<Inbound, FabError> {
         match self.shared.inbound.pop_deadline(Instant::now() + timeout) {
@@ -1276,20 +1292,13 @@ impl Runtime {
             };
             #[cfg(not(windows))]
             let handle_value = 0u64;
-            // Keep source alive until host confirms staging/commit (G41).
-            let slot = Arc::new((Mutex::new(None::<Option<NativeFile>>), Condvar::new()));
-            {
-                let mut st = self.shared.st.lock().unwrap();
-                if st.terminal.is_some() { return Err(FabError::FabricLost); }
-                st.native_hold.insert(tid, nf);
-                st.native_wait.insert(tid, slot.clone());
-            }
             // Unix: send the real descriptor over our lane BEFORE the control
             // frame so the host's blocking stage read is deterministic. Host
             // validates tid/rid against the metadata it then receives.
+            // Sender source stays open (N3): we only dup it via SCM_RIGHTS.
             #[cfg(unix)]
             {
-                let lane_opt = self.native_lane.lock().unwrap();
+                let lane_opt = self.shared.native_lane.lock().unwrap();
                 if let Some(lane) = lane_opt.as_ref() {
                     if let Err(e) = crate::native::unix::send_lane_msg(
                         lane,
@@ -1305,6 +1314,14 @@ impl Runtime {
                     eprintln!("SEAM no native lane installed");
                     return Err(FabError::TransferUnknown);
                 }
+            }
+            // Keep source alive until host confirms staging/commit (G41).
+            let slot = Arc::new((Mutex::new(None::<Option<NativeFile>>), Condvar::new()));
+            {
+                let mut st = self.shared.st.lock().unwrap();
+                if st.terminal.is_some() { return Err(FabError::FabricLost); }
+                st.native_hold.insert(tid, nf);
+                st.native_wait.insert(tid, slot.clone());
             }
             let att = crate::frame::NativeAttachment { tid, rid, handle_value };
             let pushed = self.shared.push_out(Frame::Data(DataInner {
