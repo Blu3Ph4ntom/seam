@@ -140,7 +140,7 @@ pub struct Router {
     results: HashMap<TransferId, (PeerId, Cause)>,
     // Native resource tracking (Host escrow, same transactional semantics)
     native_pending: HashMap<TransferId, NativeRec>,
-    native_results: HashMap<TransferId, (PeerId, Cause)>,
+    native_results: HashMap<TransferId, (PeerId, Cause, ResourceId)>,
     native_live: HashMap<ResourceId, PeerId>,
     native_retired: BoundedTombstones<ResourceId>,
     host_events: Vec<HostEvent>,
@@ -234,7 +234,7 @@ impl Router {
             &'a HashMap<TransferId, XferRec>,
             &'a HashMap<TransferId, (PeerId, Cause)>,
             &'a HashMap<TransferId, NativeRec>,
-            &'a HashMap<TransferId, (PeerId, Cause)>,
+            &'a HashMap<TransferId, (PeerId, Cause, ResourceId)>,
         );
         impl TransferSpace for T<'_> {
             fn contains(&self, id: TransferId) -> bool {
@@ -619,7 +619,7 @@ impl Router {
         self.peers.remove(&p);
         // A dead sender can never observe its result: clean retained results.
         self.results.retain(|_, (s, _)| *s != p);
-        self.native_results.retain(|_, (s, _)| *s != p);
+        self.native_results.retain(|_, (s, _, _)| *s != p);
         // Collect conversations touching this peer.
         let touched: Vec<EpId> = self
             .eps
@@ -662,7 +662,7 @@ impl Router {
                 if n.sender == p {
                     // Sender died pre-commit: close escrow, abort
                     self.native_pending.remove(&tid);
-                    self.native_results.insert(tid, (n.sender, Cause::Graceful));
+                    self.native_results.insert(tid, (n.sender, Cause::Graceful, n.rid));
                     self.native_retired.insert(n.rid, Cause::Graceful);
                 } else {
                     // Dest died pre-commit: restore to sender
@@ -739,7 +739,12 @@ impl Router {
                 NativeState::Aborted => XFER_ST_ABORTED,
             };
         }
-        if let Some((_, c)) = self.results.get(&tid).or_else(|| self.native_results.get(&tid)) {
+        let cause = self
+            .results
+            .get(&tid)
+            .map(|(_, c)| *c)
+            .or_else(|| self.native_results.get(&tid).map(|(_, c, _)| *c));
+        if let Some(c) = cause {
             return match c {
                 Cause::PeerLost => XFER_ST_COMMITTED,
                 Cause::Graceful => XFER_ST_ABORTED,
@@ -810,9 +815,13 @@ impl Router {
                         self.results.remove(&tid);
                     }
                 }
-                if let Some((sender, _)) = self.native_results.get(&tid).copied() {
+                if let Some((sender, _, rid)) = self.native_results.get(&tid).copied() {
                     if sender == from {
                         self.native_results.remove(&tid);
+                        // Fully retired: release the live-rid slot. Recipient keeps
+                        // its OS descriptor; the rid name retires.
+                        self.native_live.remove(&rid);
+                        self.native_retired.insert(rid, Cause::Graceful);
                     }
                 }
                 Ok(RouteOutcome::default())
@@ -954,7 +963,7 @@ impl Router {
         }
         // Move from pending to committed, and live to dest
         self.native_pending.remove(&tid);
-        self.native_results.insert(tid, (rec.sender, Cause::PeerLost));
+        self.native_results.insert(tid, (rec.sender, Cause::PeerLost, rec.rid));
         self.native_live.insert(rec.rid, rec.dest);
         // Retire the old rid if it was previously live (should not happen for new rid)
         if std::env::var("SEAM_PAUSE_AFTER_COMMIT").map(|v| v == "1").unwrap_or(false) {
@@ -978,7 +987,7 @@ impl Router {
             return Ok(RouteOutcome::default());
         }
         self.native_pending.remove(&tid);
-        self.native_results.insert(tid, (rec.sender, Cause::Graceful));
+        self.native_results.insert(tid, (rec.sender, Cause::Graceful, rec.rid));
         // No live entry for rid yet, so nothing to remove; on abort, rid returns to sender implicitly
         // For abort, we don't insert into native_live; sender will recreate on restore
         let mut out = RouteOutcome::default();

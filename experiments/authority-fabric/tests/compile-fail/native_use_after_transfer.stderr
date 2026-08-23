@@ -1,0 +1,28 @@
+error[E0382]: borrow of moved value: `file`
+  --> tests/compile-fail/native_use_after_transfer.rs:12:13
+   |
+10 |     let file = NativeFile::new_temp(b"nonce").unwrap();
+   |         ---- move occurs because `file` has type `NativeFile`, which does not implement the `Copy` trait
+11 |     consume(file);
+   |             ---- value moved here
+12 |     let _ = file.read_all();
+   |             ^^^^ value borrowed here after move
+   |
+note: consider changing this parameter type in function `consume` to borrow instead if owning the value isn't necessary
+  --> tests/compile-fail/native_use_after_transfer.rs:7:16
+   |
+ 7 | fn consume(_f: NativeFile) {}
+   |    -------     ^^^^^^^^^^ this parameter takes ownership of the value
+   |    |
+   |    in this function
+
+error[E0596]: cannot borrow `file` as mutable, as it is not declared as mutable
+  --> tests/compile-fail/native_use_after_transfer.rs:12:13
+   |
+12 |     let _ = file.read_all();
+   |             ^^^^ cannot borrow as mutable
+   |
+help: consider changing this to be mutable
+   |
+10 |     let mut file = NativeFile::new_temp(b"nonce").unwrap();
+   |         +++

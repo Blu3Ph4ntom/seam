@@ -330,3 +330,15 @@ fn native_abort_restore() {
     assert_contains(&combined, "CLIENT_NATIVE_RESTORED_RECOMMITTED_OK", "native_abort");
     assert_contains(&combined, "NATIVE_ABORT_OK", "native_abort");
 }
+
+#[test]
+fn native_stress_1k() {
+    let out = run_host(
+        &["native_stress"],
+        &[("SEAM_STRESS_N", "1000")],
+        Duration::from_secs(900),
+    );
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "native_stress\n{combined}");
+    assert_contains(&combined, "NATIVE_STRESS_OK n=1000", "native_stress");
+}

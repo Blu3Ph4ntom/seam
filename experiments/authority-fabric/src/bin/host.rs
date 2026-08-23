@@ -785,6 +785,7 @@ fn main() {
         "preflight_p4" => preflight_p4(lim),
         "native_happy" => native_happy_case(lim),
         "native_abort" => native_abort_case(lim),
+        "native_stress" => native_stress_case(lim),
         other => fail(&format!("unknown host mode {other:?}")),
     };
     std::process::exit(code);
@@ -1520,6 +1521,43 @@ fn native_abort_case(lim: Limits) -> i32 {
     if a.peers != 0 || a.native_unacked != 0 { return fail(&format!("native_abort leak {a:?}")); }
     marker!("NATIVE_ABORT_OK");
     println!("NATIVE_ABORT_OK");
+    0
+}
+
+
+fn native_stress_case(lim: Limits) -> i32 {
+    let n: String = std::env::var("SEAM_STRESS_N").unwrap_or_else(|_| "1000".into());
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "native".into())],
+        &[
+            ("SEAM_CLIENT_MODE", "native_stress".into()),
+            ("SEAM_STRESS_N", n.clone()),
+        ],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    let done_corr = match fab.wait_ctrl(Duration::from_secs(1800), |m| matches!(m, ControlMsg::Done)) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    fab.ack_ctrl(&setup, done_corr);
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(60));
+    let code = fab.exit_codes.get(&setup.cli).copied().unwrap_or(-1);
+    if code != 0 { return fail(&format!("native_stress client exit {code}")); }
+    fab.shutdown_orderly();
+    let a = fab.router.accounting();
+    if a.peers != 0 || a.native_unacked != 0 {
+        return fail(&format!("native_stress leak {a:?}"));
+    }
+    marker!(
+        "NATIVE_STRESS_OK escrow_final={} native_live={}",
+        a.native_pending,
+        a.native_live
+    );
+    println!("NATIVE_STRESS_OK n={n}");
     0
 }
 

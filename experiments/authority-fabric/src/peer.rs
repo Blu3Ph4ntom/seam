@@ -588,6 +588,9 @@ impl RuntimeInner {
                         let (m, cv) = &*slot;
                         *m.lock().unwrap() = Some(None);
                         cv.notify_all();
+                        drop(st);
+                        let _ = self.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
+                        return true;
                     }
                 }
                 if ack {

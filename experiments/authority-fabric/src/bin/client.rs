@@ -63,6 +63,7 @@ fn main() {
         "txn_once" => txn_once(&rt),
         "native_happy" => native_happy(&rt),
         "native_abort" => native_abort(&rt),
+        "native_stress" => native_stress(&rt),
         "preflight_p1_client" => preflight_p1_client(&rt),
         "preflight_p3_client" => preflight_p3_client(&rt),
         _ => full_demo(&rt),
@@ -799,11 +800,6 @@ fn native_abort(rt: &Runtime) -> i32 {
 /// metadata only; authority comes from possessing the descriptor itself.
 #[cfg(unix)]
 fn adopt_native_lane(rt: &Runtime) {
-    eprintln!(
-        "CLI_DEBUG lane_env={:?} fd3={}",
-        std::env::var("SEAM_NATIVE_LANE_FD"),
-        std::fs::metadata("/proc/self/fd/3").is_ok()
-    );
     if let Ok(fd_str) = std::env::var("SEAM_NATIVE_LANE_FD") {
         if let Ok(fd) = fd_str.parse::<i32>() {
             use std::os::unix::io::FromRawFd;
@@ -816,6 +812,47 @@ fn adopt_native_lane(rt: &Runtime) {
 }
 #[cfg(not(unix))]
 fn adopt_native_lane(_rt: &Runtime) {}
+
+
+/// N sequential real native transfers (stress gate). Each cycle is a genuine
+/// transaction: sender creates file+nonce, host escrows, recipient reads.
+fn native_stress(rt: &Runtime) -> i32 {
+    let n: usize = std::env::var("SEAM_STRESS_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let mut seen = HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("CLIENT_FAIL stress no root: {e}"); return 1; }
+    };
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("CLIENT_FAIL stress no ctrl: {e}"); return 1; }
+    };
+    let t0 = Instant::now();
+    let mut ok = 0usize;
+    for i in 0..n {
+        match root.call(proto::encode_root_request(RootRequest::OpenCounter), Duration::from_secs(20)) {
+            Ok(res) => {
+                if let Some(mut nf) = res.received_native {
+                    match nf.read_all() {
+                        Ok(d) if d.starts_with(b"SEAM_NATIVE_NONCE") => { ok += 1; }
+                        _ => { eprintln!("CLIENT_FAIL stress[{i}] bad content"); return 1; }
+                    }
+                    drop(nf);
+                } else {
+                    eprintln!("CLIENT_FAIL stress[{i}] no native attachment");
+                    return 1;
+                }
+            }
+            Err(e) => { eprintln!("CLIENT_FAIL stress[{i}]: {e}"); return 1; }
+        }
+    }
+    marker!("NATIVE_STRESS_DONE n={n} ok={ok} ms={}", t0.elapsed().as_millis());
+    let _ = send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done);
+    0
+}
 
 fn preflight_p1_client(rt: &Runtime) -> i32 {
     // Recipient that will be killed pre-accept; just do one txn and report.
