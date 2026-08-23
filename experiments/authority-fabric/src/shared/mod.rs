@@ -403,6 +403,22 @@ impl SharedRegion {
         }
     }
 
+    /// Expose the backing object (Host escrow / native-rights tests only).
+    /// The application-facing mapping API is `map_read_write` / `map_read_only`;
+    /// this raw accessor exists so cross-process and hostile tests can exercise
+    /// the *kernel* rights of a transferred handle/fd, not just Rust types.
+    pub fn backing_ref(&self) -> &File {
+        &self.backing
+    }
+
+    /// Duplicate the native backing into a new owned object with the access
+    /// rights implied by `writable`. On Windows this yields a section handle
+    /// restricted to `SECTION_MAP_READ` for read-only; on Linux the memfd is
+    /// shared (sealing enforces RO at the kernel level — see `derive_read_only`).
+    pub fn duplicate_backing_handle(&self, writable: bool) -> std::io::Result<File> {
+        duplicate_backing(&self.backing, writable)
+    }
+
     /// Map `offset..offset+len` with out-of-bounds rejection (checked).
     /// Returns a sub-slice view over the full mapping (no new unsafe mapping).
     pub fn read_slice_at<'a>(
@@ -567,5 +583,48 @@ mod tests {
                 assert_eq!(r.as_slice()[off], (off & 0xff) as u8);
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Native rights enforcement: prove a compromised recipient cannot obtain
+    // writable kernel access from a read-only transferred backing. This is the
+    // RUN 005B hard gate (G1-G6); Rust typing alone is insufficient evidence.
+    // ---------------------------------------------------------------------
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ro_native_handle_rejects_writable_mapping() {
+        let reg = SharedRegion::create(4096, &lim()).unwrap();
+        // Writable backing maps writable (friendly + native).
+        let _w = map_read_write(reg.backing_ref(), 4096).unwrap();
+        // Derive a RO-restricted native handle (SECTION_MAP_READ only).
+        let ro = reg.duplicate_backing_handle(false).unwrap();
+        // Hostile: attempt writable native view on the RO handle -> kernel deny.
+        assert!(
+            map_read_write(&ro, 4096).is_err(),
+            "RO section handle must reject FILE_MAP_WRITE"
+        );
+        // Read view on RO handle succeeds.
+        assert!(map_read_only(&ro, 4096).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_ro_native_fd_rejects_writable_mapping() {
+        let reg = SharedRegion::create(4096, &lim()).unwrap();
+        let mut w = reg.map_read_write().unwrap();
+        w.as_mut_slice()[0] = 7;
+        // Derive RO: seals the memfd so new writable mappings are denied.
+        let ro = reg.derive_read_only().unwrap();
+        // Existing producer writable mapping survives the seal (narrowing).
+        w.as_mut_slice()[0] = 9;
+        assert_eq!(w.as_mut_slice()[0], 9);
+        // Hostile: writable native mapping on the RO fd must fail at kernel.
+        assert!(
+            map_read_write(ro.backing_ref(), 4096).is_err(),
+            "sealed memfd must reject PROT_WRITE"
+        );
+        // Read mapping on RO fd succeeds.
+        assert!(map_read_only(ro.backing_ref(), 4096).is_ok());
     }
 }

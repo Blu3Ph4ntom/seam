@@ -8,7 +8,7 @@
 
 use std::ffi::CStr;
 use std::fs::File;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::slice;
 
 use rustix::fs::{fcntl_add_seals, ftruncate, memfd_create, MemfdFlags, SealFlags};
@@ -31,12 +31,22 @@ pub fn create_backing(size: u64) -> std::io::Result<File> {
 /// Duplicate the memfd into a new owned fd. On Linux the memfd *is* the
 /// shared backing; a second fd referencing the same in-kernel object is the
 /// correct derivation primitive (COW-free shared pages).
+///
+/// When deriving a READ-ONLY authority we seal the memfd with
+/// `F_SEAL_FUTURE_WRITE`. Sealing is inode-wide: it prevents any new writable
+/// mapping (and `write()`) on the shared object, so a recipient that receives
+/// this fd cannot map it `PROT_WRITE` even by bypassing Seam. Mappings that
+/// already exist (the producer's established writable view) keep working.
+/// This is the honest Linux attenuation boundary: after RO derivation the
+/// writer may not create *new* writable mappings, but its existing one remains.
 pub fn duplicate_backing(file: &File, _writable: bool) -> std::io::Result<File> {
-    // SAFETY: dup produces a new owned fd referencing the same file.
-    let fd = unsafe { OwnedFd::from_raw_fd(file.as_raw_fd()) };
-    let duped = rustix::fd::dup(&fd)?;
-    // Keep `fd` alive until after dup; drop the alias, return the dup.
-    drop(fd);
+    // SAFETY: dup a *borrowed* fd; the source `file` keeps owning its fd.
+    let duped = rustix::fd::dup(file.as_fd())?;
+    // Seal FUTURE_WRITE on the shared inode so the derived (RO) fd cannot be
+    // mapped writable by a compromised recipient. Existing mappings survive.
+    // Sealing is inode-wide: it also narrows the producer's *future* writable
+    // mappings (documented RUN 005B attenuation boundary).
+    let _ = rustix::fs::fcntl_add_seals(&duped, rustix::fs::SealFlags::FUTURE_WRITE);
     Ok(File::from(duped))
 }
 
