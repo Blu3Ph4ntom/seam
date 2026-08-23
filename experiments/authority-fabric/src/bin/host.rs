@@ -388,7 +388,7 @@ impl Fabric {
             // and fill handle_value with a value valid in the recipient's
             // handle table. Commit point = this successful duplication.
             // (Offer-time Data keeps escrow intact; only NativeCommit spends it.)
-            if let Frame::Xfer(XferMsg::NativeCommit { tid, rid: _, handle_value }) = &mut frame {
+            if let Frame::Xfer(XferMsg::NativeCommit { tid, rid, handle_value }) = &mut frame {
                 let had = self.native_escrow.contains_key(tid);
                 if let Some((escrow_file, _sender, _rid2)) = self.native_escrow.remove(tid) {
                     #[cfg(windows)]
