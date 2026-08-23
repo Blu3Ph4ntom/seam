@@ -407,7 +407,7 @@ impl Fabric {
                     {
                         // Linux commit delivery: sendmsg(SCM_RIGHTS) over the
                         // recipient lane. Commit point = successful sendmsg.
-                        let dest_lane = self.conns.get(dest).and_then(|c| c.resource_lane.clone());
+                        let dest_lane = self.conns.get(dest).and_then(|c| c.resource_lane.as_ref().map(|l| l.try_clone()).transpose());
                         match dest_lane {
                             Some(lane) => {
                                 use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -461,7 +461,7 @@ impl Fabric {
                         {
                             // Restore = sendmsg(SCM_RIGHTS) back over sender's
                             // lane. Sender's lane thread resolves its wait slot.
-                            let sender_lane = self.conns.get(dest).and_then(|c| c.resource_lane.clone());
+                            let sender_lane = self.conns.get(dest).and_then(|c| c.resource_lane.as_ref().map(|l| l.try_clone()).transpose());
                             match sender_lane {
                                 Some(lane) => {
                                     use std::os::unix::io::{FromRawFd, IntoRawFd};
