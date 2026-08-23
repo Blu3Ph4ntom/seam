@@ -16,9 +16,7 @@ use std::time::{Duration, Instant};
 
 use authority_fabric::fabric_error::FabError;
 use authority_fabric::peer::Runtime;
-use authority_fabric::proto::{
-    self, CounterRequest, CounterResponse, RootRequest, RootResponse,
-};
+use authority_fabric::proto::{self, CounterRequest, CounterResponse, RootRequest, RootResponse};
 use authority_fabric::{marker, Endpoint, EpId, Limits};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -114,7 +112,10 @@ fn full_demo(rt: &Runtime) -> i32 {
 
     // Nested capability: the service returns NEW authority inside an
     // ordinary reply. No name, no lookup, no registry.
-    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+    let res = match root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        CALL_TIMEOUT,
+    ) {
         Ok(res) => res,
         Err(e) => {
             eprintln!("CLIENT_FAIL open_counter: {e}");
@@ -196,7 +197,10 @@ fn full_demo(rt: &Runtime) -> i32 {
     }
 
     // Report completion.
-    if ctrl.call(proto::encode_control(proto::ControlMsg::Done), CALL_TIMEOUT).is_err() {
+    if ctrl
+        .call(proto::encode_control(proto::ControlMsg::Done), CALL_TIMEOUT)
+        .is_err()
+    {
         marker!("CLIENT_DONE_SIGNAL_UNACKED");
     } else {
         marker!("CLIENT_DONE_ACKED");
@@ -267,7 +271,10 @@ fn outstanding_request(rt: &Runtime) -> i32 {
         return 1;
     };
     let started = Instant::now();
-    match root.call(proto::encode_root_request(RootRequest::Ping), Duration::from_secs(30)) {
+    match root.call(
+        proto::encode_root_request(RootRequest::Ping),
+        Duration::from_secs(30),
+    ) {
         Err(FabError::Closed(_)) => {
             marker!(
                 "CLIENT_OUTSTANDING_FAILED_MS {}",
@@ -298,7 +305,10 @@ fn kill_after_first_increment(rt: &Runtime) -> i32 {
             return 1;
         }
     };
-    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+    let res = match root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        CALL_TIMEOUT,
+    ) {
         Ok(res) => res,
         Err(e) => {
             eprintln!("CLIENT_FAIL open_counter: {e}");
@@ -345,7 +355,10 @@ fn kill_after_first_increment(rt: &Runtime) -> i32 {
             return 1;
         }
     }
-    match counter.call(proto::encode_counter_request(CounterRequest::Get), CALL_TIMEOUT) {
+    match counter.call(
+        proto::encode_counter_request(CounterRequest::Get),
+        CALL_TIMEOUT,
+    ) {
         Err(FabError::Closed(_)) => marker!("CLIENT_NESTED_FAILURE_OBSERVED"),
         _ => {
             eprintln!("CLIENT_FAIL counter not explicitly failed");
@@ -373,7 +386,10 @@ fn graceful_done(rt: &Runtime) -> i32 {
         eprintln!("CLIENT_FAIL ping failed");
         return 1;
     }
-    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+    let res = match root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        CALL_TIMEOUT,
+    ) {
         Ok(res) => res,
         Err(e) => {
             eprintln!("CLIENT_FAIL open_counter: {e}");
@@ -385,7 +401,10 @@ fn graceful_done(rt: &Runtime) -> i32 {
         return 1;
     };
     if counter
-        .call(proto::encode_counter_request(CounterRequest::Get), CALL_TIMEOUT)
+        .call(
+            proto::encode_counter_request(CounterRequest::Get),
+            CALL_TIMEOUT,
+        )
         .is_err()
     {
         eprintln!("CLIENT_FAIL counter get failed");
@@ -526,7 +545,10 @@ fn perf(rt: &Runtime) -> i32 {
     // Warmup.
     for _ in 0..100 {
         if root
-            .call(proto::encode_root_request(RootRequest::Ping), Duration::from_secs(5))
+            .call(
+                proto::encode_root_request(RootRequest::Ping),
+                Duration::from_secs(5),
+            )
             .is_err()
         {
             eprintln!("CLIENT_FAIL warmup");
@@ -538,7 +560,10 @@ fn perf(rt: &Runtime) -> i32 {
     for _ in 0..N {
         let t = Instant::now();
         if root
-            .call(proto::encode_root_request(RootRequest::Ping), Duration::from_secs(5))
+            .call(
+                proto::encode_root_request(RootRequest::Ping),
+                Duration::from_secs(5),
+            )
             .is_err()
         {
             eprintln!("CLIENT_FAIL rtt probe");
@@ -697,7 +722,10 @@ fn txn_once(rt: &Runtime) -> i32 {
             return 1;
         }
     };
-    match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+    match root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        CALL_TIMEOUT,
+    ) {
         Ok(res) => match proto::decode_root_response(&res.payload) {
             Ok(RootResponse::Counter) => {
                 if let Some(cap) = res.received.into_iter().next() {
@@ -736,15 +764,27 @@ fn native_happy(rt: &Runtime) -> i32 {
     let mut seen = std::collections::HashSet::new();
     let root = match claim_ep(rt, &mut seen) {
         Ok(r) => r,
-        Err(e) => { eprintln!("CLIENT_FAIL native_happy no root: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL native_happy no root: {e}");
+            return 1;
+        }
     };
     let ctrl = match claim_ep(rt, &mut seen) {
         Ok(c) => c,
-        Err(e) => { eprintln!("CLIENT_FAIL native_happy no ctrl: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL native_happy no ctrl: {e}");
+            return 1;
+        }
     };
-    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+    let res = match root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        CALL_TIMEOUT,
+    ) {
         Ok(r) => r,
-        Err(e) => { eprintln!("CLIENT_FAIL native_happy open: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL native_happy open: {e}");
+            return 1;
+        }
     };
     if let Some(mut nf) = res.received_native {
         let data = nf.read_all().unwrap_or_default();
@@ -762,30 +802,51 @@ fn native_abort(rt: &Runtime) -> i32 {
     let mut seen = HashSet::new();
     let root = match claim_ep(rt, &mut seen) {
         Ok(r) => r,
-        Err(e) => { eprintln!("CLIENT_FAIL native_abort no root: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL native_abort no root: {e}");
+            return 1;
+        }
     };
     let ctrl = match claim_ep(rt, &mut seen) {
         Ok(c) => c,
-        Err(e) => { eprintln!("CLIENT_FAIL native_abort no ctrl: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL native_abort no ctrl: {e}");
+            return 1;
+        }
     };
     // Txn #1: reject the native offer (env set by host bootstrap).
-    let _ = root.call(proto::encode_root_request(RootRequest::OpenCounter), Duration::from_secs(3));
+    let _ = root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        Duration::from_secs(3),
+    );
     std::thread::sleep(Duration::from_millis(300));
     // Stop rejecting for txn #2 (in-process flag; read per offer).
     std::env::remove_var("SEAM_CLI_REJECT_NATIVE");
     marker!("CLIENT_NATIVE_ABORT_TRIGGERED");
     // Txn #2: rejection env is cleared by host after phase 1; restored
     // resource must now commit and arrive readable.
-    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), Duration::from_secs(10)) {
+    let res = match root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        Duration::from_secs(10),
+    ) {
         Ok(r) => r,
-        Err(e) => { eprintln!("CLIENT_FAIL native_abort txn2: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL native_abort txn2: {e}");
+            return 1;
+        }
     };
     if let Some(mut nf) = res.received_native {
         match nf.read_all() {
             Ok(data) if data.starts_with(b"SEAM_NATIVE_NONCE") && data.ends_with(b"_RESTORED") => {
                 marker!("CLIENT_NATIVE_RESTORED_RECOMMITTED_OK");
             }
-            other => { eprintln!("CLIENT_FAIL native_abort content {:?}", other.map(|v| v.len())); return 1; }
+            other => {
+                eprintln!(
+                    "CLIENT_FAIL native_abort content {:?}",
+                    other.map(|v| v.len())
+                );
+                return 1;
+            }
         }
     } else {
         eprintln!("CLIENT_FAIL native_abort no native attachment");
@@ -813,7 +874,6 @@ fn adopt_native_lane(rt: &Runtime) {
 #[cfg(not(unix))]
 fn adopt_native_lane(_rt: &Runtime) {}
 
-
 /// N sequential real native transfers (stress gate). Each cycle is a genuine
 /// transaction: sender creates file+nonce, host escrows, recipient reads.
 fn native_stress(rt: &Runtime) -> i32 {
@@ -824,21 +884,35 @@ fn native_stress(rt: &Runtime) -> i32 {
     let mut seen = HashSet::new();
     let root = match claim_ep(rt, &mut seen) {
         Ok(r) => r,
-        Err(e) => { eprintln!("CLIENT_FAIL stress no root: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL stress no root: {e}");
+            return 1;
+        }
     };
     let ctrl = match claim_ep(rt, &mut seen) {
         Ok(c) => c,
-        Err(e) => { eprintln!("CLIENT_FAIL stress no ctrl: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("CLIENT_FAIL stress no ctrl: {e}");
+            return 1;
+        }
     };
     let t0 = Instant::now();
     let mut ok = 0usize;
     for i in 0..n {
-        match root.call(proto::encode_root_request(RootRequest::OpenCounter), Duration::from_secs(20)) {
+        match root.call(
+            proto::encode_root_request(RootRequest::OpenCounter),
+            Duration::from_secs(20),
+        ) {
             Ok(res) => {
                 if let Some(mut nf) = res.received_native {
                     match nf.read_all() {
-                        Ok(d) if d.starts_with(b"SEAM_NATIVE_NONCE") => { ok += 1; }
-                        _ => { eprintln!("CLIENT_FAIL stress[{i}] bad content"); return 1; }
+                        Ok(d) if d.starts_with(b"SEAM_NATIVE_NONCE") => {
+                            ok += 1;
+                        }
+                        _ => {
+                            eprintln!("CLIENT_FAIL stress[{i}] bad content");
+                            return 1;
+                        }
                     }
                     drop(nf);
                 } else {
@@ -846,10 +920,16 @@ fn native_stress(rt: &Runtime) -> i32 {
                     return 1;
                 }
             }
-            Err(e) => { eprintln!("CLIENT_FAIL stress[{i}]: {e}"); return 1; }
+            Err(e) => {
+                eprintln!("CLIENT_FAIL stress[{i}]: {e}");
+                return 1;
+            }
         }
     }
-    marker!("NATIVE_STRESS_DONE n={n} ok={ok} ms={}", t0.elapsed().as_millis());
+    marker!(
+        "NATIVE_STRESS_DONE n={n} ok={ok} ms={}",
+        t0.elapsed().as_millis()
+    );
     let _ = send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done);
     0
 }
@@ -875,7 +955,10 @@ fn preflight_p3_client(rt: &Runtime) -> i32 {
             return 1;
         }
     };
-    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), CALL_TIMEOUT) {
+    let res = match root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        CALL_TIMEOUT,
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("CLIENT_FAIL p3 open {e}");
@@ -902,7 +985,9 @@ fn print_perf(name: &str, s: &[Duration]) {
     let mut v: Vec<u128> = s.iter().map(|d| d.as_micros()).collect();
     v.sort_unstable();
     let pct = |p: f64| -> u128 {
-        let idx = (((v.len() as f64) * p).ceil() as usize).saturating_sub(1).min(v.len() - 1);
+        let idx = (((v.len() as f64) * p).ceil() as usize)
+            .saturating_sub(1)
+            .min(v.len() - 1);
         v[idx]
     };
     marker!(

@@ -53,7 +53,9 @@ pub struct NativeFile {
 
 impl std::fmt::Debug for NativeFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NativeFile").field("id", &self.id.0).finish()
+        f.debug_struct("NativeFile")
+            .field("id", &self.id.0)
+            .finish()
     }
 }
 
@@ -79,13 +81,21 @@ impl NativeFile {
         let id = ResourceId(draw16());
         use std::io::Seek;
         let _ = f.seek(std::io::SeekFrom::Start(0));
-        Ok(NativeFile { id, file: Some(f), armed: true })
+        Ok(NativeFile {
+            id,
+            file: Some(f),
+            armed: true,
+        })
     }
 
     /// Wrap an existing File with a fresh ResourceId (for recipient materialization).
     pub fn from_file(file: File) -> Self {
         let id = ResourceId(draw16());
-        NativeFile { id, file: Some(file), armed: true }
+        NativeFile {
+            id,
+            file: Some(file),
+            armed: true,
+        }
     }
 
     pub fn id(&self) -> ResourceId {
@@ -122,7 +132,11 @@ impl NativeFile {
 
     /// For abort restoration: re-arm a file as NativeFile with same ResourceId
     pub fn restore(id: ResourceId, file: File) -> Self {
-        NativeFile { id, file: Some(file), armed: true }
+        NativeFile {
+            id,
+            file: Some(file),
+            armed: true,
+        }
     }
 }
 
@@ -150,7 +164,9 @@ pub use unix::{
 };
 
 #[cfg(windows)]
-pub use windows::{close_escrow, commit_to_recipient, restore_to_sender, stage_from_sender, Escrowed};
+pub use windows::{
+    close_escrow, commit_to_recipient, restore_to_sender, stage_from_sender, Escrowed,
+};
 
 /// Host resource table state
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -21,7 +21,10 @@ pub enum FabError {
     /// runtime tables (stale replay defense fired locally).
     StaleEndpoint,
     /// Queue/resource limits hit. The operation was NOT performed.
-    Backpressured { queued_msgs: usize, queued_bytes: usize },
+    Backpressured {
+        queued_msgs: usize,
+        queued_bytes: usize,
+    },
     /// A blocking wait exceeded its deadline without an event.
     Timeout,
     /// Transport to the host/fabric is gone. All authority is void.
@@ -52,7 +55,10 @@ impl std::fmt::Display for FabError {
         match self {
             FabError::Closed(c) => write!(f, "endpoint closed ({c:?})"),
             FabError::StaleEndpoint => write!(f, "stale endpoint identity"),
-            FabError::Backpressured { queued_msgs, queued_bytes } => write!(
+            FabError::Backpressured {
+                queued_msgs,
+                queued_bytes,
+            } => write!(
                 f,
                 "backpressured ({queued_msgs} msgs, {queued_bytes} bytes queued)"
             ),

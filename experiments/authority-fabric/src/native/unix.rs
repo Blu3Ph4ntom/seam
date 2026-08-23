@@ -7,8 +7,8 @@ use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 
 use rustix::net::{
-    recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags,
-    SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
+    recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags,
 };
 
 use crate::id::{EpId, TransferId};
@@ -102,7 +102,10 @@ pub fn recv_lane_msg(lane: &std::os::unix::net::UnixStream) -> std::io::Result<L
     if extra != 0 || found.is_none() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("expected exactly 1 descriptor, got {}", extra + usize::from(found.is_some())),
+            format!(
+                "expected exactly 1 descriptor, got {}",
+                extra + usize::from(found.is_some())
+            ),
         ));
     }
     let mut t = [0u8; 16];
@@ -120,7 +123,13 @@ pub fn recv_lane_msg(lane: &std::os::unix::net::UnixStream) -> std::io::Result<L
 // ---- Back-compat single-fd wrappers used by host staging glue ----
 
 pub fn send_fd(lane: &std::os::unix::net::UnixStream, file: &File) -> std::io::Result<()> {
-    send_lane_msg(lane, LANE_KIND_STAGE, TransferId([0; 16]), ResourceId([0; 16]), file)
+    send_lane_msg(
+        lane,
+        LANE_KIND_STAGE,
+        TransferId([0; 16]),
+        ResourceId([0; 16]),
+        file,
+    )
 }
 
 pub fn recv_fd(lane: &std::os::unix::net::UnixStream) -> std::io::Result<Escrowed> {

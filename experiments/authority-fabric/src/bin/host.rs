@@ -27,7 +27,10 @@ use authority_fabric::{marker, Limits};
 
 /// Benchmark-only stage tracing (SEAM_XFER_TRACE=1).
 fn host_trace(stage: &'static str) {
-    if std::env::var("SEAM_XFER_TRACE").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("SEAM_XFER_TRACE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         eprintln!("XFER_TRACE {stage} t={:?}", std::time::SystemTime::now());
     }
 }
@@ -59,7 +62,8 @@ struct Fabric {
     /// (corr, payload) of DATA delivered to host-held endpoints.
     ctrl_drain: VecDeque<(u32, Vec<u8>)>,
     exit_codes: HashMap<PeerId, i32>,
-    native_escrow: HashMap<TransferId, (std::fs::File, PeerId, authority_fabric::native::ResourceId)>,
+    native_escrow:
+        HashMap<TransferId, (std::fs::File, PeerId, authority_fabric::native::ResourceId)>,
 }
 
 /// Duplicate the escrowed kernel object into `dest`'s process and return the
@@ -70,7 +74,9 @@ fn deliver_to_dest(
     dest_proc_raw: *mut winapi::ctypes::c_void,
 ) -> std::io::Result<u64> {
     use std::os::windows::io::IntoRawHandle;
-    let owned = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(escrow_file.into_raw_handle()) };
+    let owned = unsafe {
+        std::os::windows::io::OwnedHandle::from_raw_handle(escrow_file.into_raw_handle())
+    };
     let hval = authority_fabric::native::windows::commit_to_recipient(
         dest_proc_raw,
         authority_fabric::native::windows::Escrowed(owned),
@@ -99,11 +105,7 @@ impl Fabric {
         self.router.limits().clone()
     }
 
-    fn spawn_role(
-        &mut self,
-        role: &str,
-        envs: &[(&str, String)],
-    ) -> Result<PeerId, String> {
+    fn spawn_role(&mut self, role: &str, envs: &[(&str, String)]) -> Result<PeerId, String> {
         let mut cmd = role_command(role)?;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -127,7 +129,10 @@ impl Fabric {
                                 return Err(std::io::Error::last_os_error());
                             }
                             let flags = libc_fcntl(3, libc_shim::F_GETFD, 0);
-                            if flags < 0 || libc_fcntl(3, libc_shim::F_SETFD, flags & !libc_shim::FD_CLOEXEC) < 0 {
+                            if flags < 0
+                                || libc_fcntl(3, libc_shim::F_SETFD, flags & !libc_shim::FD_CLOEXEC)
+                                    < 0
+                            {
                                 return Err(std::io::Error::last_os_error());
                             }
                             Ok(())
@@ -207,12 +212,15 @@ impl Fabric {
             });
         }
 
-        self.conns.insert(pid, Conn {
-            child,
-            q,
-            #[cfg(unix)]
-            resource_lane,
-        });
+        self.conns.insert(
+            pid,
+            Conn {
+                child,
+                q,
+                #[cfg(unix)]
+                resource_lane,
+            },
+        );
         Ok(pid)
     }
 
@@ -265,24 +273,34 @@ impl Fabric {
                 let native_handle = d.native.as_ref().map(|n| n.handle_value);
                 let res = self.router.on_data(pid, d);
                 // After logical escrow, do platform staging for native
-                if let (Ok(_), Some(tid), Some(_rid), Some(hval)) = (&res, native_tid, native_rid, native_handle) {
+                if let (Ok(_), Some(tid), Some(_rid), Some(hval)) =
+                    (&res, native_tid, native_rid, native_handle)
+                {
                     // Windows: duplicate handle from sender into host escrow
                     #[cfg(windows)]
                     {
-                            if let Some(conn) = self.conns.get(&pid) {
-                                let proc_handle = conn.child.as_raw_handle() as *mut winapi::ctypes::c_void;
-                                if hval != 0 {
-                                    match authority_fabric::native::windows::stage_from_sender(proc_handle, hval) {
-                                        Ok(escrow) => {
-                                            let raw = escrow.0.into_raw_handle();
-                                            // SAFETY: sole ownership moved from OwnedHandle into File
-                                            let file = unsafe { std::fs::File::from_raw_handle(raw) };
-                                            self.native_escrow.insert(tid, (file, pid, _rid));
-                                        }
-                                        Err(e) => marker!("HOST_NATIVE_STAGE_FAILED tid={} err={}", tid.0[0], e),
+                        if let Some(conn) = self.conns.get(&pid) {
+                            let proc_handle =
+                                conn.child.as_raw_handle() as *mut winapi::ctypes::c_void;
+                            if hval != 0 {
+                                match authority_fabric::native::windows::stage_from_sender(
+                                    proc_handle,
+                                    hval,
+                                ) {
+                                    Ok(escrow) => {
+                                        let raw = escrow.0.into_raw_handle();
+                                        // SAFETY: sole ownership moved from OwnedHandle into File
+                                        let file = unsafe { std::fs::File::from_raw_handle(raw) };
+                                        self.native_escrow.insert(tid, (file, pid, _rid));
                                     }
+                                    Err(e) => marker!(
+                                        "HOST_NATIVE_STAGE_FAILED tid={} err={}",
+                                        tid.0[0],
+                                        e
+                                    ),
                                 }
                             }
+                        }
                     }
                     #[cfg(unix)]
                     {
@@ -294,16 +312,23 @@ impl Fabric {
                                 match authority_fabric::native::unix::stage_from_sender(lane) {
                                     Ok(m) => {
                                         if m.tid == tid && Some(m.rid) == native_rid {
-                                            let file = authority_fabric::native::unix::escrow_to_file(
-                                                authority_fabric::native::unix::Escrowed(m.fd.unwrap()),
-                                            );
+                                            let file =
+                                                authority_fabric::native::unix::escrow_to_file(
+                                                    authority_fabric::native::unix::Escrowed(
+                                                        m.fd.unwrap(),
+                                                    ),
+                                                );
                                             self.native_escrow.insert(tid, (file, pid, _rid));
                                             marker!("HOST_NATIVE_STAGED_UNIX tid={}", tid.0[0]);
                                         } else {
                                             marker!("HOST_NATIVE_STAGE_MISMATCH tid={}", tid.0[0]);
                                         }
                                     }
-                                    Err(e) => marker!("HOST_NATIVE_STAGE_FAILED tid={} err={}", tid.0[0], e),
+                                    Err(e) => marker!(
+                                        "HOST_NATIVE_STAGE_FAILED tid={} err={}",
+                                        tid.0[0],
+                                        e
+                                    ),
                                 }
                             }
                         }
@@ -322,7 +347,7 @@ impl Fabric {
                     }
                     Err(p) => Some(p),
                 }
-            },
+            }
             Frame::Close { target } => match self.router.on_close(pid, target) {
                 Ok(oc) => {
                     self.dispatch_sends(&oc);
@@ -350,9 +375,10 @@ impl Fabric {
                 }
                 Err(p) => Some(p),
             },
-            Frame::ClosedNotify { .. } | Frame::Grant { .. } | Frame::CreateAck { .. } | Frame::Error(_) => {
-                Some(self.router.on_illegal(pid, "peer sent host-only frame"))
-            }
+            Frame::ClosedNotify { .. }
+            | Frame::Grant { .. }
+            | Frame::CreateAck { .. }
+            | Frame::Error(_) => Some(self.router.on_illegal(pid, "peer sent host-only frame")),
             Frame::Shutdown => {
                 let oc = self.router.on_shutdown(pid);
                 self.dispatch_sends(&oc);
@@ -364,11 +390,7 @@ impl Fabric {
         match outcome {
             None => true,
             Some(poison) => {
-                marker!(
-                    "HOST_QUARANTINED_PEER peer={} reason={}",
-                    pid.0,
-                    poison.0
-                );
+                marker!("HOST_QUARANTINED_PEER peer={} reason={}", pid.0, poison.0);
                 self.collapse_peer(pid);
                 true
             }
@@ -388,16 +410,33 @@ impl Fabric {
             // and fill handle_value with a value valid in the recipient's
             // handle table. Commit point = this successful duplication.
             // (Offer-time Data keeps escrow intact; only NativeCommit spends it.)
-            if let Frame::Xfer(XferMsg::NativeCommit { tid, rid, handle_value }) = &mut frame {
+            if let Frame::Xfer(XferMsg::NativeCommit {
+                tid,
+                rid: _,
+                handle_value,
+            }) = &mut frame
+            {
                 let had = self.native_escrow.contains_key(tid);
                 if let Some((escrow_file, _sender, _rid2)) = self.native_escrow.remove(tid) {
                     #[cfg(windows)]
                     {
-                        let dest_proc = self.conns.get(dest).map(|c| c.child.as_raw_handle() as *mut winapi::ctypes::c_void);
+                        let dest_proc = self
+                            .conns
+                            .get(dest)
+                            .map(|c| c.child.as_raw_handle() as *mut winapi::ctypes::c_void);
                         if let Some(dp) = dest_proc {
                             match deliver_to_dest(escrow_file, dp) {
-                                Ok(hval) => { *handle_value = hval; marker!("HOST_NATIVE_DELIVERED tid={} hval={:#x}", tid.0[0], hval); }
-                                Err(e) => marker!("HOST_NATIVE_COMMIT_FAILED tid={} err={}", tid.0[0], e),
+                                Ok(hval) => {
+                                    *handle_value = hval;
+                                    marker!(
+                                        "HOST_NATIVE_DELIVERED tid={} hval={:#x}",
+                                        tid.0[0],
+                                        hval
+                                    );
+                                }
+                                Err(e) => {
+                                    marker!("HOST_NATIVE_COMMIT_FAILED tid={} err={}", tid.0[0], e)
+                                }
                             }
                         } else {
                             drop(escrow_file);
@@ -407,7 +446,9 @@ impl Fabric {
                     {
                         // Linux commit delivery: sendmsg(SCM_RIGHTS) over the
                         // recipient lane. Commit point = successful sendmsg.
-                        let dest_lane = self.conns.get(dest).and_then(|c| c.resource_lane.as_ref().and_then(|l| l.try_clone().ok()));
+                        let dest_lane = self.conns.get(dest).and_then(|c| {
+                            c.resource_lane.as_ref().and_then(|l| l.try_clone().ok())
+                        });
                         match dest_lane {
                             Some(lane) => {
                                 use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -418,11 +459,19 @@ impl Fabric {
                                     std::os::fd::OwnedFd::from_raw_fd(escrow_file.into_raw_fd())
                                 };
                                 match authority_fabric::native::unix::deliver_to_recipient(
-                                    &lane, *tid, *rid,
+                                    &lane,
+                                    *tid,
+                                    *rid,
                                     authority_fabric::native::unix::Escrowed(owned),
                                 ) {
-                                    Ok(()) => marker!("HOST_NATIVE_DELIVERED_UNIX tid={}", tid.0[0]),
-                                    Err(e) => marker!("HOST_NATIVE_COMMIT_FAILED tid={} err={}", tid.0[0], e),
+                                    Ok(()) => {
+                                        marker!("HOST_NATIVE_DELIVERED_UNIX tid={}", tid.0[0])
+                                    }
+                                    Err(e) => marker!(
+                                        "HOST_NATIVE_COMMIT_FAILED tid={} err={}",
+                                        tid.0[0],
+                                        e
+                                    ),
                                 }
                             }
                             None => drop(escrow_file),
@@ -435,23 +484,43 @@ impl Fabric {
             // Native pre-commit abort: restore escrow to SENDER (windows
             // duplicates the handle back; unix sendmsg's it over the lane).
             if let Frame::Xfer(XferMsg::Abort { tid: abort_tid }) = frame.clone() {
-                if let Some((escrow_file, sender_peer, rid)) = self.native_escrow.remove(&abort_tid) {
+                if let Some((escrow_file, sender_peer, rid)) = self.native_escrow.remove(&abort_tid)
+                {
                     if *dest == sender_peer {
                         #[cfg(windows)]
                         {
-                            let sender_proc = self.conns.get(dest).map(|c| c.child.as_raw_handle() as *mut winapi::ctypes::c_void);
+                            let sender_proc = self
+                                .conns
+                                .get(dest)
+                                .map(|c| c.child.as_raw_handle() as *mut winapi::ctypes::c_void);
                             if let Some(sp) = sender_proc {
                                 use std::os::windows::io::{FromRawHandle, IntoRawHandle};
-                                let owned = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(escrow_file.into_raw_handle()) };
+                                let owned = unsafe {
+                                    std::os::windows::io::OwnedHandle::from_raw_handle(
+                                        escrow_file.into_raw_handle(),
+                                    )
+                                };
                                 match authority_fabric::native::windows::restore_to_sender(
                                     sp,
                                     authority_fabric::native::windows::Escrowed(owned),
                                 ) {
                                     Ok(hval) => {
-                                        frame = Frame::Xfer(XferMsg::NativeAbort { tid: abort_tid, rid, handle_value: hval });
-                                        marker!("HOST_NATIVE_RESTORED tid={} hval={:#x}", abort_tid.0[0], hval);
+                                        frame = Frame::Xfer(XferMsg::NativeAbort {
+                                            tid: abort_tid,
+                                            rid,
+                                            handle_value: hval,
+                                        });
+                                        marker!(
+                                            "HOST_NATIVE_RESTORED tid={} hval={:#x}",
+                                            abort_tid.0[0],
+                                            hval
+                                        );
                                     }
-                                    Err(e) => marker!("HOST_NATIVE_RESTORE_FAILED tid={} err={}", abort_tid.0[0], e),
+                                    Err(e) => marker!(
+                                        "HOST_NATIVE_RESTORE_FAILED tid={} err={}",
+                                        abort_tid.0[0],
+                                        e
+                                    ),
                                 }
                             } else {
                                 drop(escrow_file);
@@ -461,7 +530,9 @@ impl Fabric {
                         {
                             // Restore = sendmsg(SCM_RIGHTS) back over sender's
                             // lane. Sender's lane thread resolves its wait slot.
-                            let sender_lane = self.conns.get(dest).and_then(|c| c.resource_lane.as_ref().and_then(|l| l.try_clone().ok()));
+                            let sender_lane = self.conns.get(dest).and_then(|c| {
+                                c.resource_lane.as_ref().and_then(|l| l.try_clone().ok())
+                            });
                             match sender_lane {
                                 Some(lane) => {
                                     use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -469,11 +540,20 @@ impl Fabric {
                                         std::os::fd::OwnedFd::from_raw_fd(escrow_file.into_raw_fd())
                                     };
                                     match authority_fabric::native::unix::restore_to_sender(
-                                        &lane, abort_tid, rid,
+                                        &lane,
+                                        abort_tid,
+                                        rid,
                                         authority_fabric::native::unix::Escrowed(owned),
                                     ) {
-                                        Ok(()) => marker!("HOST_NATIVE_RESTORED_UNIX tid={}", abort_tid.0[0]),
-                                        Err(e) => marker!("HOST_NATIVE_RESTORE_FAILED tid={} err={}", abort_tid.0[0], e),
+                                        Ok(()) => marker!(
+                                            "HOST_NATIVE_RESTORED_UNIX tid={}",
+                                            abort_tid.0[0]
+                                        ),
+                                        Err(e) => marker!(
+                                            "HOST_NATIVE_RESTORE_FAILED tid={} err={}",
+                                            abort_tid.0[0],
+                                            e
+                                        ),
                                     }
                                 }
                                 None => drop(escrow_file),
@@ -533,7 +613,10 @@ impl Fabric {
             Ok(frame) => {
                 if let Some(c) = self.conns.get(&to) {
                     let deadline = Instant::now() + Duration::from_millis(2000);
-                    if c.q.push_ctrl(frame.clone(), frame.cost(), deadline).is_err() {
+                    if c.q
+                        .push_ctrl(frame.clone(), frame.cost(), deadline)
+                        .is_err()
+                    {
                         marker!("HOST_GRANT_PUSH_FAILED");
                     }
                 }
@@ -574,7 +657,8 @@ impl Fabric {
         let ids: Vec<PeerId> = self.conns.keys().copied().collect();
         for pid in &ids {
             if let Some(c) = self.conns.get(pid) {
-                let _ = c.q.push_ctrl(Frame::Shutdown, 8, Instant::now() + Duration::from_secs(1));
+                let _ =
+                    c.q.push_ctrl(Frame::Shutdown, 8, Instant::now() + Duration::from_secs(1));
             }
         }
         // Give writers a moment to flush, then process graceful collapses.
@@ -673,7 +757,10 @@ fn bootstrap(
     marker!("HOST_PIDS svc={} cli={}", svc_os, cli_os);
     if let Ok(dir) = std::env::var("SEAM_BARRIER_DIR") {
         let p = std::path::Path::new(&dir).join("pids.txt");
-        let _ = std::fs::write(p, format!("svc={} cli={} host={}", svc_os, cli_os, std::process::id()));
+        let _ = std::fs::write(
+            p,
+            format!("svc={} cli={} host={}", svc_os, cli_os, std::process::id()),
+        );
     }
     fab.wait_hellos(2, Duration::from_secs(10))?;
     marker!("SERVICE_BOOTSTRAPPED");
@@ -730,11 +817,7 @@ fn libc_fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
 fn deny_inherit(h: &impl std::os::windows::io::AsRawHandle) {
     const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
     extern "system" {
-        fn SetHandleInformation(
-            hobject: *mut core::ffi::c_void,
-            dwmask: u32,
-            dwflags: u32,
-        ) -> i32;
+        fn SetHandleInformation(hobject: *mut core::ffi::c_void, dwmask: u32, dwflags: u32) -> i32;
     }
     let raw = h.as_raw_handle();
     // SAFETY: `raw` is a valid open handle owned by `h` for the duration of
@@ -804,10 +887,7 @@ fn demo(lim: Limits) -> i32 {
         Ok(s) => s,
         Err(e) => return fail(&e),
     };
-    marker!(
-        "BOOTSTRAP_MS {}",
-        setup.t0.elapsed().as_millis()
-    );
+    marker!("BOOTSTRAP_MS {}", setup.t0.elapsed().as_millis());
 
     // Wait for the client to finish the nested-capability phase.
     let kill_corr = match fab.wait_ctrl(Duration::from_secs(30), |m| {
@@ -830,7 +910,8 @@ fn demo(lim: Limits) -> i32 {
     fab.ack_ctrl(&setup, kill_corr);
 
     // Client asserts failures and signals Done.
-    let done_corr = match fab.wait_ctrl(Duration::from_secs(20), |m| matches!(m, ControlMsg::Done)) {
+    let done_corr = match fab.wait_ctrl(Duration::from_secs(20), |m| matches!(m, ControlMsg::Done))
+    {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -934,7 +1015,10 @@ fn crash_e(lim: Limits) -> Result<(), String> {
     let mut fab = Fabric::new(lim);
     let setup = bootstrap(
         &mut fab,
-        &[("SEAM_SERVICE_MODE", "normal".into()), ("SEAM_SLOW_REPLY_MS", "8000".into())],
+        &[
+            ("SEAM_SERVICE_MODE", "normal".into()),
+            ("SEAM_SLOW_REPLY_MS", "8000".into()),
+        ],
         &[("SEAM_CLIENT_MODE", "outstanding_request".into())],
     )?;
     std::thread::sleep(Duration::from_millis(400)); // let the request land
@@ -1004,15 +1088,17 @@ fn perf(lim: Limits) -> i32 {
     let setup = match bootstrap(
         &mut fab,
         &[("SEAM_SERVICE_MODE", "normal".into())],
-        &[("SEAM_CLIENT_MODE", "perf".into()), ("SEAM_PERF_N", "2000".into())],
+        &[
+            ("SEAM_CLIENT_MODE", "perf".into()),
+            ("SEAM_PERF_N", "2000".into()),
+        ],
     ) {
         Ok(s) => s,
         Err(e) => return fail(&e),
     };
     marker!("PERF_BOOTSTRAP_MS {}", setup.t0.elapsed().as_millis());
-    let done_corr = match fab.wait_ctrl(Duration::from_secs(300), |m| {
-        matches!(m, ControlMsg::Done)
-    }) {
+    let done_corr = match fab.wait_ctrl(Duration::from_secs(300), |m| matches!(m, ControlMsg::Done))
+    {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -1034,17 +1120,19 @@ fn scale(lim: Limits) -> i32 {
     let setup = match bootstrap(
         &mut fab,
         &[("SEAM_SERVICE_MODE", "normal".into())],
-        &[("SEAM_CLIENT_MODE", "churn".into()), ("SEAM_CHURN_N", n.to_string())],
+        &[
+            ("SEAM_CLIENT_MODE", "churn".into()),
+            ("SEAM_CHURN_N", n.to_string()),
+        ],
     ) {
         Ok(s) => s,
         Err(e) => return fail(&e),
     };
-    let done_corr = match fab.wait_ctrl(Duration::from_secs(1800), |m| {
-        matches!(m, ControlMsg::Done)
-    }) {
-        Ok(c) => c,
-        Err(e) => return fail(&e),
-    };
+    let done_corr =
+        match fab.wait_ctrl(Duration::from_secs(1800), |m| matches!(m, ControlMsg::Done)) {
+            Ok(c) => c,
+            Err(e) => return fail(&e),
+        };
     fab.ack_ctrl(&setup, done_corr);
     let a = fab.router.accounting();
     marker!(
@@ -1058,9 +1146,7 @@ fn scale(lim: Limits) -> i32 {
     if a.live_endpoints != 4 || a.retired_identities > max_ret {
         return fail(&format!(
             "scale accounting wrong: live={} retired={} want live=4 retired<={}",
-            a.live_endpoints,
-            a.retired_identities,
-            max_ret
+            a.live_endpoints, a.retired_identities, max_ret
         ));
     }
     let _ = fab.wait_exit(setup.cli, Duration::from_secs(20));
@@ -1140,7 +1226,8 @@ fn abort_cycle_case(lim: Limits) -> i32 {
         Ok(s) => s,
         Err(e) => return fail(&e),
     };
-    let done_corr = match fab.wait_ctrl(Duration::from_secs(30), |m| matches!(m, ControlMsg::Done)) {
+    let done_corr = match fab.wait_ctrl(Duration::from_secs(30), |m| matches!(m, ControlMsg::Done))
+    {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -1188,7 +1275,10 @@ fn preflight_p1(lim: Limits) -> i32 {
     let svc_os = fab.conns.get(&svc).map(|c| c.child.id()).unwrap_or(0);
     let cli_os = fab.conns.get(&cli).map(|c| c.child.id()).unwrap_or(0);
     marker!("HOST_PIDS svc={} cli={}", svc_os, cli_os);
-    let _ = std::fs::write(dir.join("pids.txt"), format!("svc={} cli={}", svc_os, cli_os));
+    let _ = std::fs::write(
+        dir.join("pids.txt"),
+        format!("svc={} cli={}", svc_os, cli_os),
+    );
     if let Err(e) = fab.wait_hellos(2, Duration::from_secs(10)) {
         return fail(&e);
     }
@@ -1244,7 +1334,9 @@ fn preflight_p1(lim: Limits) -> i32 {
         fab.step(deadline);
         // Check if cli is gone and service still alive, and escrow cleared
         if fab.exit_codes.contains_key(&cli_peer) || fab.router.accounting().escrowed == 0 {
-            if fab.router.accounting().unacked_results == 0 || fab.router.accounting().pending_transfers == 0 {
+            if fab.router.accounting().unacked_results == 0
+                || fab.router.accounting().pending_transfers == 0
+            {
                 // service should have restored
                 saw_restore = true;
                 break;
@@ -1285,16 +1377,16 @@ fn preflight_p2(lim: Limits) -> i32 {
     std::env::set_var("SEAM_BARRIER_DIR", &dir_s);
     std::env::set_var("SEAM_PAUSE_BEFORE_COMMIT", "1");
     let mut fab = Fabric::new(lim);
-    let svc = match fab.spawn_role(
-        "service",
-        &[("SEAM_BARRIER_DIR", dir_s.clone())],
-    ) {
+    let svc = match fab.spawn_role("service", &[("SEAM_BARRIER_DIR", dir_s.clone())]) {
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
     let cli = match fab.spawn_role(
         "client",
-        &[("SEAM_BARRIER_DIR", dir_s.clone()), ("SEAM_CLIENT_MODE", "txn_once".into())],
+        &[
+            ("SEAM_BARRIER_DIR", dir_s.clone()),
+            ("SEAM_CLIENT_MODE", "txn_once".into()),
+        ],
     ) {
         Ok(p) => p,
         Err(e) => return fail(&e),
@@ -1302,7 +1394,10 @@ fn preflight_p2(lim: Limits) -> i32 {
     let svc_os = fab.conns.get(&svc).map(|c| c.child.id()).unwrap_or(0);
     let cli_os = fab.conns.get(&cli).map(|c| c.child.id()).unwrap_or(0);
     marker!("HOST_PIDS svc={} cli={}", svc_os, cli_os);
-    let _ = std::fs::write(dir.join("pids.txt"), format!("svc={} cli={}", svc_os, cli_os));
+    let _ = std::fs::write(
+        dir.join("pids.txt"),
+        format!("svc={} cli={}", svc_os, cli_os),
+    );
     if let Err(e) = fab.wait_hellos(2, Duration::from_secs(10)) {
         return fail(&e);
     }
@@ -1366,16 +1461,16 @@ fn preflight_p3(lim: Limits) -> i32 {
     std::env::set_var("SEAM_BARRIER_DIR", &dir_s);
     std::env::set_var("SEAM_PAUSE_AFTER_COMMIT", "1");
     let mut fab = Fabric::new(lim);
-    let svc = match fab.spawn_role(
-        "service",
-        &[("SEAM_BARRIER_DIR", dir_s.clone())],
-    ) {
+    let svc = match fab.spawn_role("service", &[("SEAM_BARRIER_DIR", dir_s.clone())]) {
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
     let cli = match fab.spawn_role(
         "client",
-        &[("SEAM_BARRIER_DIR", dir_s.clone()), ("SEAM_CLIENT_MODE", "preflight_p3_client".into())],
+        &[
+            ("SEAM_BARRIER_DIR", dir_s.clone()),
+            ("SEAM_CLIENT_MODE", "preflight_p3_client".into()),
+        ],
     ) {
         Ok(p) => p,
         Err(e) => return fail(&e),
@@ -1383,7 +1478,10 @@ fn preflight_p3(lim: Limits) -> i32 {
     let svc_os = fab.conns.get(&svc).map(|c| c.child.id()).unwrap_or(0);
     let cli_os = fab.conns.get(&cli).map(|c| c.child.id()).unwrap_or(0);
     marker!("HOST_PIDS svc={} cli={}", svc_os, cli_os);
-    let _ = std::fs::write(dir.join("pids.txt"), format!("svc={} cli={}", svc_os, cli_os));
+    let _ = std::fs::write(
+        dir.join("pids.txt"),
+        format!("svc={} cli={}", svc_os, cli_os),
+    );
     if let Err(e) = fab.wait_hellos(2, Duration::from_secs(10)) {
         return fail(&e);
     }
@@ -1471,7 +1569,18 @@ fn preflight_p4(lim: Limits) -> i32 {
     let done = fab.wait_ctrl(Duration::from_secs(20), |m| matches!(m, ControlMsg::Done));
     match done {
         Ok(corr) => {
-            fab.ack_ctrl(&Setup { svc, cli, _root_client_side: a, _root_service_side: b, _ctrl_client_side: cc, ctrl_host_side: ch, t0: Instant::now() }, corr);
+            fab.ack_ctrl(
+                &Setup {
+                    svc,
+                    cli,
+                    _root_client_side: a,
+                    _root_service_side: b,
+                    _ctrl_client_side: cc,
+                    ctrl_host_side: ch,
+                    t0: Instant::now(),
+                },
+                corr,
+            );
         }
         Err(_e) => {
             // Even with drop, client should still get committed via status and then Done
@@ -1501,29 +1610,36 @@ fn native_abort_case(lim: Limits) -> i32 {
     let setup = match bootstrap(
         &mut fab,
         &[("SEAM_SERVICE_MODE", "native".into())],
-        &[("SEAM_CLIENT_MODE", "native_abort".into()), ("SEAM_CLI_REJECT_NATIVE", "1".into())],
+        &[
+            ("SEAM_CLIENT_MODE", "native_abort".into()),
+            ("SEAM_CLI_REJECT_NATIVE", "1".into()),
+        ],
     ) {
         Ok(s) => s,
         Err(e) => return fail(&e),
     };
     // Phase 1 runs with rejection on (child-side env). The client clears its
     // own flag in-process before txn #2; nothing to flip here.
-    let done_corr = match fab.wait_ctrl(Duration::from_secs(30), |m| matches!(m, ControlMsg::Done)) {
+    let done_corr = match fab.wait_ctrl(Duration::from_secs(30), |m| matches!(m, ControlMsg::Done))
+    {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
     fab.ack_ctrl(&setup, done_corr);
     let _ = fab.wait_exit(setup.cli, Duration::from_secs(15));
     let code = fab.exit_codes.get(&setup.cli).copied().unwrap_or(-1);
-    if code != 0 { return fail(&format!("native_abort client exit {code}")); }
+    if code != 0 {
+        return fail(&format!("native_abort client exit {code}"));
+    }
     fab.shutdown_orderly();
     let a = fab.router.accounting();
-    if a.peers != 0 || a.native_unacked != 0 { return fail(&format!("native_abort leak {a:?}")); }
+    if a.peers != 0 || a.native_unacked != 0 {
+        return fail(&format!("native_abort leak {a:?}"));
+    }
     marker!("NATIVE_ABORT_OK");
     println!("NATIVE_ABORT_OK");
     0
 }
-
 
 fn native_stress_case(lim: Limits) -> i32 {
     let n: String = std::env::var("SEAM_STRESS_N").unwrap_or_else(|_| "1000".into());
@@ -1539,14 +1655,17 @@ fn native_stress_case(lim: Limits) -> i32 {
         Ok(s) => s,
         Err(e) => return fail(&e),
     };
-    let done_corr = match fab.wait_ctrl(Duration::from_secs(1800), |m| matches!(m, ControlMsg::Done)) {
-        Ok(c) => c,
-        Err(e) => return fail(&e),
-    };
+    let done_corr =
+        match fab.wait_ctrl(Duration::from_secs(1800), |m| matches!(m, ControlMsg::Done)) {
+            Ok(c) => c,
+            Err(e) => return fail(&e),
+        };
     fab.ack_ctrl(&setup, done_corr);
     let _ = fab.wait_exit(setup.cli, Duration::from_secs(60));
     let code = fab.exit_codes.get(&setup.cli).copied().unwrap_or(-1);
-    if code != 0 { return fail(&format!("native_stress client exit {code}")); }
+    if code != 0 {
+        return fail(&format!("native_stress client exit {code}"));
+    }
     fab.shutdown_orderly();
     let a = fab.router.accounting();
     if a.peers != 0 || a.native_unacked != 0 {
@@ -1571,7 +1690,8 @@ fn native_happy_case(lim: Limits) -> i32 {
         Ok(s) => s,
         Err(e) => return fail(&e),
     };
-    let done_corr = match fab.wait_ctrl(Duration::from_secs(20), |m| matches!(m, ControlMsg::Done)) {
+    let done_corr = match fab.wait_ctrl(Duration::from_secs(20), |m| matches!(m, ControlMsg::Done))
+    {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };

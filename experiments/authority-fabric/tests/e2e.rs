@@ -26,18 +26,14 @@ fn kill_tree(pid: u32) {
     }
     #[cfg(not(windows))]
     {
-        let _ = Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
     }
 }
 
 fn run_host(args: &[&str], envs: &[(&str, &str)], timeout: Duration) -> Output {
     let _guard = E2E.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(host_bin());
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -156,10 +152,7 @@ fn quarantine() {
 #[test]
 fn host_death() {
     let _guard = E2E.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = std::env::temp_dir().join(format!(
-        "seam-hostdie-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("seam-hostdie-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let mut cmd = Command::new(host_bin());
     cmd.arg("hostdie")
@@ -212,7 +205,10 @@ fn host_death() {
         thread::sleep(Duration::from_millis(50));
     }
     let _ = std::fs::remove_dir_all(&dir);
-    panic!("host death: children={child_pids:?} gone={pids_gone} marker={}", marker.exists());
+    panic!(
+        "host death: children={child_pids:?} gone={pids_gone} marker={}",
+        marker.exists()
+    );
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -327,7 +323,11 @@ fn native_abort_restore() {
     assert_eq!(out.status.code(), Some(0), "native_abort\n{combined}");
     assert_contains(&combined, "HOST_NATIVE_RESTORED", "native_abort");
     assert_contains(&combined, "SVC_NATIVE_NONCE_READBACK_OK", "native_abort");
-    assert_contains(&combined, "CLIENT_NATIVE_RESTORED_RECOMMITTED_OK", "native_abort");
+    assert_contains(
+        &combined,
+        "CLIENT_NATIVE_RESTORED_RECOMMITTED_OK",
+        "native_abort",
+    );
     assert_contains(&combined, "NATIVE_ABORT_OK", "native_abort");
 }
 

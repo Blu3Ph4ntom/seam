@@ -4,11 +4,11 @@
 //! format, or transport. See `.agent/` (local-only) for the run charter.
 
 pub mod fabric_error;
-pub mod id;
-pub mod native;
 pub mod frame;
+pub mod id;
 pub mod limits;
 pub mod memstream;
+pub mod native;
 pub mod peer;
 pub mod proto;
 pub mod queue;
@@ -18,7 +18,9 @@ pub use fabric_error::{Cause, FabError};
 pub use frame::FrameError;
 pub use id::{EpId, TransferId};
 pub use limits::Limits;
-pub use peer::{CallResult, Endpoint, Inbound, PeerAccounting, Runtime, RuntimeInner, TransferOutcome};
+pub use peer::{
+    CallResult, Endpoint, Inbound, PeerAccounting, Runtime, RuntimeInner, TransferOutcome,
+};
 pub use queue::{Backlog, DualQueue};
 pub use router::{Accounting as RouterAccounting, HostDelivery, PeerId, Poison, Router};
 

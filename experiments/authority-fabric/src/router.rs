@@ -20,9 +20,11 @@ use crate::frame::{
     self, DataInner, Frame, XferMsg, XFER_ST_ABORTED, XFER_ST_COMMITTED, XFER_ST_PENDING,
     XFER_ST_UNKNOWN,
 };
-use crate::id::{fresh_id, fresh_transfer_id, BoundedTombstones, EpId, IdSpace, TransferId, TransferSpace};
+use crate::id::{
+    fresh_id, fresh_transfer_id, BoundedTombstones, EpId, IdSpace, TransferId, TransferSpace,
+};
 use crate::limits::Limits;
-use crate::native::{ResourceId, ResourceSpace, fresh_resource_id};
+use crate::native::{ResourceId, ResourceSpace};
 
 fn barrier_wait(name: &str) {
     if let Ok(dir) = std::env::var("SEAM_BARRIER_DIR") {
@@ -201,8 +203,16 @@ impl Router {
                 .values()
                 .filter(|e| !e.closed && e.holder == Holder::Host)
                 .count(),
-            pending_transfers: self.xfers.values().filter(|x| x.phase == XferPhase::Offered).count()
-                + self.native_pending.values().filter(|n| n.state == NativeState::Escrowed).count(),
+            pending_transfers: self
+                .xfers
+                .values()
+                .filter(|x| x.phase == XferPhase::Offered)
+                .count()
+                + self
+                    .native_pending
+                    .values()
+                    .filter(|n| n.state == NativeState::Escrowed)
+                    .count(),
             escrowed: self
                 .eps
                 .values()
@@ -244,7 +254,12 @@ impl Router {
                     || self.3.contains_key(&id)
             }
         }
-        T(&self.xfers, &self.results, &self.native_pending, &self.native_results)
+        T(
+            &self.xfers,
+            &self.results,
+            &self.native_pending,
+            &self.native_results,
+        )
     }
 
     fn taken_rids(&self) -> impl ResourceSpace + '_ {
@@ -274,8 +289,22 @@ impl Router {
         );
         let a = fresh_id(&self.taken_ids());
         let b = fresh_id(&self.taken_ids());
-        self.eps.insert(a, EpEntry { partner: b, holder, closed: false });
-        self.eps.insert(b, EpEntry { partner: a, holder, closed: false });
+        self.eps.insert(
+            a,
+            EpEntry {
+                partner: b,
+                holder,
+                closed: false,
+            },
+        );
+        self.eps.insert(
+            b,
+            EpEntry {
+                partner: a,
+                holder,
+                closed: false,
+            },
+        );
         (a, b)
     }
 
@@ -363,7 +392,10 @@ impl Router {
     }
 
     pub fn on_hello(&mut self, from: PeerId, magic: u16, version: u16) -> Result<(), Poison> {
-        let ready = self.peers.get_mut(&from).ok_or(Poison("hello from unknown peer"))?;
+        let ready = self
+            .peers
+            .get_mut(&from)
+            .ok_or(Poison("hello from unknown peer"))?;
         if *ready {
             return Err(Poison("duplicate hello"));
         }
@@ -378,8 +410,16 @@ impl Router {
     }
 
     /// Process a DATA frame from `from`.
-    pub fn on_data(&mut self, from: PeerId, mut f: frame::DataInner) -> Result<RouteOutcome, Poison> {
-        if !*self.peers.get(&from).ok_or(Poison("frame from unknown peer"))? {
+    pub fn on_data(
+        &mut self,
+        from: PeerId,
+        mut f: frame::DataInner,
+    ) -> Result<RouteOutcome, Poison> {
+        if !*self
+            .peers
+            .get(&from)
+            .ok_or(Poison("frame from unknown peer"))?
+        {
             return Err(Poison("traffic before hello"));
         }
         let target_entry = match self.require_owner(from, f.target) {
@@ -390,7 +430,9 @@ impl Router {
                 let mut out = RouteOutcome::default();
                 out.send.push((
                     from,
-                    Frame::ClosedNotify { entries: vec![(f.target, cause)] },
+                    Frame::ClosedNotify {
+                        entries: vec![(f.target, cause)],
+                    },
                 ));
                 return Ok(out);
             }
@@ -413,7 +455,12 @@ impl Router {
                     // tell the sender that capability is gone.
                     let cause = self.retired.get(att.id).unwrap_or(Cause::Graceful);
                     let mut out = RouteOutcome::default();
-                    out.send.push((from, Frame::ClosedNotify { entries: vec![(att.id, cause)] }));
+                    out.send.push((
+                        from,
+                        Frame::ClosedNotify {
+                            entries: vec![(att.id, cause)],
+                        },
+                    ));
                     return Ok(out);
                 }
                 Err(Err(p)) => return Err(p),
@@ -442,11 +489,14 @@ impl Router {
             Holder::Escrow(_) => return Err(Poison("conversation partner is in escrow")),
         };
 
-        if attachments.len() + self.xfers.len() + self.results.len() > self.lim.max_pending_transfers {
+        if attachments.len() + self.xfers.len() + self.results.len()
+            > self.lim.max_pending_transfers
+        {
             // Resource: abort before commit. Sender still owns (we have not
             // escrowed yet). Surface as ERROR capacity.
             let mut out = RouteOutcome::default();
-            out.send.push((from, Frame::Error(crate::frame::ERR_CAPACITY)));
+            out.send
+                .push((from, Frame::Error(crate::frame::ERR_CAPACITY)));
             return Ok(out);
         }
 
@@ -476,11 +526,13 @@ impl Router {
                 return Err(Poison("duplicate or reused native resource id"));
             }
             // Capacity checks for native
-            if self.native_pending.len() + self.native_results.len() >= self.lim.max_native_resources
+            if self.native_pending.len() + self.native_results.len()
+                >= self.lim.max_native_resources
                 || self.native_pending.len() >= self.lim.max_resources_in_escrow
             {
                 let mut out = RouteOutcome::default();
-                out.send.push((from, Frame::Error(crate::frame::ERR_CAPACITY)));
+                out.send
+                    .push((from, Frame::Error(crate::frame::ERR_CAPACITY)));
                 return Ok(out);
             }
             // Windows handle_value validation: must be non-zero if present, but allow 0 for Linux
@@ -505,7 +557,10 @@ impl Router {
             f.native = None;
         }
 
-        if std::env::var("SEAM_PAUSE_AFTER_ESCROW").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("SEAM_PAUSE_AFTER_ESCROW")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             barrier_wait("host_after_escrow");
         }
 
@@ -542,16 +597,22 @@ impl Router {
         if entry.holder != Holder::Host {
             return Err(Poison("host emit on endpoint not held by host"));
         }
-        let partner_entry = *self.eps.get(&entry.partner).ok_or(Poison("broken pairing"))?;
+        let partner_entry = *self
+            .eps
+            .get(&entry.partner)
+            .ok_or(Poison("broken pairing"))?;
         let mut out = RouteOutcome::default();
         if let Holder::Peer(dest) = partner_entry.holder {
-            out.send.push((dest, Frame::Data(DataInner {
-                target,
-                corr,
-                attachments: vec![],
-                payload,
-                native: None,
-            })));
+            out.send.push((
+                dest,
+                Frame::Data(DataInner {
+                    target,
+                    corr,
+                    attachments: vec![],
+                    payload,
+                    native: None,
+                }),
+            ));
         }
         Ok(out)
     }
@@ -559,7 +620,11 @@ impl Router {
     /// Process CLOSE of one end by its current holder.
 
     pub fn on_close(&mut self, from: PeerId, target: EpId) -> Result<RouteOutcome, Poison> {
-        if !*self.peers.get(&from).ok_or(Poison("frame from unknown peer"))? {
+        if !*self
+            .peers
+            .get(&from)
+            .ok_or(Poison("frame from unknown peer"))?
+        {
             return Err(Poison("traffic before hello"));
         }
         match self.require_owner(from, target) {
@@ -567,7 +632,12 @@ impl Router {
             Err(Ok(())) => {
                 let cause = self.retired.get(target).unwrap_or(Cause::Graceful);
                 let mut out = RouteOutcome::default();
-                out.send.push((from, Frame::ClosedNotify { entries: vec![(target, cause)] }));
+                out.send.push((
+                    from,
+                    Frame::ClosedNotify {
+                        entries: vec![(target, cause)],
+                    },
+                ));
                 return Ok(out);
             }
             Err(Err(p)) => return Err(p),
@@ -576,11 +646,18 @@ impl Router {
         let mut out = RouteOutcome::default();
         match partner_entry.holder {
             Holder::Peer(q) => {
-                out.send.push((q, Frame::ClosedNotify { entries: vec![(surviving, Cause::Graceful)] }));
+                out.send.push((
+                    q,
+                    Frame::ClosedNotify {
+                        entries: vec![(surviving, Cause::Graceful)],
+                    },
+                ));
             }
             Holder::Host => {
-                self.host_events
-                    .push(HostEvent::EndpointClosed { ep: surviving, cause: Cause::Graceful });
+                self.host_events.push(HostEvent::EndpointClosed {
+                    ep: surviving,
+                    cause: Cause::Graceful,
+                });
             }
             Holder::Escrow(_) => {}
         }
@@ -590,7 +667,11 @@ impl Router {
     /// Process CREATE from a peer: allocates an implementation side and a
     /// transferable side, both initially held by the requesting peer.
     pub fn on_create(&mut self, from: PeerId) -> Result<RouteOutcome, Poison> {
-        if !*self.peers.get(&from).ok_or(Poison("frame from unknown peer"))? {
+        if !*self
+            .peers
+            .get(&from)
+            .ok_or(Poison("frame from unknown peer"))?
+        {
             return Err(Poison("traffic before hello"));
         }
         if self.eps.values().filter(|e| !e.closed).count() + 2 > self.lim.max_live_endpoints
@@ -599,12 +680,19 @@ impl Router {
             // Capacity exhaustion is a resource condition, not corruption.
             // Surface as ERROR(code=capacity) to the requester.
             let mut out = RouteOutcome::default();
-            out.send.push((from, Frame::Error(crate::frame::ERR_CAPACITY)));
+            out.send
+                .push((from, Frame::Error(crate::frame::ERR_CAPACITY)));
             return Ok(out);
         }
         let (imp, tra) = self.alloc_pair(Holder::Peer(from));
         let mut out = RouteOutcome::default();
-        out.send.push((from, Frame::CreateAck { impl_ep: imp, transferable_ep: tra }));
+        out.send.push((
+            from,
+            Frame::CreateAck {
+                impl_ep: imp,
+                transferable_ep: tra,
+            },
+        ));
         Ok(out)
     }
 
@@ -645,7 +733,9 @@ impl Router {
                     self.finish_xfer(tid, x.sender, XferPhase::Aborted);
                 } else {
                     // T3/T4/T5: dest died pre-commit; restore to sender.
-                    let extra = self.xfer_abort_inner(tid, "recipient lost").unwrap_or_default();
+                    let extra = self
+                        .xfer_abort_inner(tid, "recipient lost")
+                        .unwrap_or_default();
                     out.send.extend(extra.send);
                 }
             }
@@ -662,7 +752,8 @@ impl Router {
                 if n.sender == p {
                     // Sender died pre-commit: close escrow, abort
                     self.native_pending.remove(&tid);
-                    self.native_results.insert(tid, (n.sender, Cause::Graceful, n.rid));
+                    self.native_results
+                        .insert(tid, (n.sender, Cause::Graceful, n.rid));
                     self.native_retired.insert(n.rid, Cause::Graceful);
                 } else {
                     // Dest died pre-commit: restore to sender
@@ -677,13 +768,19 @@ impl Router {
                         // q may itself have been removed earlier in this loop;
                         // only notify peers still present.
                         if self.peers.contains_key(&q) && q != p {
-                            out.send.push((q, Frame::ClosedNotify {
-                                entries: vec![(surviving, cause)],
-                            }));
+                            out.send.push((
+                                q,
+                                Frame::ClosedNotify {
+                                    entries: vec![(surviving, cause)],
+                                },
+                            ));
                         }
                     }
                     Holder::Host => {
-                        self.host_events.push(HostEvent::EndpointClosed { ep: surviving, cause });
+                        self.host_events.push(HostEvent::EndpointClosed {
+                            ep: surviving,
+                            cause,
+                        });
                     }
                     Holder::Escrow(_) => {}
                 }
@@ -784,7 +881,9 @@ impl Router {
                 return false;
             }
             if escrow {
-                let Holder::Escrow(tid) = e.holder else { return false };
+                let Holder::Escrow(tid) = e.holder else {
+                    return false;
+                };
                 match self.xfers.get(&tid) {
                     Some(x) if x.ep == *id && x.phase == XferPhase::Offered => {}
                     _ => return false,
@@ -795,7 +894,11 @@ impl Router {
     }
 
     pub fn on_xfer(&mut self, from: PeerId, msg: XferMsg) -> Result<RouteOutcome, Poison> {
-        if !*self.peers.get(&from).ok_or(Poison("frame from unknown peer"))? {
+        if !*self
+            .peers
+            .get(&from)
+            .ok_or(Poison("frame from unknown peer"))?
+        {
             return Err(Poison("traffic before hello"));
         }
         match msg {
@@ -804,7 +907,8 @@ impl Router {
             XferMsg::Status { tid } => {
                 let st = self.xfer_status(tid);
                 let mut out = RouteOutcome::default();
-                out.send.push((from, Frame::Xfer(XferMsg::StatusAck { tid, status: st })));
+                out.send
+                    .push((from, Frame::Xfer(XferMsg::StatusAck { tid, status: st })));
                 Ok(out)
             }
             XferMsg::ResultAck { tid } => {
@@ -846,7 +950,10 @@ impl Router {
             if self.dest_live_count(from) >= self.lim.max_live_endpoints {
                 return self.xfer_abort_inner(tid, "recipient capacity");
             }
-            if std::env::var("SEAM_PAUSE_BEFORE_COMMIT").map(|v| v == "1").unwrap_or(false) {
+            if std::env::var("SEAM_PAUSE_BEFORE_COMMIT")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
                 barrier_wait("host_before_commit");
             }
             return self.xfer_commit_inner(tid);
@@ -861,7 +968,10 @@ impl Router {
             if self.native_live.len() >= self.lim.max_native_resources {
                 return self.native_abort_inner(tid, "recipient capacity");
             }
-            if std::env::var("SEAM_PAUSE_BEFORE_COMMIT").map(|v| v == "1").unwrap_or(false) {
+            if std::env::var("SEAM_PAUSE_BEFORE_COMMIT")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
                 barrier_wait("host_before_commit");
             }
             return self.native_commit_inner(tid);
@@ -913,7 +1023,10 @@ impl Router {
             return Err(Poison("escrowed endpoint missing"));
         }
         self.finish_xfer(tid, x.sender, XferPhase::Committed);
-        if std::env::var("SEAM_PAUSE_AFTER_COMMIT").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("SEAM_PAUSE_AFTER_COMMIT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             barrier_wait("host_after_commit");
         }
         let mut out = RouteOutcome::default();
@@ -928,12 +1041,17 @@ impl Router {
             ));
         }
         if !self.inject.drop_committed {
-            out.send.push((x.sender, Frame::Xfer(XferMsg::Committed { tid })));
+            out.send
+                .push((x.sender, Frame::Xfer(XferMsg::Committed { tid })));
         }
         Ok(out)
     }
 
-    fn xfer_abort_inner(&mut self, tid: TransferId, _why: &'static str) -> Result<RouteOutcome, Poison> {
+    fn xfer_abort_inner(
+        &mut self,
+        tid: TransferId,
+        _why: &'static str,
+    ) -> Result<RouteOutcome, Poison> {
         let x = *self.xfers.get(&tid).ok_or(Poison("unknown transfer id"))?;
         if x.phase != XferPhase::Offered {
             return Ok(RouteOutcome::default());
@@ -957,46 +1075,71 @@ impl Router {
     }
 
     fn native_commit_inner(&mut self, tid: TransferId) -> Result<RouteOutcome, Poison> {
-        let rec = *self.native_pending.get(&tid).ok_or(Poison("unknown native transfer"))?;
+        let rec = *self
+            .native_pending
+            .get(&tid)
+            .ok_or(Poison("unknown native transfer"))?;
         if rec.state != NativeState::Escrowed {
             return Ok(RouteOutcome::default());
         }
         // Move from pending to committed, and live to dest
         self.native_pending.remove(&tid);
-        self.native_results.insert(tid, (rec.sender, Cause::PeerLost, rec.rid));
+        self.native_results
+            .insert(tid, (rec.sender, Cause::PeerLost, rec.rid));
         self.native_live.insert(rec.rid, rec.dest);
         // Retire the old rid if it was previously live (should not happen for new rid)
-        if std::env::var("SEAM_PAUSE_AFTER_COMMIT").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("SEAM_PAUSE_AFTER_COMMIT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             barrier_wait("host_after_commit");
         }
         let mut out = RouteOutcome::default();
         // Recipient gets NativeCommit carrying the (host-filled) handle;
         // sender gets logical Committed for ResultAck retention.
         if !self.inject.drop_commit {
-            out.send.push((rec.dest, Frame::Xfer(XferMsg::NativeCommit { tid, rid: rec.rid, handle_value: 0 })));
+            out.send.push((
+                rec.dest,
+                Frame::Xfer(XferMsg::NativeCommit {
+                    tid,
+                    rid: rec.rid,
+                    handle_value: 0,
+                }),
+            ));
         }
         if !self.inject.drop_committed {
-            out.send.push((rec.sender, Frame::Xfer(XferMsg::Committed { tid })));
+            out.send
+                .push((rec.sender, Frame::Xfer(XferMsg::Committed { tid })));
         }
         Ok(out)
     }
 
-    fn native_abort_inner(&mut self, tid: TransferId, _why: &'static str) -> Result<RouteOutcome, Poison> {
-        let rec = *self.native_pending.get(&tid).ok_or(Poison("unknown native transfer"))?;
+    fn native_abort_inner(
+        &mut self,
+        tid: TransferId,
+        _why: &'static str,
+    ) -> Result<RouteOutcome, Poison> {
+        let rec = *self
+            .native_pending
+            .get(&tid)
+            .ok_or(Poison("unknown native transfer"))?;
         if rec.state != NativeState::Escrowed {
             return Ok(RouteOutcome::default());
         }
         self.native_pending.remove(&tid);
-        self.native_results.insert(tid, (rec.sender, Cause::Graceful, rec.rid));
+        self.native_results
+            .insert(tid, (rec.sender, Cause::Graceful, rec.rid));
         // No live entry for rid yet, so nothing to remove; on abort, rid returns to sender implicitly
         // For abort, we don't insert into native_live; sender will recreate on restore
         let mut out = RouteOutcome::default();
         if !self.inject.drop_abort {
             if self.peers.contains_key(&rec.sender) {
-                out.send.push((rec.sender, Frame::Xfer(XferMsg::Abort { tid })));
+                out.send
+                    .push((rec.sender, Frame::Xfer(XferMsg::Abort { tid })));
             }
             if rec.dest != rec.sender && self.peers.contains_key(&rec.dest) {
-                out.send.push((rec.dest, Frame::Xfer(XferMsg::Abort { tid })));
+                out.send
+                    .push((rec.dest, Frame::Xfer(XferMsg::Abort { tid })));
             }
         }
         Ok(out)
@@ -1018,12 +1161,16 @@ impl Router {
 mod tests {
     use super::*;
     use crate::frame::{Attachment, DataInner, Frame, XferMsg, ERR_CAPACITY};
-    use crate::native::ResourceId;
     use crate::id::TransferId;
+    use crate::native::ResourceId;
 
     fn hello_ok(r: &mut Router, p: PeerId) {
-        r.on_hello(p, Limits::default().hello_magic, Limits::default().hello_version)
-            .unwrap();
+        r.on_hello(
+            p,
+            Limits::default().hello_magic,
+            Limits::default().hello_version,
+        )
+        .unwrap();
     }
 
     fn grant_commit(r: &mut Router, to: PeerId, ep: EpId) {
@@ -1041,7 +1188,11 @@ mod tests {
     }
 
     fn att(id: EpId, partner: EpId) -> Attachment {
-        Attachment { tid: TransferId(id.0), id, partner }
+        Attachment {
+            tid: TransferId(id.0),
+            id,
+            partner,
+        }
     }
 
     /// Two accepted, hello'd peers; root pair granted A=x, B=y.
@@ -1108,10 +1259,7 @@ mod tests {
         let (mut r, a, _, x, y) = primed();
         // y is held by B; A attaching it is forgery.
         let err = r
-            .on_data(
-                a,
-                data(x, vec![att(y, r.partner_of(y).unwrap())]),
-            )
+            .on_data(a, data(x, vec![att(y, r.partner_of(y).unwrap())]))
             .unwrap_err();
         assert_eq!(err, Poison("identity not held by sender"));
     }
@@ -1272,7 +1420,11 @@ mod tests {
 
         hello_ok(&mut r, a);
         let err = r
-            .on_hello(a, Limits::default().hello_magic, Limits::default().hello_version)
+            .on_hello(
+                a,
+                Limits::default().hello_magic,
+                Limits::default().hello_version,
+            )
             .unwrap_err();
         assert_eq!(err, Poison("duplicate hello"));
 
@@ -1303,7 +1455,10 @@ mod tests {
         // first transfer A->B
         let oc = r.on_create(a).unwrap();
         let (imp1, tra1) = match &oc.send[0].1 {
-            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            } => (*impl_ep, *transferable_ep),
             other => panic!("{other:?}"),
         };
         let oc = r.on_data(a, data(x, vec![att(tra1, imp1)])).unwrap();
@@ -1318,7 +1473,10 @@ mod tests {
         // second transfer
         let oc = r.on_create(a).unwrap();
         let (imp2, tra2) = match &oc.send[0].1 {
-            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            } => (*impl_ep, *transferable_ep),
             other => panic!("{other:?}"),
         };
         let oc = r.on_data(a, data(x, vec![att(tra2, imp2)])).unwrap();
@@ -1351,7 +1509,10 @@ mod tests {
         let (mut r, a, b, x, _) = primed();
         let oc = r.on_create(a).unwrap();
         let (imp, tra) = match &oc.send[0].1 {
-            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            } => (*impl_ep, *transferable_ep),
             other => panic!("{other:?}"),
         };
         let oc = r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
@@ -1376,7 +1537,10 @@ mod tests {
         // abort case also idempotent
         let oc = r.on_create(a).unwrap();
         let (imp2, tra2) = match &oc.send[0].1 {
-            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            } => (*impl_ep, *transferable_ep),
             other => panic!("{other:?}"),
         };
         let oc = r.on_data(a, data(x, vec![att(tra2, imp2)])).unwrap();
@@ -1399,7 +1563,10 @@ mod tests {
         r.inject.drop_committed = true;
         let oc = r.on_create(a).unwrap();
         let (imp, tra) = match &oc.send[0].1 {
-            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            } => (*impl_ep, *transferable_ep),
             other => panic!("{other:?}"),
         };
         let oc = r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
@@ -1410,7 +1577,10 @@ mod tests {
         let _ = oc;
         let out = r.on_xfer(b, XferMsg::Accept { tid }).unwrap();
         // Committed dropped, but status still COMMITTED via retained result
-        assert!(out.send.iter().all(|(_, f)| !matches!(f, Frame::Xfer(XferMsg::Committed { .. }))));
+        assert!(out
+            .send
+            .iter()
+            .all(|(_, f)| !matches!(f, Frame::Xfer(XferMsg::Committed { .. }))));
         assert_eq!(r.xfer_status(tid), crate::frame::XFER_ST_COMMITTED);
         let oc = r.on_xfer(a, XferMsg::Status { tid }).unwrap();
         assert!(oc.send.iter().any(|(dest, f)| {
@@ -1430,7 +1600,10 @@ mod tests {
         // Pre-commit abort: dest Rejects -> holder returns to sender
         let oc = r.on_create(a).unwrap();
         let (imp, tra) = match &oc.send[0].1 {
-            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            } => (*impl_ep, *transferable_ep),
             other => panic!("{other:?}"),
         };
         let oc = r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
@@ -1446,7 +1619,10 @@ mod tests {
         // Post-commit death: authority dies with dest, not restored
         let oc = r.on_create(a).unwrap();
         let (imp2, tra2) = match &oc.send[0].1 {
-            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            } => (*impl_ep, *transferable_ep),
             other => panic!("{other:?}"),
         };
         let oc = r.on_data(a, data(x, vec![att(tra2, imp2)])).unwrap();
@@ -1488,7 +1664,10 @@ mod tests {
         for _ in 0..500 {
             let oc = r.on_create(a).unwrap();
             let (imp, tra) = match &oc.send[0].1 {
-                Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+                Frame::CreateAck {
+                    impl_ep,
+                    transferable_ep,
+                } => (*impl_ep, *transferable_ep),
                 other => panic!("{other:?}"),
             };
             let oc = r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
@@ -1527,7 +1706,10 @@ mod tests {
         grant_commit(&mut r2, b2, y2);
         let oc = r2.on_create(a2).unwrap();
         let (imp, tra) = match &oc.send[0].1 {
-            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            } => (*impl_ep, *transferable_ep),
             other => panic!("{other:?}"),
         };
         let oc = r2.on_data(a2, data(x2, vec![att(tra, imp)])).unwrap();
@@ -1557,7 +1739,10 @@ mod tests {
         grant_commit(&mut r3, b3, y3);
         let oc = r3.on_create(a3).unwrap();
         let (imp3, tra3) = match &oc.send[0].1 {
-            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            } => (*impl_ep, *transferable_ep),
             other => panic!("{other:?}"),
         };
         let oc = r3.on_data(a3, data(x3, vec![att(tra3, imp3)])).unwrap();
@@ -1570,7 +1755,10 @@ mod tests {
         // next transfer must be rejected via Error, not queued
         let oc2 = r3.on_create(a3).unwrap();
         let (imp4, tra4) = match &oc2.send[0].1 {
-            Frame::CreateAck { impl_ep, transferable_ep } => (*impl_ep, *transferable_ep),
+            Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            } => (*impl_ep, *transferable_ep),
             other => panic!("{other:?}"),
         };
         let oc = r3.on_data(a3, data(x3, vec![att(tra4, imp4)])).unwrap();
@@ -1583,10 +1771,23 @@ mod tests {
         let (mut r, a, b, x, _) = primed();
         let rid = ResourceId([9u8; 16]);
         let tid = TransferId([10u8; 16]);
-        let native = crate::frame::NativeAttachment { tid, rid, handle_value: 12345 };
-        let f = DataInner { target: x, corr: 1, attachments: vec![], payload: b"x".to_vec(), native: Some(native) };
+        let native = crate::frame::NativeAttachment {
+            tid,
+            rid,
+            handle_value: 12345,
+        };
+        let f = DataInner {
+            target: x,
+            corr: 1,
+            attachments: vec![],
+            payload: b"x".to_vec(),
+            native: Some(native),
+        };
         let out = r.on_data(a, f).unwrap();
-        assert!(out.send.iter().any(|(dest, f)| *dest == b && matches!(f, Frame::Data(d) if d.native.is_some())));
+        assert!(out
+            .send
+            .iter()
+            .any(|(dest, f)| *dest == b && matches!(f, Frame::Data(d) if d.native.is_some())));
         assert_eq!(r.native_pending.len(), 1);
         r.on_xfer(b, XferMsg::Accept { tid }).unwrap();
         assert_eq!(r.native_live.get(&rid), Some(&b));

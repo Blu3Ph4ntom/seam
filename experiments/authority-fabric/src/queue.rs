@@ -54,10 +54,22 @@ impl<T> BoundedQueue<T> {
     pub fn try_push(&self, item: T, cost: usize) -> Result<(), (T, Backlog)> {
         let mut g = self.inner.lock().unwrap();
         if g.closed {
-            return Err((item, Backlog { msgs: g.msgs, bytes: g.bytes }));
+            return Err((
+                item,
+                Backlog {
+                    msgs: g.msgs,
+                    bytes: g.bytes,
+                },
+            ));
         }
         if g.msgs >= self.max_msgs || g.bytes + cost > self.max_bytes {
-            return Err((item, Backlog { msgs: g.msgs, bytes: g.bytes }));
+            return Err((
+                item,
+                Backlog {
+                    msgs: g.msgs,
+                    bytes: g.bytes,
+                },
+            ));
         }
         g.q.push_back((item, cost));
         g.msgs += 1;
@@ -69,11 +81,22 @@ impl<T> BoundedQueue<T> {
 
     /// Enqueue, waiting until space exists or `deadline`. Control-plane
     /// frames use this so they are never silently dropped.
-    pub fn push_deadline(&self, item: T, cost: usize, deadline: Instant) -> Result<(), (T, Backlog)> {
+    pub fn push_deadline(
+        &self,
+        item: T,
+        cost: usize,
+        deadline: Instant,
+    ) -> Result<(), (T, Backlog)> {
         let mut g = self.inner.lock().unwrap();
         loop {
             if g.closed {
-                return Err((item, Backlog { msgs: g.msgs, bytes: g.bytes }));
+                return Err((
+                    item,
+                    Backlog {
+                        msgs: g.msgs,
+                        bytes: g.bytes,
+                    },
+                ));
             }
             if g.msgs < self.max_msgs && g.bytes + cost <= self.max_bytes {
                 g.q.push_back((item, cost));
@@ -85,7 +108,13 @@ impl<T> BoundedQueue<T> {
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err((item, Backlog { msgs: g.msgs, bytes: g.bytes }));
+                return Err((
+                    item,
+                    Backlog {
+                        msgs: g.msgs,
+                        bytes: g.bytes,
+                    },
+                ));
             }
             let wait = std::cmp::min(deadline - now, Duration::from_millis(50));
             let (ng, _) = self.space.wait_timeout(g, wait).unwrap();
@@ -162,7 +191,10 @@ impl<T> BoundedQueue<T> {
     /// Current accounting snapshot (for state tests).
     pub fn backlog(&self) -> Backlog {
         let g = self.inner.lock().unwrap();
-        Backlog { msgs: g.msgs, bytes: g.bytes }
+        Backlog {
+            msgs: g.msgs,
+            bytes: g.bytes,
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -237,12 +269,7 @@ impl<T> DualQueue<T> {
 
     /// Lifecycle/control frame. Waits (bounded) for reserved capacity; the
     /// item is returned untouched on failure — silent loss is forbidden.
-    pub fn push_ctrl(
-        &self,
-        item: T,
-        cost: usize,
-        deadline: Instant,
-    ) -> Result<(), (T, Backlog)> {
+    pub fn push_ctrl(&self, item: T, cost: usize, deadline: Instant) -> Result<(), (T, Backlog)> {
         let mut g = self.inner.lock().unwrap();
         loop {
             if g.closed {

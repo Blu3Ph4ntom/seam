@@ -6,8 +6,12 @@ use authority_fabric::Limits;
 use std::time::Instant;
 
 fn hello(r: &mut Router, p: authority_fabric::PeerId) {
-    r.on_hello(p, Limits::default().hello_magic, Limits::default().hello_version)
-        .unwrap();
+    r.on_hello(
+        p,
+        Limits::default().hello_magic,
+        Limits::default().hello_version,
+    )
+    .unwrap();
 }
 
 fn grant_commit(r: &mut Router, to: authority_fabric::PeerId, ep: authority_fabric::EpId) {
@@ -39,7 +43,11 @@ fn million_lifecycle_churn() {
     }
     let a = r.accounting();
     assert_eq!(a.pending_transfers, 0);
-    assert!(a.retired_identities <= 4096, "retired {}", a.retired_identities);
+    assert!(
+        a.retired_identities <= 4096,
+        "retired {}",
+        a.retired_identities
+    );
     assert_eq!(a.escrowed, 0);
     eprintln!(
         "CHURN_1M n={n} ms={} live={} retired={} pending={} collisions={}",

@@ -130,7 +130,9 @@ pub fn encode_counter_request(r: CounterRequest) -> Vec<u8> {
 pub fn decode_counter_request(buf: &[u8]) -> Result<CounterRequest, FabError> {
     let (t, rest) = dec_tag(buf)?;
     if !rest.is_empty() {
-        return Err(FabError::InvalidMessage("trailing bytes in counter request"));
+        return Err(FabError::InvalidMessage(
+            "trailing bytes in counter request",
+        ));
     }
     match t {
         TAG_INCREMENT => Ok(CounterRequest::Increment),
@@ -158,7 +160,9 @@ pub fn decode_counter_response(buf: &[u8]) -> Result<CounterResponse, FabError> 
     let (t, rest) = dec_tag(buf)?;
     let (n, rest) = take_u64(rest)?;
     if !rest.is_empty() {
-        return Err(FabError::InvalidMessage("trailing bytes in counter response"));
+        return Err(FabError::InvalidMessage(
+            "trailing bytes in counter response",
+        ));
     }
     match t {
         TAG_INCREMENTED => Ok(CounterResponse::Incremented(n)),
@@ -220,13 +224,19 @@ mod tests {
             assert_eq!(decode_root_response(&encode_root_response(r)).unwrap(), r);
         }
         for r in [CounterRequest::Increment, CounterRequest::Get] {
-            assert_eq!(decode_counter_request(&encode_counter_request(r)).unwrap(), r);
+            assert_eq!(
+                decode_counter_request(&encode_counter_request(r)).unwrap(),
+                r
+            );
         }
         for r in [
             CounterResponse::Incremented(u64::MAX),
             CounterResponse::Value(0),
         ] {
-            assert_eq!(decode_counter_response(&encode_counter_response(r)).unwrap(), r);
+            assert_eq!(
+                decode_counter_response(&encode_counter_response(r)).unwrap(),
+                r
+            );
         }
         for r in [ControlMsg::ReadyToKill, ControlMsg::Done] {
             assert_eq!(decode_control(&encode_control(r)).unwrap(), r);

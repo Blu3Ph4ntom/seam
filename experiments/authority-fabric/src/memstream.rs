@@ -36,13 +36,25 @@ pub struct MemStream {
 
 pub fn mem_duplex() -> (MemStream, MemStream) {
     let link = Arc::new(Link {
-        a_to_b: LinkSide { q: Mutex::new(VecDeque::new()), cv: Condvar::new() },
-        b_to_a: LinkSide { q: Mutex::new(VecDeque::new()), cv: Condvar::new() },
+        a_to_b: LinkSide {
+            q: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+        },
+        b_to_a: LinkSide {
+            q: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+        },
         closed: AtomicBool::new(false),
     });
     (
-        MemStream { link: link.clone(), read_a_to_b: true },
-        MemStream { link, read_a_to_b: false },
+        MemStream {
+            link: link.clone(),
+            read_a_to_b: true,
+        },
+        MemStream {
+            link,
+            read_a_to_b: false,
+        },
     )
 }
 

@@ -7,12 +7,10 @@ use std::time::Duration;
 
 use authority_fabric::fabric_error::FabError;
 use authority_fabric::id::EpId;
-use authority_fabric::peer::{Endpoint, Inbound, Runtime, TransferOutcome};
 use authority_fabric::marker;
 use authority_fabric::native::NativeFile;
-use authority_fabric::proto::{
-    self, CounterRequest, RootRequest, RootResponse,
-};
+use authority_fabric::peer::{Endpoint, Inbound, Runtime, TransferOutcome};
+use authority_fabric::proto::{self, CounterRequest, RootRequest, RootResponse};
 use authority_fabric::Limits;
 
 fn main() {
@@ -47,7 +45,7 @@ fn main() {
     let mut counters: HashMap<EpId, u64> = HashMap::new();
     // RAII: keep implementation-side handles alive; dropping them would Close.
     let mut held: Vec<Endpoint> = Vec::new();
-        let mut restored_q: Vec<Endpoint> = Vec::new();
+    let mut restored_q: Vec<Endpoint> = Vec::new();
     let mut restored_q_native: Vec<NativeFile> = Vec::new();
 
     loop {
@@ -80,10 +78,17 @@ fn main() {
                             Some(f) => f,
                             None => match NativeFile::new_temp(b"SEAM_NATIVE_NONCE") {
                                 Ok(f) => f,
-                                Err(e) => { eprintln!("SERVICE_FAIL native create: {e}"); continue; }
+                                Err(e) => {
+                                    eprintln!("SERVICE_FAIL native create: {e}");
+                                    continue;
+                                }
                             },
                         };
-                        match rt.reply_with_native(&req, proto::encode_root_response(RootResponse::Counter), Some(nf)) {
+                        match rt.reply_with_native(
+                            &req,
+                            proto::encode_root_response(RootResponse::Counter),
+                            Some(nf),
+                        ) {
                             Ok(TransferOutcome::Committed) => {}
                             Ok(TransferOutcome::NativeAborted(back)) => {
                                 marker!("SVC_NATIVE_RESTORED n={}", back.len());

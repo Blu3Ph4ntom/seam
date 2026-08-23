@@ -110,27 +110,68 @@ pub struct NativeAttachment {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum XferMsg {
-    Accept { tid: TransferId },
-    Reject { tid: TransferId },
-    Commit { tid: TransferId, ep: EpId, partner: EpId },
-    Committed { tid: TransferId },
-    Abort { tid: TransferId },
-    Status { tid: TransferId },
-    StatusAck { tid: TransferId, status: u8 },
-    ResultAck { tid: TransferId },
-    NativeCommit { tid: TransferId, rid: ResourceId, handle_value: u64 },
-    NativeAbort { tid: TransferId, rid: ResourceId, handle_value: u64 },
+    Accept {
+        tid: TransferId,
+    },
+    Reject {
+        tid: TransferId,
+    },
+    Commit {
+        tid: TransferId,
+        ep: EpId,
+        partner: EpId,
+    },
+    Committed {
+        tid: TransferId,
+    },
+    Abort {
+        tid: TransferId,
+    },
+    Status {
+        tid: TransferId,
+    },
+    StatusAck {
+        tid: TransferId,
+        status: u8,
+    },
+    ResultAck {
+        tid: TransferId,
+    },
+    NativeCommit {
+        tid: TransferId,
+        rid: ResourceId,
+        handle_value: u64,
+    },
+    NativeAbort {
+        tid: TransferId,
+        rid: ResourceId,
+        handle_value: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
-    Hello { magic: u16, version: u16 },
+    Hello {
+        magic: u16,
+        version: u16,
+    },
     Data(DataInner),
-    Close { target: EpId },
-    ClosedNotify { entries: Vec<(EpId, Cause)> },
-    Grant { ep: EpId, partner: EpId, tid: TransferId },
+    Close {
+        target: EpId,
+    },
+    ClosedNotify {
+        entries: Vec<(EpId, Cause)>,
+    },
+    Grant {
+        ep: EpId,
+        partner: EpId,
+        tid: TransferId,
+    },
     Create,
-    CreateAck { impl_ep: EpId, transferable_ep: EpId },
+    CreateAck {
+        impl_ep: EpId,
+        transferable_ep: EpId,
+    },
     Error(u8),
     Shutdown,
     Xfer(XferMsg),
@@ -193,7 +234,9 @@ impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             FrameError::Truncated => write!(f, "frame truncated"),
-            FrameError::TooLarge { declared, cap } => write!(f, "declared frame {declared} exceeds cap {cap}"),
+            FrameError::TooLarge { declared, cap } => {
+                write!(f, "declared frame {declared} exceeds cap {cap}")
+            }
             FrameError::UnknownKind(k) => write!(f, "unknown frame kind {k}"),
             FrameError::BadMagic(m) => write!(f, "bad hello magic 0x{m:04x}"),
             FrameError::BadVersion(v) => write!(f, "bad protocol version {v}"),
@@ -331,7 +374,10 @@ pub fn encode_into(frame: &Frame, out: &mut Vec<u8>) {
             put_tid(out, *tid);
         }
         Frame::Create => {}
-        Frame::CreateAck { impl_ep, transferable_ep } => {
+        Frame::CreateAck {
+            impl_ep,
+            transferable_ep,
+        } => {
             put_ep(out, *impl_ep);
             put_ep(out, *transferable_ep);
         }
@@ -375,13 +421,21 @@ pub fn encode_into(frame: &Frame, out: &mut Vec<u8>) {
                 out.push(XFER_RESULT_ACK);
                 put_tid(out, *tid);
             }
-            XferMsg::NativeCommit { tid, rid, handle_value } => {
+            XferMsg::NativeCommit {
+                tid,
+                rid,
+                handle_value,
+            } => {
                 out.push(XFER_NATIVE_COMMIT);
                 put_tid(out, *tid);
                 put_rid(out, *rid);
                 put_u64(out, *handle_value);
             }
-            XferMsg::NativeAbort { tid, rid, handle_value } => {
+            XferMsg::NativeAbort {
+                tid,
+                rid,
+                handle_value,
+            } => {
                 out.push(XFER_NATIVE_ABORT);
                 put_tid(out, *tid);
                 put_rid(out, *rid);
@@ -429,14 +483,24 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
                 let tid = c.tid()?;
                 let rid = c.rid()?;
                 let handle_value = c.u64v()?;
-                Some(NativeAttachment { tid, rid, handle_value })
+                Some(NativeAttachment {
+                    tid,
+                    rid,
+                    handle_value,
+                })
             } else if has_native == 0 {
                 None
             } else {
                 return Err(FrameError::UnknownKind(KIND_DATA));
             };
             let payload = c.rest().to_vec();
-            Ok(Frame::Data(DataInner { target, corr, attachments, payload, native }))
+            Ok(Frame::Data(DataInner {
+                target,
+                corr,
+                attachments,
+                payload,
+                native,
+            }))
         }
         KIND_CLOSE => Ok(Frame::Close { target: c.epid()? }),
         KIND_CLOSED_NOTIFY => {
@@ -465,7 +529,10 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
         KIND_CREATE_ACK => {
             let impl_ep = c.epid()?;
             let transferable_ep = c.epid()?;
-            Ok(Frame::CreateAck { impl_ep, transferable_ep })
+            Ok(Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            })
         }
         KIND_ERROR => {
             let code = c.u8v()?;
@@ -491,8 +558,16 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
                     status: c.u8v()?,
                 },
                 XFER_RESULT_ACK => XferMsg::ResultAck { tid },
-                XFER_NATIVE_COMMIT => XferMsg::NativeCommit { tid, rid: c.rid()?, handle_value: c.u64v()? },
-                XFER_NATIVE_ABORT => XferMsg::NativeAbort { tid, rid: c.rid()?, handle_value: c.u64v()? },
+                XFER_NATIVE_COMMIT => XferMsg::NativeCommit {
+                    tid,
+                    rid: c.rid()?,
+                    handle_value: c.u64v()?,
+                },
+                XFER_NATIVE_ABORT => XferMsg::NativeAbort {
+                    tid,
+                    rid: c.rid()?,
+                    handle_value: c.u64v()?,
+                },
                 _ => return Err(FrameError::UnknownKind(KIND_XFER)),
             };
             Ok(Frame::Xfer(msg))
@@ -534,7 +609,10 @@ pub fn read_frame<R: Read>(r: &mut R, lim: &Limits) -> Result<Frame, FrameError>
     r.read_exact(&mut lb).map_err(|_| FrameError::Truncated)?;
     let declared = u32::from_le_bytes(lb);
     if declared > lim.max_frame_body {
-        return Err(FrameError::TooLarge { declared, cap: lim.max_frame_body });
+        return Err(FrameError::TooLarge {
+            declared,
+            cap: lim.max_frame_body,
+        });
     }
     if declared == 0 {
         return Err(FrameError::Truncated); // no kind byte
@@ -549,7 +627,10 @@ mod tests {
     use super::*;
 
     fn lim() -> Limits {
-        Limits { max_frame_body: 128, ..Limits::default() }
+        Limits {
+            max_frame_body: 128,
+            ..Limits::default()
+        }
     }
 
     fn ep(n: u8) -> EpId {
@@ -567,11 +648,18 @@ mod tests {
     fn roundtrip_all_kinds() {
         let l = lim();
         let frames = vec![
-            Frame::Hello { magic: 0x5345, version: 2 },
+            Frame::Hello {
+                magic: 0x5345,
+                version: 2,
+            },
             Frame::Data(DataInner {
                 target: ep(7),
                 corr: 9,
-                attachments: vec![Attachment { tid: tid(1), id: ep(100), partner: ep(101) }],
+                attachments: vec![Attachment {
+                    tid: tid(1),
+                    id: ep(100),
+                    partner: ep(101),
+                }],
                 payload: vec![1, 2, 3],
                 native: None,
             }),
@@ -579,14 +667,28 @@ mod tests {
             Frame::ClosedNotify {
                 entries: vec![(ep(1), Cause::Graceful), (ep(2), Cause::PeerLost)],
             },
-            Frame::Grant { ep: ep(10), partner: ep(11), tid: tid(3) },
+            Frame::Grant {
+                ep: ep(10),
+                partner: ep(11),
+                tid: tid(3),
+            },
             Frame::Create,
-            Frame::CreateAck { impl_ep: ep(12), transferable_ep: ep(13) },
+            Frame::CreateAck {
+                impl_ep: ep(12),
+                transferable_ep: ep(13),
+            },
             Frame::Error(ERR_CAPACITY),
             Frame::Shutdown,
             Frame::Xfer(XferMsg::Accept { tid: tid(4) }),
-            Frame::Xfer(XferMsg::Commit { tid: tid(5), ep: ep(6), partner: ep(7) }),
-            Frame::Xfer(XferMsg::StatusAck { tid: tid(8), status: XFER_ST_COMMITTED }),
+            Frame::Xfer(XferMsg::Commit {
+                tid: tid(5),
+                ep: ep(6),
+                partner: ep(7),
+            }),
+            Frame::Xfer(XferMsg::StatusAck {
+                tid: tid(8),
+                status: XFER_ST_COMMITTED,
+            }),
         ];
         for f in frames {
             let buf = encode(&f);
@@ -612,7 +714,10 @@ mod tests {
     #[test]
     fn truncated_frames_rejected() {
         let l = lim();
-        let buf = encode(&Frame::Hello { magic: 1, version: 1 });
+        let buf = encode(&Frame::Hello {
+            magic: 1,
+            version: 1,
+        });
         for cut in [0usize, 1, 3, 4, buf.len() - 1] {
             assert_eq!(
                 decode(&buf[..cut.min(buf.len())], &l),
@@ -648,7 +753,11 @@ mod tests {
 
     #[test]
     fn attach_count_over_limit_rejected() {
-        let l = Limits { max_attachments: 2, max_frame_body: 4096, ..lim() };
+        let l = Limits {
+            max_attachments: 2,
+            max_frame_body: 4096,
+            ..lim()
+        };
         let mut buf = Vec::new();
         let body_len = 16 + 4 + 1 + 3 * 48 + 1;
         buf.extend_from_slice(&((1 + body_len) as u32).to_le_bytes());
@@ -716,7 +825,11 @@ mod tests {
         let l = lim();
         // Declared 2GB, but stream only contains the header. Reader must bail
         // on the cap check without attempting a giant read.
-        let mut g = GuardedReader { data: vec![], pos: 0, max_read: 0 };
+        let mut g = GuardedReader {
+            data: vec![],
+            pos: 0,
+            max_read: 0,
+        };
         g.data.extend_from_slice(&(1u32 << 31).to_le_bytes());
         g.data.push(KIND_SHUTDOWN);
         assert!(matches!(

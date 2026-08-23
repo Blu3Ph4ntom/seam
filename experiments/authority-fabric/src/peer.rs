@@ -13,10 +13,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::fabric_error::{Cause, FabError};
-use crate::frame::{self, Attachment, DataInner, Frame, FrameError, NativeAttachment, XferMsg, ERR_CAPACITY};
+use crate::frame::{
+    self, Attachment, DataInner, Frame, FrameError, NativeAttachment, XferMsg, ERR_CAPACITY,
+};
 use crate::id::{fresh_transfer_id, EpId, TransferId, TransferSpace};
 use crate::limits::Limits;
-use crate::native::{NativeFile, ResourceId};
+use crate::native::NativeFile;
 use crate::queue::{BoundedQueue, PopError};
 
 /// A message delivered to a locally-implemented endpoint.
@@ -51,7 +53,10 @@ pub(crate) struct WaitSlot {
 
 impl WaitSlot {
     fn new(ep: EpId) -> Self {
-        WaitSlot { ep, inner: Arc::new((Mutex::new(None), Condvar::new())) }
+        WaitSlot {
+            ep,
+            inner: Arc::new((Mutex::new(None), Condvar::new())),
+        }
     }
     fn resolve(self, res: Result<CallResult, FabError>) {
         let (m, cv) = &*self.inner;
@@ -217,7 +222,10 @@ const INBOUND_COST_OVERHEAD: usize = 96;
 
 /// Benchmark-only stage tracing (SEAM_XFER_TRACE=1). Silent otherwise.
 fn xfer_trace(stage: &'static str) {
-    if std::env::var("SEAM_XFER_TRACE").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("SEAM_XFER_TRACE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         eprintln!("XFER_TRACE {stage} t={:?}", std::time::SystemTime::now());
     }
 }
@@ -249,14 +257,24 @@ impl RuntimeInner {
             return None;
         }
         if !st.handles.contains_key(&id) {
-            st.handles.insert(id, HState { partner, cause: None });
+            st.handles.insert(
+                id,
+                HState {
+                    partner,
+                    cause: None,
+                },
+            );
             st.arrival_order.push(id);
         }
         st.partner_of_theirs.insert(partner, id);
         drop(st);
         let _g = self.new_handle_m.lock().unwrap();
         self.new_handle.notify_all();
-        Some(Endpoint { id, shared: self.clone(), armed: true })
+        Some(Endpoint {
+            id,
+            shared: self.clone(),
+            armed: true,
+        })
     }
     fn new_inner(lim: Limits) -> Self {
         RuntimeInner {
@@ -326,7 +344,11 @@ impl RuntimeInner {
                 let mut st = self.st.lock().unwrap();
                 st.waiters.remove(&p.corr).map(|s| s.peek())
             };
-            let res = Ok(CallResult { payload: p.payload, received: p.got, received_native: None });
+            let res = Ok(CallResult {
+                payload: p.payload,
+                received: p.got,
+                received_native: None,
+            });
             if let Some(inner) = inner {
                 let (m, cv) = &*inner;
                 *m.lock().unwrap() = Some(res);
@@ -362,25 +384,50 @@ impl RuntimeInner {
     fn complete_native(&self, p: NativeParked, file: NativeFile) {
         let local = {
             let st = self.st.lock().unwrap();
-            st.partner_of_theirs.get(&p.target).copied().unwrap_or(p.target)
+            st.partner_of_theirs
+                .get(&p.target)
+                .copied()
+                .unwrap_or(p.target)
         };
         if p.corr != 0 {
             let slot = {
                 let mut st = self.st.lock().unwrap();
-                let matches = st.waiters.get(&p.corr).map(|s| s.ep == local).unwrap_or(false);
-                if matches { st.waiters.remove(&p.corr) } else { None }
+                let matches = st
+                    .waiters
+                    .get(&p.corr)
+                    .map(|s| s.ep == local)
+                    .unwrap_or(false);
+                if matches {
+                    st.waiters.remove(&p.corr)
+                } else {
+                    None
+                }
             };
             if let Some(slot) = slot {
-                slot.resolve(Ok(CallResult { payload: p.payload, received: vec![], received_native: Some(file) }));
+                slot.resolve(Ok(CallResult {
+                    payload: p.payload,
+                    received: vec![],
+                    received_native: Some(file),
+                }));
                 return;
             }
         }
         let cost = p.payload.len() + INBOUND_COST_OVERHEAD;
-        let mut item = Inbound { from: EpId([0; 16]), local, corr: p.corr, payload: p.payload, received: vec![], received_native: Some(file) };
+        let mut item = Inbound {
+            from: EpId([0; 16]),
+            local,
+            corr: p.corr,
+            payload: p.payload,
+            received: vec![],
+            received_native: Some(file),
+        };
         loop {
             match self.inbound.try_push(item, cost) {
                 Ok(()) => return,
-                Err((back, _)) => { item = back; std::thread::sleep(Duration::from_millis(2)); }
+                Err((back, _)) => {
+                    item = back;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
             }
         }
     }
@@ -392,9 +439,7 @@ impl RuntimeInner {
     pub fn install_native_lane(&self, lane: std::os::unix::net::UnixStream) {
         use crate::native::{NativeFile as NF, LANE_KIND_RESTORE};
         // Keep a sender-side clone so reply_with_native can stage over it.
-        *self.native_lane.lock().unwrap() = Some(
-            lane.try_clone().expect("lane try_clone"),
-        );
+        *self.native_lane.lock().unwrap() = Some(lane.try_clone().expect("lane try_clone"));
         let sh = match self.self_weak.lock().unwrap().upgrade() {
             Some(a) => a,
             None => return,
@@ -469,7 +514,8 @@ impl RuntimeInner {
                 // have capacity; otherwise reject so sender can recover.
                 let accept = {
                     let st = self.st.lock().unwrap();
-                    st.handles.values().filter(|h| h.cause.is_none()).count() < self.lim.max_live_endpoints
+                    st.handles.values().filter(|h| h.cause.is_none()).count()
+                        < self.lim.max_live_endpoints
                         && st.terminal.is_none()
                 };
                 if accept {
@@ -498,7 +544,10 @@ impl RuntimeInner {
                 true
             }
             Frame::Create => true,
-            Frame::CreateAck { impl_ep, transferable_ep } => {
+            Frame::CreateAck {
+                impl_ep,
+                transferable_ep,
+            } => {
                 let mut st = self.st.lock().unwrap();
                 if let Some(slot) = st.create_slot.take() {
                     let (m, cv) = &*slot;
@@ -511,7 +560,10 @@ impl RuntimeInner {
                 let mut st = self.st.lock().unwrap();
                 if let Some(slot) = st.create_slot.take() {
                     let err = match code {
-                        ERR_CAPACITY => FabError::Backpressured { queued_msgs: 0, queued_bytes: 0 },
+                        ERR_CAPACITY => FabError::Backpressured {
+                            queued_msgs: 0,
+                            queued_bytes: 0,
+                        },
                         _ => FabError::ProtocolViolation("unknown error code"),
                     };
                     let (m, cv) = &*slot;
@@ -538,7 +590,13 @@ impl RuntimeInner {
                     let mut st = self.st.lock().unwrap();
                     st.pending_offers.remove(&tid);
                     if !st.handles.contains_key(&ep) {
-                        st.handles.insert(ep, HState { partner, cause: None });
+                        st.handles.insert(
+                            ep,
+                            HState {
+                                partner,
+                                cause: None,
+                            },
+                        );
                         st.arrival_order.push(ep);
                     }
                     st.partner_of_theirs.insert(partner, ep);
@@ -548,7 +606,11 @@ impl RuntimeInner {
                     }
                     for p in &mut st.parked {
                         if p.remaining.remove(&tid) {
-                            p.got.push(Endpoint { id: ep, shared: self.clone(), armed: true });
+                            p.got.push(Endpoint {
+                                id: ep,
+                                shared: self.clone(),
+                                armed: true,
+                            });
                         }
                     }
                     let mut i = 0;
@@ -610,7 +672,8 @@ impl RuntimeInner {
                     }
                     let mut i = 0;
                     while i < st.parked.len() {
-                        if st.parked[i].remaining.remove(&tid) && st.parked[i].remaining.is_empty() {
+                        if st.parked[i].remaining.remove(&tid) && st.parked[i].remaining.is_empty()
+                        {
                             let p = st.parked.remove(i);
                             if p.is_response {
                                 fail_waiters.push(p.corr);
@@ -627,7 +690,8 @@ impl RuntimeInner {
                     };
                     if let Some(inner) = inner {
                         let (m, cv) = &*inner;
-                        *m.lock().unwrap() = Some(Err(FabError::TransferAborted("recipient rejected")));
+                        *m.lock().unwrap() =
+                            Some(Err(FabError::TransferAborted("recipient rejected")));
                         cv.notify_all();
                     }
                 }
@@ -651,7 +715,11 @@ impl RuntimeInner {
                 }
                 true
             }
-            XferMsg::NativeCommit { tid, rid, handle_value } => {
+            XferMsg::NativeCommit {
+                tid,
+                rid,
+                handle_value,
+            } => {
                 // Commit observed. The kernel object may arrive via lane
                 // (unix) before or after this frame; join order-independently.
                 let mut st = self.st.lock().unwrap();
@@ -662,7 +730,9 @@ impl RuntimeInner {
                     st.native_recv.insert(tid, NativeFile::restore(rid, file));
                 }
                 #[cfg(not(windows))]
-                { let _ = (rid, handle_value); }
+                {
+                    let _ = (rid, handle_value);
+                }
                 st.native_commit_seen.insert(tid);
                 if let Some(file) = st.native_recv.remove(&tid) {
                     if let Some(p) = st.native_parked.remove(&tid) {
@@ -673,7 +743,11 @@ impl RuntimeInner {
                 }
                 true
             }
-            XferMsg::NativeAbort { tid, rid, handle_value } => {
+            XferMsg::NativeAbort {
+                tid,
+                rid,
+                handle_value,
+            } => {
                 // Restoration (windows inline value; unix arrives via lane fd).
                 #[cfg(windows)]
                 {
@@ -688,7 +762,9 @@ impl RuntimeInner {
                     }
                 }
                 #[cfg(not(windows))]
-                { let _ = (&tid, &rid, &handle_value); }
+                {
+                    let _ = (&tid, &rid, &handle_value);
+                }
                 true
             }
             XferMsg::ResultAck { .. } => true,
@@ -700,14 +776,24 @@ impl RuntimeInner {
         // Native OFFER: accept, park metadata until commit+kernel-object join.
         if let Some(n) = d.native.clone() {
             // Hostile/capacity drill: reject instead of accept.
-            let reject_native = std::env::var("SEAM_CLI_REJECT_NATIVE").map(|v| v == "1").unwrap_or(false);
+            let reject_native = std::env::var("SEAM_CLI_REJECT_NATIVE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             if reject_native {
                 let _ = self.push_out(Frame::Xfer(XferMsg::Reject { tid: n.tid }));
                 return;
             }
             let _ = self.push_out(Frame::Xfer(XferMsg::Accept { tid: n.tid }));
             let mut st = self.st.lock().unwrap();
-            st.native_parked.insert(n.tid, NativeParked { target: d.target, corr: d.corr, payload: d.payload, rid: n.rid });
+            st.native_parked.insert(
+                n.tid,
+                NativeParked {
+                    target: d.target,
+                    corr: d.corr,
+                    payload: d.payload,
+                    rid: n.rid,
+                },
+            );
             return;
         }
         // Attachments are offers: ACCEPT if we have capacity, then wait for
@@ -715,7 +801,10 @@ impl RuntimeInner {
         if !d.attachments.is_empty() {
             xfer_trace("recipient_offer_received");
             // Test-only barrier: pause before ACCEPT so supervisor can kill at known point.
-            if std::env::var("SEAM_BARRIER_OFFER").map(|v| v == "1").unwrap_or(false) {
+            if std::env::var("SEAM_BARRIER_OFFER")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
                 barrier_wait("peer_at_offer");
                 if self.broken.load(Ordering::SeqCst) {
                     return;
@@ -723,8 +812,7 @@ impl RuntimeInner {
             }
             let cap_ok = {
                 let st = self.st.lock().unwrap();
-                st.handles.values().filter(|h| h.cause.is_none()).count()
-                    + d.attachments.len()
+                st.handles.values().filter(|h| h.cause.is_none()).count() + d.attachments.len()
                     <= self.lim.max_live_endpoints
                     && st.terminal.is_none()
             };
@@ -752,9 +840,8 @@ impl RuntimeInner {
                         drop(st);
                         let inner = slot.peek();
                         let (m, cv) = &*inner;
-                        *m.lock().unwrap() = Some(Err(FabError::TransferAborted(
-                            "recipient at capacity",
-                        )));
+                        *m.lock().unwrap() =
+                            Some(Err(FabError::TransferAborted("recipient at capacity")));
                         cv.notify_all();
                     }
                 }
@@ -831,7 +918,11 @@ impl RuntimeInner {
                 let received = d
                     .attachments
                     .iter()
-                    .map(|a| Endpoint { id: a.id, shared: self.clone(), armed: true })
+                    .map(|a| Endpoint {
+                        id: a.id,
+                        shared: self.clone(),
+                        armed: true,
+                    })
                     .collect();
                 let received_native = d.native.map(|n| {
                     let file = {
@@ -840,7 +931,8 @@ impl RuntimeInner {
                             if n.handle_value != 0 {
                                 crate::native::windows::handle_to_file(n.handle_value)
                             } else {
-                                std::fs::File::create(std::env::temp_dir().join("dummy_recv")).unwrap()
+                                std::fs::File::create(std::env::temp_dir().join("dummy_recv"))
+                                    .unwrap()
                             }
                         }
                         #[cfg(unix)]
@@ -858,7 +950,11 @@ impl RuntimeInner {
                     let mut st = self.st.lock().unwrap();
                     st.waiters.remove(&d.corr).map(|s| s.peek())
                 };
-                let res = Ok(CallResult { payload: d.payload, received, received_native });
+                let res = Ok(CallResult {
+                    payload: d.payload,
+                    received,
+                    received_native,
+                });
                 match inner {
                     Some(inner) => {
                         let (m, cv) = &*inner;
@@ -877,7 +973,11 @@ impl RuntimeInner {
                 let received = d
                     .attachments
                     .iter()
-                    .map(|a| Endpoint { id: a.id, shared: self.clone(), armed: true })
+                    .map(|a| Endpoint {
+                        id: a.id,
+                        shared: self.clone(),
+                        armed: true,
+                    })
                     .collect();
                 let received_native = d.native.map(|n| {
                     let file = {
@@ -886,7 +986,8 @@ impl RuntimeInner {
                             if n.handle_value != 0 {
                                 crate::native::windows::handle_to_file(n.handle_value)
                             } else {
-                                std::fs::File::create(std::env::temp_dir().join("dummy_recv")).unwrap()
+                                std::fs::File::create(std::env::temp_dir().join("dummy_recv"))
+                                    .unwrap()
                             }
                         }
                         #[cfg(unix)]
@@ -901,8 +1002,14 @@ impl RuntimeInner {
                     NativeFile::restore(n.rid, file)
                 });
                 let cost = d.payload.len() + INBOUND_COST_OVERHEAD;
-                let mut item =
-                    Inbound { from: d.target, local, corr: d.corr, payload: d.payload, received, received_native };
+                let mut item = Inbound {
+                    from: d.target,
+                    local,
+                    corr: d.corr,
+                    payload: d.payload,
+                    received,
+                    received_native,
+                };
                 // Backpressure: retry WITHOUT holding the state lock; bounded
                 // forever because the fabric eventually goes terminal.
                 loop {
@@ -948,7 +1055,11 @@ impl Endpoint {
     /// Test-only constructor. Not an authority source.
     #[doc(hidden)]
     pub fn __unchecked(id: EpId, shared: Arc<RuntimeInner>) -> Self {
-        Endpoint { id, shared, armed: true }
+        Endpoint {
+            id,
+            shared,
+            armed: true,
+        }
     }
 
     fn disarm(&mut self) {
@@ -983,18 +1094,19 @@ impl Endpoint {
             (corr, st.waiters.get(&corr).unwrap().peek())
         };
 
-        self.shared.push_out(Frame::Data(DataInner {
-            target: self.id,
-            corr,
-            attachments: vec![],
-            payload,
-            native: None,
-        }))
-        .map_err(|e| {
-            let mut st = self.shared.st.lock().unwrap();
-            st.waiters.remove(&corr);
-            e
-        })?;
+        self.shared
+            .push_out(Frame::Data(DataInner {
+                target: self.id,
+                corr,
+                attachments: vec![],
+                payload,
+                native: None,
+            }))
+            .map_err(|e| {
+                let mut st = self.shared.st.lock().unwrap();
+                st.waiters.remove(&corr);
+                e
+            })?;
 
         let (m, cv) = &*slot;
         let mut g = m.lock().unwrap();
@@ -1016,7 +1128,12 @@ impl Endpoint {
     }
 
     /// Call with native resource attachment (experimental).
-    pub fn call_with_native(&self, payload: Vec<u8>, native: NativeFile, timeout: Duration) -> Result<CallResult, FabError> {
+    pub fn call_with_native(
+        &self,
+        payload: Vec<u8>,
+        native: NativeFile,
+        timeout: Duration,
+    ) -> Result<CallResult, FabError> {
         // For now, delegate to normal call; real native FD/HANDLE passing is via host escrow
         // The NativeFile's handle_value will be sent in Data's native attachment with tid/rid
         let _ = native;
@@ -1121,7 +1238,10 @@ impl Runtime {
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
-        let hello = Frame::Hello { magic: lim.hello_magic, version: lim.hello_version };
+        let hello = Frame::Hello {
+            magic: lim.hello_magic,
+            version: lim.hello_version,
+        };
         let mut buf = Vec::with_capacity(hello.cost());
         frame::encode_into(&hello, &mut buf);
         tx.write_all(&buf)?;
@@ -1208,7 +1328,11 @@ impl Runtime {
                     partner,
                 });
                 st.xfer_wait.insert(tid, slot.clone());
-                attachments.push(Attachment { tid, id: cap.id, partner });
+                attachments.push(Attachment {
+                    tid,
+                    id: cap.id,
+                    partner,
+                });
                 st.handles.remove(&cap.id);
                 cap.disarm();
                 waiters.push((tid, slot));
@@ -1251,7 +1375,9 @@ impl Runtime {
             match outcome {
                 XferLocal::Committed => {
                     xfer_trace("sender_saw_committed");
-                    let _ = self.shared.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
+                    let _ = self
+                        .shared
+                        .push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
                 }
                 XferLocal::Aborted => {
                     if let Some(ep) = self.shared.restore_local(slot.ep, slot.partner) {
@@ -1259,24 +1385,28 @@ impl Runtime {
                     } else {
                         return Ok(TransferOutcome::AuthorityLost(Cause::Graceful));
                     }
-                    let _ = self.shared.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
+                    let _ = self
+                        .shared
+                        .push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
                 }
-                XferLocal::Unknown => {
-                    match self.transfer_status(tid, Duration::from_secs(2)) {
-                        Ok(frame::XFER_ST_COMMITTED) => {
-                            let _ = self.shared.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
-                        }
-                        Ok(frame::XFER_ST_ABORTED) => {
-                            if let Some(ep) = self.shared.restore_local(slot.ep, slot.partner) {
-                                aborted.push(ep);
-                            } else {
-                                return Ok(TransferOutcome::AuthorityLost(Cause::Graceful));
-                            }
-                            let _ = self.shared.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
-                        }
-                        _ => return Err(FabError::TransferUnknown),
+                XferLocal::Unknown => match self.transfer_status(tid, Duration::from_secs(2)) {
+                    Ok(frame::XFER_ST_COMMITTED) => {
+                        let _ = self
+                            .shared
+                            .push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
                     }
-                }
+                    Ok(frame::XFER_ST_ABORTED) => {
+                        if let Some(ep) = self.shared.restore_local(slot.ep, slot.partner) {
+                            aborted.push(ep);
+                        } else {
+                            return Ok(TransferOutcome::AuthorityLost(Cause::Graceful));
+                        }
+                        let _ = self
+                            .shared
+                            .push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
+                    }
+                    _ => return Err(FabError::TransferUnknown),
+                },
             }
         }
         if aborted.is_empty() {
@@ -1286,10 +1416,19 @@ impl Runtime {
         }
     }
 
-    pub fn reply_with_native(&self, req: &Inbound, payload: Vec<u8>, native: Option<NativeFile>) -> Result<TransferOutcome, FabError> {
+    pub fn reply_with_native(
+        &self,
+        req: &Inbound,
+        payload: Vec<u8>,
+        native: Option<NativeFile>,
+    ) -> Result<TransferOutcome, FabError> {
         if let Some(mut nf) = native {
             struct Empty;
-            impl TransferSpace for Empty { fn contains(&self, _: TransferId) -> bool { false } }
+            impl TransferSpace for Empty {
+                fn contains(&self, _: TransferId) -> bool {
+                    false
+                }
+            }
             let tid = fresh_transfer_id(&Empty);
             let rid = nf.id();
             #[cfg(windows)]
@@ -1326,13 +1465,23 @@ impl Runtime {
             let slot = Arc::new((Mutex::new(None::<Option<NativeFile>>), Condvar::new()));
             {
                 let mut st = self.shared.st.lock().unwrap();
-                if st.terminal.is_some() { return Err(FabError::FabricLost); }
+                if st.terminal.is_some() {
+                    return Err(FabError::FabricLost);
+                }
                 st.native_hold.insert(tid, nf);
                 st.native_wait.insert(tid, slot.clone());
             }
-            let att = crate::frame::NativeAttachment { tid, rid, handle_value };
+            let att = crate::frame::NativeAttachment {
+                tid,
+                rid,
+                handle_value,
+            };
             let pushed = self.shared.push_out(Frame::Data(DataInner {
-                target: req.local, corr: req.corr, attachments: vec![], payload, native: Some(att),
+                target: req.local,
+                corr: req.corr,
+                attachments: vec![],
+                payload,
+                native: Some(att),
             }));
             if let Err(e) = pushed {
                 let mut st = self.shared.st.lock().unwrap();
@@ -1344,7 +1493,9 @@ impl Runtime {
             let (m, cv) = &*slot;
             let mut g = m.lock().unwrap();
             let outcome = loop {
-                if let Some(v) = g.take() { break v; }
+                if let Some(v) = g.take() {
+                    break v;
+                }
                 let now = Instant::now();
                 if now >= deadline {
                     match self.transfer_status(tid, Duration::from_secs(2)) {
@@ -1409,7 +1560,10 @@ impl Runtime {
                 return Err(FabError::FabricLost);
             }
             if st.create_slot.is_some() {
-                return Err(FabError::Backpressured { queued_msgs: 0, queued_bytes: 0 });
+                return Err(FabError::Backpressured {
+                    queued_msgs: 0,
+                    queued_bytes: 0,
+                });
             }
             st.create_slot = Some(slot.clone());
         }
@@ -1425,11 +1579,23 @@ impl Runtime {
                 Some(CreateOutcome::Done(imp, tra)) => {
                     let mut st = self.shared.st.lock().unwrap();
                     if !st.handles.contains_key(&imp) {
-                        st.handles.insert(imp, HState { partner: tra, cause: None });
+                        st.handles.insert(
+                            imp,
+                            HState {
+                                partner: tra,
+                                cause: None,
+                            },
+                        );
                         st.arrival_order.push(imp);
                     }
                     if !st.handles.contains_key(&tra) {
-                        st.handles.insert(tra, HState { partner: imp, cause: None });
+                        st.handles.insert(
+                            tra,
+                            HState {
+                                partner: imp,
+                                cause: None,
+                            },
+                        );
                         st.arrival_order.push(tra);
                     }
                     // Demux: a DATA addressed with the peer's handle (the
@@ -1437,8 +1603,16 @@ impl Runtime {
                     st.partner_of_theirs.insert(tra, imp);
                     st.partner_of_theirs.insert(imp, tra);
                     return Ok((
-                        Endpoint { id: imp, shared: self.shared.clone(), armed: true },
-                        Endpoint { id: tra, shared: self.shared.clone(), armed: true },
+                        Endpoint {
+                            id: imp,
+                            shared: self.shared.clone(),
+                            armed: true,
+                        },
+                        Endpoint {
+                            id: tra,
+                            shared: self.shared.clone(),
+                            armed: true,
+                        },
                     ));
                 }
                 Some(CreateOutcome::Failed(e)) => return Err(e),
@@ -1507,9 +1681,11 @@ impl Runtime {
     pub fn endpoint_for(&self, id: EpId) -> Option<Endpoint> {
         let st = self.shared.st.lock().unwrap();
         match st.handles.get(&id) {
-            Some(h) if h.cause.is_none() => {
-                Some(Endpoint { id, shared: self.shared.clone(), armed: true })
-            }
+            Some(h) if h.cause.is_none() => Some(Endpoint {
+                id,
+                shared: self.shared.clone(),
+                armed: true,
+            }),
             _ => None,
         }
     }

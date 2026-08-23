@@ -61,20 +61,14 @@ pub fn stage_from_sender(
     Ok(Escrowed(owned))
 }
 
-pub fn restore_to_sender(
-    sender_process: HANDLE,
-    escrow: Escrowed,
-) -> std::io::Result<u64> {
+pub fn restore_to_sender(sender_process: HANDLE, escrow: Escrowed) -> std::io::Result<u64> {
     let escrow_handle = escrow.0.as_raw_handle() as *mut winapi::ctypes::c_void;
     let raw = dup_to_process(sender_process, escrow_handle)?;
     drop(escrow);
     Ok(raw)
 }
 
-pub fn commit_to_recipient(
-    recipient_process: HANDLE,
-    escrow: Escrowed,
-) -> std::io::Result<u64> {
+pub fn commit_to_recipient(recipient_process: HANDLE, escrow: Escrowed) -> std::io::Result<u64> {
     let escrow_handle = escrow.0.as_raw_handle() as *mut winapi::ctypes::c_void;
     let raw = dup_to_process(recipient_process, escrow_handle)?;
     drop(escrow);

@@ -6,11 +6,21 @@ use authority_fabric::router::{Holder, Router};
 use authority_fabric::Limits;
 
 fn hello(r: &mut Router, p: authority_fabric::PeerId) {
-    r.on_hello(p, Limits::default().hello_magic, Limits::default().hello_version)
-        .unwrap();
+    r.on_hello(
+        p,
+        Limits::default().hello_magic,
+        Limits::default().hello_version,
+    )
+    .unwrap();
 }
 
-fn primed() -> (Router, authority_fabric::PeerId, authority_fabric::PeerId, EpId, EpId) {
+fn primed() -> (
+    Router,
+    authority_fabric::PeerId,
+    authority_fabric::PeerId,
+    EpId,
+    EpId,
+) {
     let mut r = Router::new(Limits::default());
     let a = r.accept_peer();
     let b = r.accept_peer();
@@ -32,12 +42,21 @@ fn commit_grant(r: &mut Router, to: authority_fabric::PeerId, ep: EpId) {
 }
 
 fn att(id: EpId, partner: EpId) -> Attachment {
-    Attachment { tid: TransferId(id.0), id, partner }
+    Attachment {
+        tid: TransferId(id.0),
+        id,
+        partner,
+    }
 }
 
 fn data(target: EpId, atts: Vec<Attachment>) -> DataInner {
-    DataInner { target, corr: 1, attachments: atts, payload: b"x".to_vec(),
-    native: None }
+    DataInner {
+        target,
+        corr: 1,
+        attachments: atts,
+        payload: b"x".to_vec(),
+        native: None,
+    }
 }
 
 #[test]
@@ -45,7 +64,10 @@ fn t2_sender_dies_after_prepare_aborts() {
     let (mut r, a, b, x, _) = primed();
     let oc = r.on_create(a).unwrap();
     let (imp, tra) = match oc.send[0].1 {
-        Frame::CreateAck { impl_ep, transferable_ep } => (impl_ep, transferable_ep),
+        Frame::CreateAck {
+            impl_ep,
+            transferable_ep,
+        } => (impl_ep, transferable_ep),
         _ => panic!(),
     };
     r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
@@ -61,7 +83,10 @@ fn t3_recipient_dies_before_accept_restores() {
     let (mut r, a, b, x, _) = primed();
     let oc = r.on_create(a).unwrap();
     let (imp, tra) = match oc.send[0].1 {
-        Frame::CreateAck { impl_ep, transferable_ep } => (impl_ep, transferable_ep),
+        Frame::CreateAck {
+            impl_ep,
+            transferable_ep,
+        } => (impl_ep, transferable_ep),
         _ => panic!(),
     };
     r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
@@ -75,7 +100,10 @@ fn t6_commit_then_recipient_death_does_not_restore() {
     let (mut r, a, b, x, _) = primed();
     let oc = r.on_create(a).unwrap();
     let (imp, tra) = match oc.send[0].1 {
-        Frame::CreateAck { impl_ep, transferable_ep } => (impl_ep, transferable_ep),
+        Frame::CreateAck {
+            impl_ep,
+            transferable_ep,
+        } => (impl_ep, transferable_ep),
         _ => panic!(),
     };
     r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
@@ -96,7 +124,10 @@ fn t8_lost_committed_ack_status_is_committed() {
     r.inject.drop_committed = true;
     let oc = r.on_create(a).unwrap();
     let (imp, tra) = match oc.send[0].1 {
-        Frame::CreateAck { impl_ep, transferable_ep } => (impl_ep, transferable_ep),
+        Frame::CreateAck {
+            impl_ep,
+            transferable_ep,
+        } => (impl_ep, transferable_ep),
         _ => panic!(),
     };
     r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
@@ -105,13 +136,19 @@ fn t8_lost_committed_ack_status_is_committed() {
         _ => panic!(),
     };
     let oc = r.on_xfer(b, XferMsg::Accept { tid }).unwrap();
-    assert!(!oc.send.iter().any(|(_, f)| matches!(f, Frame::Xfer(XferMsg::Committed { .. }))));
+    assert!(!oc
+        .send
+        .iter()
+        .any(|(_, f)| matches!(f, Frame::Xfer(XferMsg::Committed { .. }))));
     assert_eq!(r.xfer_status(tid), XFER_ST_COMMITTED);
     assert_eq!(r.holder_of(tra), Some(Holder::Peer(b)));
     let st = r.on_xfer(a, XferMsg::Status { tid }).unwrap();
     assert!(st.send.iter().any(|(_, f)| matches!(
         f,
-        Frame::Xfer(XferMsg::StatusAck { status: XFER_ST_COMMITTED, .. })
+        Frame::Xfer(XferMsg::StatusAck {
+            status: XFER_ST_COMMITTED,
+            ..
+        })
     )));
 }
 
@@ -120,7 +157,10 @@ fn replay_accept_is_idempotent() {
     let (mut r, a, b, x, _) = primed();
     let oc = r.on_create(a).unwrap();
     let (imp, tra) = match oc.send[0].1 {
-        Frame::CreateAck { impl_ep, transferable_ep } => (impl_ep, transferable_ep),
+        Frame::CreateAck {
+            impl_ep,
+            transferable_ep,
+        } => (impl_ep, transferable_ep),
         _ => panic!(),
     };
     r.on_data(a, data(x, vec![att(tra, imp)])).unwrap();
