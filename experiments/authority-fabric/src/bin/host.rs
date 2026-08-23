@@ -253,7 +253,8 @@ impl Fabric {
                         if let Some(conn) = self.conns.get(&pid) {
                             if let Some(lane) = conn.resource_lane.as_ref() {
                                 if let Ok(escrow) = authority_fabric::native::unix::recv_fd(lane) {
-                                    self.native_escrow.insert(tid, std::fs::File::from(escrow.0));
+                                    let file = authority_fabric::native::unix::escrow_to_file(escrow);
+                                    self.native_escrow.insert(tid, (file, pid, _rid));
                                 }
                             }
                         }
