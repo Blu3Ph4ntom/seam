@@ -126,8 +126,8 @@ impl Fabric {
                             if libc_dup2(raw_child, 3) == -1 {
                                 return Err(std::io::Error::last_os_error());
                             }
-                            let flags = libc_fcntl(3, F_GETFD);
-                            if flags < 0 || libc_fcntl(3, F_SETFD, flags & !FDCLOEXEC) < 0 {
+                            let flags = libc_fcntl(3, libc_shim::F_GETFD);
+                            if flags < 0 || libc_fcntl(3, libc_shim::F_SETFD, flags & !libc_shim::FD_CLOEXEC) < 0 {
                                 return Err(std::io::Error::last_os_error());
                             }
                             Ok(())
@@ -702,6 +702,28 @@ fn bootstrap(
         ctrl_host_side: ch,
         t0,
     })
+}
+
+#[cfg(unix)]
+mod libc_shim {
+    pub const F_GETFD: i32 = 1;
+    pub const F_SETFD: i32 = 2;
+    pub const FD_CLOEXEC: i32 = 1;
+    extern "C" {
+        pub fn dup2(oldfd: i32, newfd: i32) -> i32;
+        pub fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    }
+}
+#[cfg(unix)]
+fn libc_dup2(oldfd: i32, newfd: i32) -> i32 {
+    // SAFETY: raw syscall wrappers with fixed signatures; fd 3 is reserved
+    // for the child's native lane and dup2 is the documented mechanism.
+    unsafe { libc_shim::dup2(oldfd, newfd) }
+}
+#[cfg(unix)]
+fn libc_fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
+    // SAFETY: same as above; F_GETFD/F_SETFD only touch the fd flag word.
+    unsafe { libc_shim::fcntl(fd, cmd, arg) }
 }
 
 #[cfg(windows)]
