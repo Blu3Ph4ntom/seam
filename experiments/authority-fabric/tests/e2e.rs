@@ -317,4 +317,16 @@ fn native_happy() {
     let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
     assert_eq!(out.status.code(), Some(0), "native_happy\n{combined}");
     assert_contains(&combined, "NATIVE_HAPPY_OK", "native_happy");
+    assert_contains(&combined, "CLIENT_NATIVE_HAPPY_OK", "native_happy");
+}
+
+#[test]
+fn native_abort_restore() {
+    let out = run_host(&["native_abort"], &[], Duration::from_secs(45));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "native_abort\n{combined}");
+    assert_contains(&combined, "HOST_NATIVE_RESTORED", "native_abort");
+    assert_contains(&combined, "SVC_NATIVE_NONCE_READBACK_OK", "native_abort");
+    assert_contains(&combined, "CLIENT_NATIVE_RESTORED_RECOMMITTED_OK", "native_abort");
+    assert_contains(&combined, "NATIVE_ABORT_OK", "native_abort");
 }

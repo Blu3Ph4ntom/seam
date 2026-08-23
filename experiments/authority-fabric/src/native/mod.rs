@@ -59,12 +59,17 @@ impl std::fmt::Debug for NativeFile {
 
 impl NativeFile {
     /// Create a new temp file with random nonce written. Used by sender.
+    /// Opened READ+WRITE so every later duplicate keeps readable access.
     pub fn new_temp(nonce: &[u8]) -> std::io::Result<Self> {
         let mut path = std::env::temp_dir();
         let mut rnd = [0u8; 8];
         fill(&mut rnd).unwrap();
         path.push(format!("seam-native-{:x}.tmp", u64::from_le_bytes(rnd)));
-        let mut f = File::create(&path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
         f.write_all(nonce)?;
         f.flush()?;
         #[cfg(unix)]

@@ -46,7 +46,8 @@ fn main() {
     let mut counters: HashMap<EpId, u64> = HashMap::new();
     // RAII: keep implementation-side handles alive; dropping them would Close.
     let mut held: Vec<Endpoint> = Vec::new();
-    let mut restored_q: Vec<Endpoint> = Vec::new();
+        let mut restored_q: Vec<Endpoint> = Vec::new();
+    let mut restored_q_native: Vec<NativeFile> = Vec::new();
 
     loop {
         let req: Inbound = match rt.wait_inbound(Duration::from_secs(600)) {
@@ -70,17 +71,34 @@ fn main() {
                     );
                 }
                 Ok(RootRequest::OpenCounter) => {
-                    if mode == "native" {
-                        let nonce = b"SEAM_NATIVE_NONCE";
-                        match NativeFile::new_temp(nonce) {
-                            Ok(nf) => {
-                                let outcome = rt.reply_with_native(&req, proto::encode_root_response(RootResponse::Counter), Some(nf));
-                                match outcome {
-                                    Ok(_) => {},
-                                    Err(e) => eprintln!("SERVICE_FAIL native reply: {e}"),
+                    if mode == "native" || !restored_q_native.is_empty() {
+                        // Retransfer a restored native file first (proves the
+                        // returned resource is usable and retransferrable);
+                        // otherwise create a fresh one.
+                        let nf = match restored_q_native.pop() {
+                            Some(f) => f,
+                            None => match NativeFile::new_temp(b"SEAM_NATIVE_NONCE") {
+                                Ok(f) => f,
+                                Err(e) => { eprintln!("SERVICE_FAIL native create: {e}"); continue; }
+                            },
+                        };
+                        match rt.reply_with_native(&req, proto::encode_root_response(RootResponse::Counter), Some(nf)) {
+                            Ok(TransferOutcome::Committed) => {}
+                            Ok(TransferOutcome::NativeAborted(back)) => {
+                                marker!("SVC_NATIVE_RESTORED n={}", back.len());
+                                // Prove restoration: read nonce, append marker.
+                                for mut f in back {
+                                    if let Ok(data) = f.read_all() {
+                                        if data.starts_with(b"SEAM_NATIVE_NONCE") {
+                                            marker!("SVC_NATIVE_NONCE_READBACK_OK");
+                                        }
+                                    }
+                                    let _ = f.write_marker(b"_RESTORED");
+                                    restored_q_native.push(f);
                                 }
                             }
-                            Err(e) => eprintln!("SERVICE_FAIL native create: {e}"),
+                            Ok(_) => {}
+                            Err(e) => eprintln!("SERVICE_FAIL native reply: {e}"),
                         }
                         continue;
                     }
@@ -112,6 +130,10 @@ fn main() {
                     };
                     match attempt {
                         Ok(TransferOutcome::Committed) => {}
+                        Ok(TransferOutcome::NativeAborted(back)) => {
+                            marker!("SVC_NATIVE_RESTORED n={}", back.len());
+                            restored_q_native.extend(back);
+                        }
                         Ok(TransferOutcome::Aborted(back)) => {
                             marker!("SVC_AUTHORITY_RESTORED n={}", back.len());
                             // Keep restored handles alive for re-transfer.

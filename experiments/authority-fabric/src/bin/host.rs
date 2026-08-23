@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::io::{FromRawHandle, IntoRawHandle};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
@@ -57,7 +59,23 @@ struct Fabric {
     /// (corr, payload) of DATA delivered to host-held endpoints.
     ctrl_drain: VecDeque<(u32, Vec<u8>)>,
     exit_codes: HashMap<PeerId, i32>,
-    native_escrow: HashMap<TransferId, std::fs::File>,
+    native_escrow: HashMap<TransferId, (std::fs::File, PeerId, authority_fabric::native::ResourceId)>,
+}
+
+/// Duplicate the escrowed kernel object into `dest`'s process and return the
+/// handle value valid there. Consumes escrow on success.
+#[cfg(windows)]
+fn deliver_to_dest(
+    escrow_file: std::fs::File,
+    dest_proc_raw: *mut winapi::ctypes::c_void,
+) -> std::io::Result<u64> {
+    use std::os::windows::io::IntoRawHandle;
+    let owned = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(escrow_file.into_raw_handle()) };
+    let hval = authority_fabric::native::windows::commit_to_recipient(
+        dest_proc_raw,
+        authority_fabric::native::windows::Escrowed(owned),
+    )?;
+    Ok(hval)
 }
 
 impl Fabric {
@@ -214,14 +232,20 @@ impl Fabric {
                     // Windows: duplicate handle from sender into host escrow
                     #[cfg(windows)]
                     {
-                        if let Some(conn) = self.conns.get(&pid) {
-                            let proc_handle = conn.child.as_raw_handle() as *mut winapi::ctypes::c_void;
-                            if hval != 0 {
-                                if let Ok(escrow) = authority_fabric::native::windows::stage_from_sender(proc_handle, hval) {
-                                    self.native_escrow.insert(tid, escrow.0.into());
+                            if let Some(conn) = self.conns.get(&pid) {
+                                let proc_handle = conn.child.as_raw_handle() as *mut winapi::ctypes::c_void;
+                                if hval != 0 {
+                                    match authority_fabric::native::windows::stage_from_sender(proc_handle, hval) {
+                                        Ok(escrow) => {
+                                            let raw = escrow.0.into_raw_handle();
+                                            // SAFETY: sole ownership moved from OwnedHandle into File
+                                            let file = unsafe { std::fs::File::from_raw_handle(raw) };
+                                            self.native_escrow.insert(tid, (file, pid, _rid));
+                                        }
+                                        Err(e) => marker!("HOST_NATIVE_STAGE_FAILED tid={} err={}", tid.0[0], e),
+                                    }
                                 }
                             }
-                        }
                     }
                     #[cfg(unix)]
                     {
@@ -309,13 +333,70 @@ impl Fabric {
             if matches!(f, Frame::Xfer(XferMsg::Committed { .. })) {
                 host_trace("host_committed_emitted");
             }
+            let mut frame = f.clone();
+            // Native commit delivery: duplicate escrow into the DEST process
+            // and fill handle_value with a value valid in the recipient's
+            // handle table. Commit point = this successful duplication.
+            // (Offer-time Data keeps escrow intact; only NativeCommit spends it.)
+            if let Frame::Xfer(XferMsg::NativeCommit { tid, rid: _, handle_value }) = &mut frame {
+                let had = self.native_escrow.contains_key(tid);
+                if let Some((escrow_file, _sender, _rid2)) = self.native_escrow.remove(tid) {
+                    #[cfg(windows)]
+                    {
+                        let dest_proc = self.conns.get(dest).map(|c| c.child.as_raw_handle() as *mut winapi::ctypes::c_void);
+                        if let Some(dp) = dest_proc {
+                            match deliver_to_dest(escrow_file, dp) {
+                                Ok(hval) => { *handle_value = hval; marker!("HOST_NATIVE_DELIVERED tid={} hval={:#x}", tid.0[0], hval); }
+                                Err(e) => marker!("HOST_NATIVE_COMMIT_FAILED tid={} err={}", tid.0[0], e),
+                            }
+                        } else {
+                            drop(escrow_file);
+                        }
+                    }
+                    #[cfg(unix)]
+                    { drop(escrow_file); }
+                } else {
+                    marker!("HOST_NATIVE_ESCROW_MISS tid={} had={}", tid.0[0], had);
+                }
+            }
+            // Native pre-commit abort: restore escrow to SENDER and retarget
+            // the sender's Abort as NativeAbort carrying a sender-valid value.
+            if let Frame::Xfer(XferMsg::Abort { tid: abort_tid }) = frame.clone() {
+                if let Some((escrow_file, sender_peer, rid)) = self.native_escrow.remove(&abort_tid) {
+                    if *dest == sender_peer {
+                        #[cfg(windows)]
+                        {
+                            let sender_proc = self.conns.get(dest).map(|c| c.child.as_raw_handle() as *mut winapi::ctypes::c_void);
+                            if let Some(sp) = sender_proc {
+                                use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+                                let owned = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(escrow_file.into_raw_handle()) };
+                                match authority_fabric::native::windows::restore_to_sender(
+                                    sp,
+                                    authority_fabric::native::windows::Escrowed(owned),
+                                ) {
+                                    Ok(hval) => {
+                                        frame = Frame::Xfer(XferMsg::NativeAbort { tid: abort_tid, rid, handle_value: hval });
+                                        marker!("HOST_NATIVE_RESTORED tid={} hval={:#x}", abort_tid.0[0], hval);
+                                    }
+                                    Err(e) => marker!("HOST_NATIVE_RESTORE_FAILED tid={} err={}", abort_tid.0[0], e),
+                                }
+                            } else {
+                                drop(escrow_file);
+                            }
+                        }
+                        #[cfg(unix)]
+                        { drop(escrow_file); }
+                    } else {
+                        drop(escrow_file);
+                    }
+                }
+            }
             if let Some(c) = self.conns.get(dest) {
-                let frame = f.clone();
                 let cost = frame.cost();
                 // Transfer offers ride the reserved ctrl compartment so a
                 // saturated DATA queue cannot strand authority in escrow.
                 let is_ctrl = frame::is_control_frame(&frame)
-                    || matches!(&frame, Frame::Data(d) if !d.attachments.is_empty());
+                    || matches!(&frame, Frame::Data(d) if !d.attachments.is_empty() || d.native.is_some());
                 if is_ctrl {
                     let deadline = Instant::now() + Duration::from_millis(2000);
                     if c.q.push_ctrl(frame, cost, deadline).is_err() {
@@ -588,6 +669,7 @@ fn main() {
         "preflight_p3" => preflight_p3(lim),
         "preflight_p4" => preflight_p4(lim),
         "native_happy" => native_happy_case(lim),
+        "native_abort" => native_abort_case(lim),
         other => fail(&format!("unknown host mode {other:?}")),
     };
     std::process::exit(code);
@@ -1295,6 +1377,34 @@ fn preflight_p4(lim: Limits) -> i32 {
     }
     marker!("PREFLIGHT_P4_OK");
     println!("PREFLIGHT_P4_OK");
+    0
+}
+
+fn native_abort_case(lim: Limits) -> i32 {
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "native".into())],
+        &[("SEAM_CLIENT_MODE", "native_abort".into()), ("SEAM_CLI_REJECT_NATIVE", "1".into())],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    // Phase 1 runs with rejection on (child-side env). The client clears its
+    // own flag in-process before txn #2; nothing to flip here.
+    let done_corr = match fab.wait_ctrl(Duration::from_secs(30), |m| matches!(m, ControlMsg::Done)) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    fab.ack_ctrl(&setup, done_corr);
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(15));
+    let code = fab.exit_codes.get(&setup.cli).copied().unwrap_or(-1);
+    if code != 0 { return fail(&format!("native_abort client exit {code}")); }
+    fab.shutdown_orderly();
+    let a = fab.router.accounting();
+    if a.peers != 0 || a.native_unacked != 0 { return fail(&format!("native_abort leak {a:?}")); }
+    marker!("NATIVE_ABORT_OK");
+    println!("NATIVE_ABORT_OK");
     0
 }
 

@@ -1,90 +1,144 @@
-//! Unix FD passing via SCM_RIGHTS over UnixStream.
+//! Unix FD passing via SCM_RIGHTS (rustix 0.38 ownership-aware APIs).
 
 use std::fs::File;
-use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use rustix::cmsg_space;
-use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, SendAncillaryBuffer, SendAncillaryMessage};
+use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
+use rustix::net::{
+    recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags,
+    SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
+};
 
-use super::ResourceId;
-
-/// Host escrow holds the received OwnedFd.
+/// Host escrow holds the received descriptor as owned RAII state.
 pub struct Escrowed(pub OwnedFd);
 
-/// Send a File's FD over the resource lane socket.
-/// The File is borrowed; the sender must close its own copy only after Host confirms.
+fn errno_to_io(e: rustix::io::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(e.raw_os_error().unwrap_or(0))
+}
+
+/// Send one descriptor over the lane. The source File stays open; the kernel
+/// installs a new descriptor referring to the same open file description in
+/// the receiver.
 pub fn send_fd(lane: &std::os::unix::net::UnixStream, file: &File) -> std::io::Result<()> {
-    let fd = file.as_raw_fd();
-    // SAFETY: BorrowedFd is valid for the duration of this call
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let mut cmsg_space = cmsg_space!(ScmRights(1));
-    let mut ancillary = SendAncillaryBuffer::new(&mut cmsg_space);
-    ancillary.push(SendAncillaryMessage::ScmRights(&[borrowed]));
-    // Use rustix's sendmsg with one dummy byte
-    let stream = rustix::net::Socket::from_raw_fd(lane.as_raw_fd());
-    // We must not close the raw fd; we borrowed it
-    let iov = [std::io::IoSlice::new(b"x")];
-    rustix::net::sendmsg(&stream, &iov, &mut ancillary, rustix::net::SendFlags::empty())?;
-    std::mem::forget(stream);
+    // SAFETY: borrowed view of a live descriptor owned by `file`; the borrow
+    // does not outlive this call and `file` is never closed during sendmsg.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) };
+    let mut space = cmsg_space!(ScmRights(1));
+    let mut ancillary = SendAncillaryBuffer::new(&mut space);
+    let pushed = ancillary.push(SendAncillaryMessage::ScmRights(&[borrowed]));
+    debug_assert!(pushed);
+    let payload = [b'x'];
+    let iov = [std::io::IoSlice::new(&payload)];
+    sendmsg(lane.as_fd(), &iov, &mut ancillary, SendFlags::empty()).map_err(errno_to_io)?;
     Ok(())
 }
 
-/// Receive one FD from the lane. Returns Escrowed.
+/// Receive exactly one descriptor from the lane. Any unexpected ancillary
+/// data is closed immediately (RAII drop of OwnedFd) and reported as error.
 pub fn recv_fd(lane: &std::os::unix::net::UnixStream) -> std::io::Result<Escrowed> {
-    let mut cmsg_space = cmsg_space!(ScmRights(1));
-    let mut ancillary = RecvAncillaryBuffer::new(&mut cmsg_space);
+    let mut space = cmsg_space!(ScmRights(2));
+    let mut ancillary = RecvAncillaryBuffer::new(&mut space);
     let mut buf = [0u8; 1];
     let mut iov = [std::io::IoSliceMut::new(&mut buf)];
-    let stream = rustix::net::Socket::from_raw_fd(lane.as_raw_fd());
-    let msg = rustix::net::recvmsg(&stream, &mut iov, &mut ancillary, rustix::net::RecvFlags::empty())?;
-    std::mem::forget(stream);
+    let msg = recvmsg(lane.as_fd(), &mut iov, &mut ancillary, RecvFlags::empty())
+        .map_err(errno_to_io)?;
     if msg.bytes == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no fd"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "lane closed",
+        ));
     }
+    let mut found: Option<OwnedFd> = None;
+    let mut extra: usize = 0;
     for cmsg in ancillary.drain() {
-        if let RecvAncillaryMessage::ScmRights(mut fds) = cmsg {
-            if let Some(fd) = fds.next() {
-                // fd is OwnedFd already
-                return Ok(Escrowed(fd));
+        if let RecvAncillaryMessage::ScmRights(fds) = cmsg {
+            for fd in fds {
+                if found.is_none() {
+                    found = Some(fd);
+                } else {
+                    extra += 1; // OwnedFd dropped here => descriptor closed
+                }
             }
         }
     }
-    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "no SCM_RIGHTS"))
+    match (found, extra) {
+        (Some(fd), 0) => Ok(Escrowed(fd)),
+        (Some(_), n) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("expected 1 descriptor, got {}", n + 1),
+        )),
+        (None, _) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no SCM_RIGHTS in message",
+        )),
+    }
 }
 
-/// Host stages from sender: recv FD from sender lane and return Escrowed.
-pub fn stage_from_sender(lane: &std::os::unix::net::UnixStream) -> std::io::Result<Escrowed> {
-    recv_fd(lane)
-}
-
-/// Host restores to sender: send escrow FD back to sender lane.
-pub fn restore_to_sender(lane: &std::os::unix::net::UnixStream, escrow: Escrowed) -> std::io::Result<()> {
-    // Convert OwnedFd to File for sending
-    let file = File::from(escrow.0);
-    send_fd(lane, &file)?;
-    // File's OwnedFd is consumed by send (dup), original File drops and closes its copy
-    // The sent FD is a dup; Host's escrow is now gone (moved into File)
-    Ok(())
-}
-
-/// Host commits to recipient: send escrow FD to recipient lane.
-pub fn commit_to_recipient(lane: &std::os::unix::net::UnixStream, escrow: Escrowed) -> std::io::Result<()> {
-    let file = File::from(escrow.0);
-    send_fd(lane, &file)?;
-    Ok(())
-}
-
-pub fn close_escrow(escrow: Escrowed) {
-    drop(escrow);
-}
-
-/// Helper to materialize Escrowed into File for recipient
+/// Wrap an escrowed descriptor into an application-facing File.
 pub fn escrow_to_file(escrow: Escrowed) -> File {
-    File::from(escrow.0)
+    // SAFETY: we own exactly one OwnedFd and hand its descriptor to exactly
+    // one File; no second Rust owner is ever created from this raw value.
+    let raw = escrow.0.into_raw_fd();
+    unsafe { File::from_raw_fd(raw) }
 }
 
-/// Materialize received FD on peer side into NativeFile
-pub fn recv_to_file(lane: &std::os::unix::net::UnixStream, _rid: ResourceId) -> std::io::Result<File> {
-    let esc = recv_fd(lane)?;
-    Ok(File::from(esc.0))
+/// Unit-provable kernel transfer: roundtrip one real descriptor through a
+/// real socketpair using SCM_RIGHTS (no path reopen anywhere).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn scm_rights_roundtrip_transfers_real_descriptor() {
+        let (a, b) = UnixStream::pair().unwrap();
+        // Source file with known content, opened for read.
+        let mut src = tempfile_bytes(b"SEAM_SCM_NONCE");
+        let raw_before = src.as_raw_fd();
+        send_fd(&a, &src).unwrap();
+        let Escrowed(fd) = recv_fd(&b).unwrap();
+        // The received descriptor is a NEW descriptor number referring to the
+        // same open file description; it must differ numerically in general,
+        // but the contract we assert is content identity through the object.
+        let file = File::from(fd);
+        assert_ne!(
+            raw_before,
+            file.as_raw_fd(),
+            "kernel must install a distinct descriptor in receiver"
+        );
+        let mut got = Vec::new();
+        let mut f = file;
+        use std::io::Read;
+        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        f.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"SEAM_SCM_NONCE");
+        // Zero descriptors expected afterwards: both sides consumed.
+        let _ = a.into_raw_fd();
+        let _ = src;
+    }
+
+    fn tempfile_bytes(content: &[u8]) -> File {
+        use std::io::Write;
+        let mut p = std::env::temp_dir();
+        p.push(format!("seam-scm-{}", std::process::id()));
+        let mut f = File::create(&p).unwrap();
+        f.write_all(content).unwrap();
+        f.flush().unwrap();
+        drop(std::fs::remove_file(p));
+        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        f
+    }
+
+    /// Malformed case: zero descriptors must fail closed.
+    #[test]
+    fn missing_descriptor_fails_closed() {
+        let (a, b) = UnixStream::pair().unwrap();
+        use std::io::Write as _;
+        a.write_all(&[b'y']).unwrap();
+        // Plain byte, no ancillary: recv_fd must error, nothing leaks.
+        let r = recv_fd(&b);
+        assert!(r.is_err());
+    }
 }

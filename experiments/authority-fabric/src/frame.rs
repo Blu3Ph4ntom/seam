@@ -119,7 +119,7 @@ pub enum XferMsg {
     StatusAck { tid: TransferId, status: u8 },
     ResultAck { tid: TransferId },
     NativeCommit { tid: TransferId, rid: ResourceId, handle_value: u64 },
-    NativeAbort { tid: TransferId },
+    NativeAbort { tid: TransferId, rid: ResourceId, handle_value: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,7 +170,7 @@ impl Frame {
             Frame::Xfer(XferMsg::Commit { .. }) => 1 + 16 + 32,
             Frame::Xfer(XferMsg::StatusAck { .. }) => 1 + 16 + 1,
             Frame::Xfer(XferMsg::NativeCommit { .. }) => 1 + 16 + 16 + 8,
-            Frame::Xfer(XferMsg::NativeAbort { .. }) => 1 + 16,
+            Frame::Xfer(XferMsg::NativeAbort { .. }) => 1 + 16 + 16 + 8,
             Frame::Xfer(_) => 1 + 16,
         };
         4 + 1 + body // length prefix + kind byte + body
@@ -381,9 +381,11 @@ pub fn encode_into(frame: &Frame, out: &mut Vec<u8>) {
                 put_rid(out, *rid);
                 put_u64(out, *handle_value);
             }
-            XferMsg::NativeAbort { tid } => {
+            XferMsg::NativeAbort { tid, rid, handle_value } => {
                 out.push(XFER_NATIVE_ABORT);
                 put_tid(out, *tid);
+                put_rid(out, *rid);
+                put_u64(out, *handle_value);
             }
         },
     }
@@ -490,7 +492,7 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
                 },
                 XFER_RESULT_ACK => XferMsg::ResultAck { tid },
                 XFER_NATIVE_COMMIT => XferMsg::NativeCommit { tid, rid: c.rid()?, handle_value: c.u64v()? },
-                XFER_NATIVE_ABORT => XferMsg::NativeAbort { tid },
+                XFER_NATIVE_ABORT => XferMsg::NativeAbort { tid, rid: c.rid()?, handle_value: c.u64v()? },
                 _ => return Err(FrameError::UnknownKind(KIND_XFER)),
             };
             Ok(Frame::Xfer(msg))

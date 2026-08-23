@@ -961,8 +961,10 @@ impl Router {
             barrier_wait("host_after_commit");
         }
         let mut out = RouteOutcome::default();
+        // Recipient gets NativeCommit carrying the (host-filled) handle;
+        // sender gets logical Committed for ResultAck retention.
         if !self.inject.drop_commit {
-            out.send.push((rec.dest, Frame::Xfer(XferMsg::Commit { tid, ep: EpId(rec.rid.0), partner: EpId([0u8;16]) })));
+            out.send.push((rec.dest, Frame::Xfer(XferMsg::NativeCommit { tid, rid: rec.rid, handle_value: 0 })));
         }
         if !self.inject.drop_committed {
             out.send.push((rec.sender, Frame::Xfer(XferMsg::Committed { tid })));

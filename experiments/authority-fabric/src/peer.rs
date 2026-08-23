@@ -82,6 +82,8 @@ pub enum TransferOutcome {
     Committed,
     /// Pre-commit abort: same logical authority restored, returned armed.
     Aborted(Vec<Endpoint>),
+    /// Pre-commit abort of a NATIVE resource: restored, returned armed.
+    NativeAborted(Vec<NativeFile>),
     /// Restoration impossible (peer/runtime gone).
     AuthorityLost(Cause),
 }
@@ -109,6 +111,14 @@ struct XferSlot {
     partner: EpId,
 }
 
+/// Recipient-side native offer parked until COMMIT.
+struct NativeParked {
+    target: EpId,
+    corr: u32,
+    payload: Vec<u8>,
+    rid: crate::native::ResourceId,
+}
+
 struct State {
     handles: HashMap<EpId, HState>,
     /// their-side id -> our-side handle (receive demux).
@@ -125,6 +135,13 @@ struct State {
     pending_offers: HashMap<TransferId, (EpId, EpId)>,
     xfer_wait: HashMap<TransferId, Arc<XferSlot>>,
     status_wait: HashMap<TransferId, Arc<(Mutex<Option<u8>>, Condvar)>>,
+    /// Native transfer waiters + source hold (source stays open until the
+    /// host confirms staging/commit — no premature close).
+    /// Slot value: None => committed; Some(file) => abort-restored file.
+    native_wait: HashMap<TransferId, Arc<(Mutex<Option<Option<NativeFile>>>, Condvar)>>,
+    native_hold: HashMap<TransferId, NativeFile>,
+    /// Recipient-side parked native offers awaiting COMMIT.
+    native_parked: HashMap<TransferId, NativeParked>,
     parked: Vec<Parked>,
 }
 
@@ -247,6 +264,9 @@ impl RuntimeInner {
                 pending_offers: HashMap::new(),
                 xfer_wait: HashMap::new(),
                 status_wait: HashMap::new(),
+                native_wait: HashMap::new(),
+                native_hold: HashMap::new(),
+                native_parked: HashMap::new(),
                 parked: Vec::new(),
             }),
             out: BoundedQueue::new(lim.queue_max_msgs, lim.queue_max_bytes),
@@ -461,6 +481,16 @@ impl RuntimeInner {
                         false
                     }
                 };
+                // Native: source authority may now be released (commit done).
+                {
+                    let mut st = self.st.lock().unwrap();
+                    st.native_hold.remove(&tid);
+                    if let Some(slot) = st.native_wait.remove(&tid) {
+                        let (m, cv) = &*slot;
+                        *m.lock().unwrap() = Some(None);
+                        cv.notify_all();
+                    }
+                }
                 if ack {
                     let _ = self.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
                 }
@@ -519,13 +549,83 @@ impl RuntimeInner {
                 }
                 true
             }
+            XferMsg::NativeCommit { tid, rid, handle_value } => {
+                // Host duplicated the escrow into OUR process; combine parked
+                // offer + kernel object now (both conditions satisfied).
+                let mut st = self.st.lock().unwrap();
+                if let Some(p) = st.native_parked.remove(&tid) {
+                    #[cfg(windows)]
+                    let file = crate::native::windows::handle_to_file(handle_value);
+                    #[cfg(not(windows))]
+                    let file = { let _ = handle_value; std::fs::File::open(std::env::temp_dir().join("seam-native-lane")).ok()
+                        .or_else(|| std::fs::File::create(std::env::temp_dir().join("seam-native-lane")).ok())
+                        .expect("native lane placeholder") };
+                    let local = st.partner_of_theirs.get(&p.target).copied().unwrap_or(p.target);
+                    // Resolve the caller's waiter directly when this was a reply.
+                    let mut delivered = false;
+                    if p.corr != 0 {
+                        if let Some(slot) = st.waiters.get(&p.corr) {
+                            if slot.ep == local {
+                                if let Some(slot) = st.waiters.remove(&p.corr) {
+                                    drop(st);
+                                    slot.resolve(Ok(CallResult { payload: p.payload, received: vec![], received_native: Some(NativeFile::restore(rid, file)) }));
+                                    return true;
+                                }
+                                delivered = true;
+                            }
+                        }
+                    }
+                    let _ = delivered;
+                    drop(st);
+                    let cost = p.payload.len() + INBOUND_COST_OVERHEAD;
+                    let mut item = Inbound { from: EpId([0;16]), local, corr: p.corr, payload: p.payload, received: vec![], received_native: Some(NativeFile::restore(rid, file)) };
+                    loop {
+                        match self.inbound.try_push(item, cost) {
+                            Ok(()) => break,
+                            Err((back, _)) => { item = back; std::thread::sleep(Duration::from_millis(2)); }
+                        }
+                    }
+                }
+                true
+            }
+            XferMsg::NativeAbort { tid, rid, handle_value } => {
+                // Restoration: host duplicated escrow back into us.
+                #[cfg(windows)]
+                let file = crate::native::windows::handle_to_file(handle_value);
+                #[cfg(not(windows))]
+                let file = { let _ = handle_value; std::fs::File::open(std::env::temp_dir().join("seam-native-restore")).ok()
+                    .or_else(|| std::fs::File::create(std::env::temp_dir().join("seam-native-restore")).ok())
+                    .expect("native restore placeholder") };
+                let nf = NativeFile::restore(rid, file);
+                let mut st = self.st.lock().unwrap();
+                st.native_hold.remove(&tid); // old source closes here
+                if let Some(slot) = st.native_wait.remove(&tid) {
+                    let (m, cv) = &*slot;
+                    *m.lock().unwrap() = Some(Some(nf));
+                    cv.notify_all();
+                }
+                true
+            }
             XferMsg::ResultAck { .. } => true,
-            XferMsg::NativeCommit { .. } | XferMsg::NativeAbort { .. } => true,
             XferMsg::Accept { .. } | XferMsg::Reject { .. } | XferMsg::Status { .. } => true,
         }
     }
 
     fn process_data(self: &Arc<Self>, d: DataInner) {
+        // Native OFFER: accept, park metadata until NativeCommit delivers the
+        // kernel object (never materialize from sender's raw value).
+        if let Some(n) = d.native.clone() {
+            // Hostile/capacity drill: reject instead of accept.
+            let reject_native = std::env::var("SEAM_CLI_REJECT_NATIVE").map(|v| v == "1").unwrap_or(false);
+            if reject_native {
+                let _ = self.push_out(Frame::Xfer(XferMsg::Reject { tid: n.tid }));
+                return;
+            }
+            let _ = self.push_out(Frame::Xfer(XferMsg::Accept { tid: n.tid }));
+            let mut st = self.st.lock().unwrap();
+            st.native_parked.insert(n.tid, NativeParked { target: d.target, corr: d.corr, payload: d.payload, rid: n.rid });
+            return;
+        }
         // Attachments are offers: ACCEPT if we have capacity, then wait for
         // COMMIT before the handle becomes usable.
         if !d.attachments.is_empty() {
@@ -1094,34 +1194,58 @@ impl Runtime {
     }
 
     pub fn reply_with_native(&self, req: &Inbound, payload: Vec<u8>, native: Option<NativeFile>) -> Result<TransferOutcome, FabError> {
-        if let Some(native_file) = native {
-            // Minimal native transfer: create tid/rid and send handle_value
-            let tid = {
-                struct Empty;
-                impl crate::id::TransferSpace for Empty { fn contains(&self, _: crate::id::TransferId) -> bool { false } }
-                crate::id::fresh_transfer_id(&Empty)
-            };
-            let rid = native_file.id();
+        if let Some(mut nf) = native {
+            struct Empty;
+            impl TransferSpace for Empty { fn contains(&self, _: TransferId) -> bool { false } }
+            let tid = fresh_transfer_id(&Empty);
+            let rid = nf.id();
+            #[cfg(windows)]
             let handle_value = {
-                #[cfg(windows)]
-                {
-                    use std::os::windows::io::AsRawHandle;
-                    let mut nf = native_file;
-                    let hv = nf.file().as_raw_handle() as u64;
-                    drop(nf);
-                    hv
-                }
-                #[cfg(unix)]
-                {
-                    let _ = native_file;
-                    0u64
-                }
+                use std::os::windows::io::AsRawHandle;
+                nf.file().as_raw_handle() as u64
             };
-            let native_att = crate::frame::NativeAttachment { tid, rid, handle_value };
-            self.shared.push_out(Frame::Data(DataInner { target: req.local, corr: req.corr, attachments: vec![], payload, native: Some(native_att) }))?;
-            return Ok(TransferOutcome::Committed);
+            #[cfg(not(windows))]
+            let handle_value = 0u64;
+            // Keep source alive until host confirms staging/commit (G41).
+            let slot = Arc::new((Mutex::new(None::<Option<NativeFile>>), Condvar::new()));
+            {
+                let mut st = self.shared.st.lock().unwrap();
+                if st.terminal.is_some() { return Err(FabError::FabricLost); }
+                st.native_hold.insert(tid, nf);
+                st.native_wait.insert(tid, slot.clone());
+            }
+            let att = crate::frame::NativeAttachment { tid, rid, handle_value };
+            let pushed = self.shared.push_out(Frame::Data(DataInner {
+                target: req.local, corr: req.corr, attachments: vec![], payload, native: Some(att),
+            }));
+            if let Err(e) = pushed {
+                let mut st = self.shared.st.lock().unwrap();
+                st.native_hold.remove(&tid);
+                st.native_wait.remove(&tid);
+                return Err(e);
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let (m, cv) = &*slot;
+            let mut g = m.lock().unwrap();
+            let outcome = loop {
+                if let Some(v) = g.take() { break v; }
+                let now = Instant::now();
+                if now >= deadline {
+                    match self.transfer_status(tid, Duration::from_secs(2)) {
+                        Ok(frame::XFER_ST_COMMITTED) => break None,
+                        _ => break None,
+                    }
+                }
+                let (ng, _) = cv.wait_timeout(g, deadline - now).unwrap();
+                g = ng;
+            };
+            match outcome {
+                None => Ok(TransferOutcome::Committed),
+                Some(file) => Ok(TransferOutcome::NativeAborted(vec![file])),
+            }
+        } else {
+            self.reply(req, payload, vec![])
         }
-        self.reply(req, payload, vec![])
     }
 
     fn transfer_status(&self, tid: TransferId, timeout: Duration) -> Result<u8, FabError> {

@@ -60,6 +60,7 @@ fn main() {
         "abort_cycle" => abort_cycle(&rt),
         "txn_once" => txn_once(&rt),
         "native_happy" => native_happy(&rt),
+        "native_abort" => native_abort(&rt),
         "preflight_p1_client" => preflight_p1_client(&rt),
         "preflight_p3_client" => preflight_p3_client(&rt),
         _ => full_demo(&rt),
@@ -748,7 +749,46 @@ fn native_happy(rt: &Runtime) -> i32 {
             marker!("CLIENT_NATIVE_HAPPY_OK");
         }
         let _ = nf.write_marker(b"_CLIENT");
+    } else {
     }
+    let _ = send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done);
+    0
+}
+
+fn native_abort(rt: &Runtime) -> i32 {
+    let mut seen = HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("CLIENT_FAIL native_abort no root: {e}"); return 1; }
+    };
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("CLIENT_FAIL native_abort no ctrl: {e}"); return 1; }
+    };
+    // Txn #1: reject the native offer (env set by host bootstrap).
+    let _ = root.call(proto::encode_root_request(RootRequest::OpenCounter), Duration::from_secs(3));
+    std::thread::sleep(Duration::from_millis(300));
+    // Stop rejecting for txn #2 (in-process flag; read per offer).
+    std::env::remove_var("SEAM_CLI_REJECT_NATIVE");
+    marker!("CLIENT_NATIVE_ABORT_TRIGGERED");
+    // Txn #2: rejection env is cleared by host after phase 1; restored
+    // resource must now commit and arrive readable.
+    let res = match root.call(proto::encode_root_request(RootRequest::OpenCounter), Duration::from_secs(10)) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("CLIENT_FAIL native_abort txn2: {e}"); return 1; }
+    };
+    if let Some(mut nf) = res.received_native {
+        match nf.read_all() {
+            Ok(data) if data.starts_with(b"SEAM_NATIVE_NONCE") && data.ends_with(b"_RESTORED") => {
+                marker!("CLIENT_NATIVE_RESTORED_RECOMMITTED_OK");
+            }
+            other => { eprintln!("CLIENT_FAIL native_abort content {:?}", other.map(|v| v.len())); return 1; }
+        }
+    } else {
+        eprintln!("CLIENT_FAIL native_abort no native attachment");
+        return 1;
+    }
+    marker!("CLIENT_NATIVE_ABORT_OK");
     let _ = send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done);
     0
 }
