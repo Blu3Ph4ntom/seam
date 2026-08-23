@@ -27,6 +27,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    adopt_native_lane(&rt);
     let mode = std::env::var("SEAM_SERVICE_MODE").unwrap_or_else(|_| "normal".into());
     let slow_ms: u64 = std::env::var("SEAM_SLOW_REPLY_MS")
         .ok()
@@ -189,3 +190,18 @@ fn main() {
     rt.shutdown();
     std::process::exit(0);
 }
+
+/// Adopt the inherited native resource lane (unix).
+#[cfg(unix)]
+fn adopt_native_lane(rt: &Runtime) {
+    if let Ok(fd_str) = std::env::var("SEAM_NATIVE_LANE_FD") {
+        if let Ok(fd) = fd_str.parse::<i32>() {
+            use std::os::unix::io::FromRawFd;
+            // SAFETY: fd 3 dup2'd by host pre-exec solely for us; sole owner.
+            let lane = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+            rt.install_native_lane(lane);
+        }
+    }
+}
+#[cfg(not(unix))]
+fn adopt_native_lane(_rt: &Runtime) {}

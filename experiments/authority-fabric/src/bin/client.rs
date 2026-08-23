@@ -48,6 +48,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    adopt_native_lane(&rt);
     let code = match mode().as_str() {
         "root_closed_tolerant" => root_closed(&rt, false),
         "root_closed_strict" => root_closed(&rt, true),
@@ -792,6 +793,23 @@ fn native_abort(rt: &Runtime) -> i32 {
     let _ = send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done);
     0
 }
+
+/// Adopt the inherited native resource lane (unix). The descriptor number is
+/// metadata only; authority comes from possessing the descriptor itself.
+#[cfg(unix)]
+fn adopt_native_lane(rt: &Runtime) {
+    if let Ok(fd_str) = std::env::var("SEAM_NATIVE_LANE_FD") {
+        if let Ok(fd) = fd_str.parse::<i32>() {
+            use std::os::unix::io::FromRawFd;
+            // SAFETY: fd 3 was dup2'd by the host pre-exec solely for us and
+            // marked non-CLOEXEC; we take sole ownership exactly once.
+            let lane = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+            rt.install_native_lane(lane);
+        }
+    }
+}
+#[cfg(not(unix))]
+fn adopt_native_lane(_rt: &Runtime) {}
 
 fn preflight_p1_client(rt: &Runtime) -> i32 {
     // Recipient that will be killed pre-accept; just do one txn and report.

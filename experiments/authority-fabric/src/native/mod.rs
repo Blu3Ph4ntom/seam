@@ -143,7 +143,11 @@ pub mod unix;
 pub mod windows;
 
 #[cfg(unix)]
-pub use unix::{close_escrow, commit_to_recipient, recv_fd, escrow_to_file, restore_to_sender, send_fd, stage_from_sender, Escrowed};
+pub use unix::{
+    close_escrow, deliver_to_recipient, escrow_to_file, recv_fd, recv_lane_msg, restore_to_sender,
+    send_fd, send_lane_msg, stage_from_sender, Escrowed, LaneMsg, LANE_KIND_DELIVER,
+    LANE_KIND_RESTORE, LANE_KIND_STAGE,
+};
 
 #[cfg(windows)]
 pub use windows::{close_escrow, commit_to_recipient, restore_to_sender, stage_from_sender, Escrowed};

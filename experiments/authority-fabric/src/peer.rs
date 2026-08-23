@@ -140,8 +140,12 @@ struct State {
     /// Slot value: None => committed; Some(file) => abort-restored file.
     native_wait: HashMap<TransferId, Arc<(Mutex<Option<Option<NativeFile>>>, Condvar)>>,
     native_hold: HashMap<TransferId, NativeFile>,
-    /// Recipient-side parked native offers awaiting COMMIT.
+    /// Recipient-side native offer parked until COMMIT + fd arrival.
     native_parked: HashMap<TransferId, NativeParked>,
+    /// Lane-received kernel objects awaiting COMMIT (order-independent join).
+    native_recv: HashMap<TransferId, NativeFile>,
+    /// Commit observed but object not yet arrived.
+    native_commit_seen: std::collections::HashSet<TransferId>,
     parked: Vec<Parked>,
 }
 
@@ -202,6 +206,9 @@ pub struct RuntimeInner {
     broken: AtomicBool,
     pub sent_frames: AtomicU64,
     pub received_frames: AtomicU64,
+    /// Sender-side native resource lane (unix). Set once at startup.
+    #[cfg(unix)]
+    native_lane: std::sync::Mutex<Option<std::os::unix::net::UnixStream>>,
 }
 
 const INBOUND_COST_OVERHEAD: usize = 96;
@@ -267,6 +274,8 @@ impl RuntimeInner {
                 native_wait: HashMap::new(),
                 native_hold: HashMap::new(),
                 native_parked: HashMap::new(),
+                native_recv: HashMap::new(),
+                native_commit_seen: std::collections::HashSet::new(),
                 parked: Vec::new(),
             }),
             out: BoundedQueue::new(lim.queue_max_msgs, lim.queue_max_bytes),
@@ -276,6 +285,8 @@ impl RuntimeInner {
             broken: AtomicBool::new(false),
             sent_frames: AtomicU64::new(0),
             received_frames: AtomicU64::new(0),
+            #[cfg(unix)]
+            native_lane: std::sync::Mutex::new(None),
         }
     }
 
@@ -342,6 +353,83 @@ impl RuntimeInner {
         }
     }
 
+    /// Join a parked native offer with its arrived kernel object and deliver
+    /// to the waiting caller (reply path) or the inbound queue.
+    fn complete_native(&self, p: NativeParked, file: NativeFile) {
+        let local = {
+            let st = self.st.lock().unwrap();
+            st.partner_of_theirs.get(&p.target).copied().unwrap_or(p.target)
+        };
+        if p.corr != 0 {
+            let slot = {
+                let mut st = self.st.lock().unwrap();
+                let matches = st.waiters.get(&p.corr).map(|s| s.ep == local).unwrap_or(false);
+                if matches { st.waiters.remove(&p.corr) } else { None }
+            };
+            if let Some(slot) = slot {
+                slot.resolve(Ok(CallResult { payload: p.payload, received: vec![], received_native: Some(file) }));
+                return;
+            }
+        }
+        let cost = p.payload.len() + INBOUND_COST_OVERHEAD;
+        let mut item = Inbound { from: EpId([0; 16]), local, corr: p.corr, payload: p.payload, received: vec![], received_native: Some(file) };
+        loop {
+            match self.inbound.try_push(item, cost) {
+                Ok(()) => return,
+                Err((back, _)) => { item = back; std::thread::sleep(Duration::from_millis(2)); }
+            }
+        }
+    }
+
+    /// Bind this runtime's native resource lane (unix only). Spawns the lane
+    /// reader thread; every received descriptor is immediately RAII-wrapped
+    /// and joined with parked metadata / commit state (order-independent).
+    #[cfg(unix)]
+    pub fn install_native_lane(&self, lane: std::os::unix::net::UnixStream) {
+        use crate::native::{NativeFile as NF, LANE_KIND_RESTORE};
+        let sh = self.clone();
+        std::thread::spawn(move || {
+            loop {
+                let msg = match crate::native::recv_lane_msg(&lane) {
+                    Ok(m) => m,
+                    Err(_) => return, // host death or lane close: EOF
+                };
+                let Some(fd) = msg.fd else { continue }; // malformed: closed inside recv
+                let file = NF::restore(msg.rid, File::from(fd));
+                if msg.kind == LANE_KIND_RESTORE {
+                    // Abort restoration: resolve sender wait slot.
+                    let mut st = sh.st.lock().unwrap();
+                    st.native_hold.remove(&msg.tid);
+                    if let Some(slot) = st.native_wait.remove(&msg.tid) {
+                        let (m, cv) = &*slot;
+                        *m.lock().unwrap() = Some(Some(file));
+                        cv.notify_all();
+                    }
+                    continue;
+                }
+                // Commit delivery: join with parked metadata / commit flag.
+                let mut st = sh.st.lock().unwrap();
+                if st.native_recv.len() >= sh.lim.max_native_resources {
+                    drop(st); // over capacity: descriptor closes via Drop
+                    continue;
+                }
+                if let Some(p) = st.native_parked.remove(&msg.tid) {
+                    drop(st);
+                    sh.complete_native(p, file);
+                    continue;
+                }
+                if st.native_commit_seen.contains(&msg.tid) {
+                    st.native_commit_seen.remove(&msg.tid);
+                    drop(st);
+                    // No parked metadata (e.g., late offer loss): object has
+                    // no application destination — close it by dropping.
+                    drop(file);
+                    continue;
+                }
+                st.native_recv.insert(msg.tid, file);
+            }
+        });
+    }
     fn go_terminal_pub(&self, cause: Cause) {
         {
             let mut st = self.st.lock().unwrap();
@@ -550,60 +638,43 @@ impl RuntimeInner {
                 true
             }
             XferMsg::NativeCommit { tid, rid, handle_value } => {
-                // Host duplicated the escrow into OUR process; combine parked
-                // offer + kernel object now (both conditions satisfied).
+                // Commit observed. The kernel object may arrive via lane
+                // (unix) before or after this frame; join order-independently.
                 let mut st = self.st.lock().unwrap();
-                if let Some(p) = st.native_parked.remove(&tid) {
-                    #[cfg(windows)]
+                #[cfg(windows)]
+                {
+                    // Windows carries the duplicated value inline; materialize now.
                     let file = crate::native::windows::handle_to_file(handle_value);
-                    #[cfg(not(windows))]
-                    let file = { let _ = handle_value; std::fs::File::open(std::env::temp_dir().join("seam-native-lane")).ok()
-                        .or_else(|| std::fs::File::create(std::env::temp_dir().join("seam-native-lane")).ok())
-                        .expect("native lane placeholder") };
-                    let local = st.partner_of_theirs.get(&p.target).copied().unwrap_or(p.target);
-                    // Resolve the caller's waiter directly when this was a reply.
-                    let mut delivered = false;
-                    if p.corr != 0 {
-                        if let Some(slot) = st.waiters.get(&p.corr) {
-                            if slot.ep == local {
-                                if let Some(slot) = st.waiters.remove(&p.corr) {
-                                    drop(st);
-                                    slot.resolve(Ok(CallResult { payload: p.payload, received: vec![], received_native: Some(NativeFile::restore(rid, file)) }));
-                                    return true;
-                                }
-                                delivered = true;
-                            }
-                        }
-                    }
-                    let _ = delivered;
-                    drop(st);
-                    let cost = p.payload.len() + INBOUND_COST_OVERHEAD;
-                    let mut item = Inbound { from: EpId([0;16]), local, corr: p.corr, payload: p.payload, received: vec![], received_native: Some(NativeFile::restore(rid, file)) };
-                    loop {
-                        match self.inbound.try_push(item, cost) {
-                            Ok(()) => break,
-                            Err((back, _)) => { item = back; std::thread::sleep(Duration::from_millis(2)); }
-                        }
+                    st.native_recv.insert(tid, NativeFile::restore(rid, file));
+                }
+                #[cfg(not(windows))]
+                { let _ = (rid, handle_value); }
+                st.native_commit_seen.insert(tid);
+                if let Some(file) = st.native_recv.remove(&tid) {
+                    if let Some(p) = st.native_parked.remove(&tid) {
+                        drop(st);
+                        self.complete_native(p, file);
+                        return true;
                     }
                 }
                 true
             }
             XferMsg::NativeAbort { tid, rid, handle_value } => {
-                // Restoration: host duplicated escrow back into us.
+                // Restoration (windows inline value; unix arrives via lane fd).
                 #[cfg(windows)]
-                let file = crate::native::windows::handle_to_file(handle_value);
-                #[cfg(not(windows))]
-                let file = { let _ = handle_value; std::fs::File::open(std::env::temp_dir().join("seam-native-restore")).ok()
-                    .or_else(|| std::fs::File::create(std::env::temp_dir().join("seam-native-restore")).ok())
-                    .expect("native restore placeholder") };
-                let nf = NativeFile::restore(rid, file);
-                let mut st = self.st.lock().unwrap();
-                st.native_hold.remove(&tid); // old source closes here
-                if let Some(slot) = st.native_wait.remove(&tid) {
-                    let (m, cv) = &*slot;
-                    *m.lock().unwrap() = Some(Some(nf));
-                    cv.notify_all();
+                {
+                    let file = crate::native::windows::handle_to_file(handle_value);
+                    let nf = NativeFile::restore(rid, file);
+                    let mut st = self.st.lock().unwrap();
+                    st.native_hold.remove(&tid); // old source closes here
+                    if let Some(slot) = st.native_wait.remove(&tid) {
+                        let (m, cv) = &*slot;
+                        *m.lock().unwrap() = Some(Some(nf));
+                        cv.notify_all();
+                    }
                 }
+                #[cfg(not(windows))]
+                { let _ = (&tid, &rid, &handle_value); }
                 true
             }
             XferMsg::ResultAck { .. } => true,
@@ -612,8 +683,7 @@ impl RuntimeInner {
     }
 
     fn process_data(self: &Arc<Self>, d: DataInner) {
-        // Native OFFER: accept, park metadata until NativeCommit delivers the
-        // kernel object (never materialize from sender's raw value).
+        // Native OFFER: accept, park metadata until commit+kernel-object join.
         if let Some(n) = d.native.clone() {
             // Hostile/capacity drill: reject instead of accept.
             let reject_native = std::env::var("SEAM_CLI_REJECT_NATIVE").map(|v| v == "1").unwrap_or(false);
@@ -1213,6 +1283,28 @@ impl Runtime {
                 if st.terminal.is_some() { return Err(FabError::FabricLost); }
                 st.native_hold.insert(tid, nf);
                 st.native_wait.insert(tid, slot.clone());
+            }
+            // Unix: send the real descriptor over our lane BEFORE the control
+            // frame so the host's blocking stage read is deterministic. Host
+            // validates tid/rid against the metadata it then receives.
+            #[cfg(unix)]
+            {
+                let lane_opt = self.native_lane.lock().unwrap();
+                if let Some(lane) = lane_opt.as_ref() {
+                    if let Err(e) = crate::native::unix::send_lane_msg(
+                        lane,
+                        crate::native::LANE_KIND_STAGE,
+                        tid,
+                        rid,
+                        nf.file(),
+                    ) {
+                        eprintln!("SEAM lane stage failed: {e}");
+                        return Err(FabError::TransferUnknown);
+                    }
+                } else {
+                    eprintln!("SEAM no native lane installed");
+                    return Err(FabError::TransferUnknown);
+                }
             }
             let att = crate::frame::NativeAttachment { tid, rid, handle_value };
             let pushed = self.shared.push_out(Frame::Data(DataInner {

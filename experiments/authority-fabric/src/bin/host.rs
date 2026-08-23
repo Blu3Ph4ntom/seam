@@ -111,6 +111,38 @@ impl Fabric {
         for (k, v) in envs {
             cmd.env(k, v);
         }
+        #[cfg(unix)]
+        let resource_lane: Option<std::os::unix::net::UnixStream> = {
+            use std::os::unix::io::IntoRawFd;
+            use std::os::unix::process::CommandExt;
+            match std::os::unix::net::UnixStream::pair() {
+                Ok((host_end, child_end)) => {
+                    // Dup child end onto fd 3 in the child (pre-exec) and clear
+                    // CLOEXEC so it survives exec. Host end stays private.
+                    let raw_child = child_end.into_raw_fd();
+                    cmd.env("SEAM_NATIVE_LANE_FD", "3");
+                    unsafe {
+                        cmd.pre_exec(move || {
+                            if libc_dup2(raw_child, 3) == -1 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            let flags = libc_fcntl(3, F_GETFD);
+                            if flags < 0 || libc_fcntl(3, F_SETFD, flags & !FDCLOEXEC) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                    // SAFETY: raw_child ownership moved into the pre_exec
+                    // closure; kernel owns the descriptor until the child's
+                    // dup2 completes. Parent must not close it concurrently,
+                    // and spawn() happens immediately below on this thread.
+                    std::mem::forget(raw_child);
+                    Some(host_end)
+                }
+                Err(_) => None,
+            }
+        };
         let mut child = cmd.spawn().map_err(|e| format!("spawn {role}: {e}"))?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
@@ -175,7 +207,12 @@ impl Fabric {
             });
         }
 
-        self.conns.insert(pid, Conn { child, q, #[cfg(unix)] resource_lane: None });
+        self.conns.insert(pid, Conn {
+            child,
+            q,
+            #[cfg(unix)]
+            resource_lane,
+        });
         Ok(pid)
     }
 
@@ -249,12 +286,24 @@ impl Fabric {
                     }
                     #[cfg(unix)]
                     {
-                        // Linux: recv FD from sender lane (blocking with timeout)
+                        // Linux: recv framed FD from sender lane. The child
+                        // sends the descriptor right after pushing the control
+                        // frame, so a short blocking read is deterministic.
                         if let Some(conn) = self.conns.get(&pid) {
                             if let Some(lane) = conn.resource_lane.as_ref() {
-                                if let Ok(escrow) = authority_fabric::native::unix::recv_fd(lane) {
-                                    let file = authority_fabric::native::unix::escrow_to_file(escrow);
-                                    self.native_escrow.insert(tid, (file, pid, _rid));
+                                match authority_fabric::native::unix::stage_from_sender(lane) {
+                                    Ok(m) => {
+                                        if m.tid == tid && Some(m.rid) == native_rid {
+                                            let file = authority_fabric::native::unix::escrow_to_file(
+                                                authority_fabric::native::unix::Escrowed(m.fd.unwrap()),
+                                            );
+                                            self.native_escrow.insert(tid, (file, pid, _rid));
+                                            marker!("HOST_NATIVE_STAGED_UNIX tid={}", tid.0[0]);
+                                        } else {
+                                            marker!("HOST_NATIVE_STAGE_MISMATCH tid={}", tid.0[0]);
+                                        }
+                                    }
+                                    Err(e) => marker!("HOST_NATIVE_STAGE_FAILED tid={} err={}", tid.0[0], e),
                                 }
                             }
                         }
@@ -355,13 +404,36 @@ impl Fabric {
                         }
                     }
                     #[cfg(unix)]
-                    { drop(escrow_file); }
+                    {
+                        // Linux commit delivery: sendmsg(SCM_RIGHTS) over the
+                        // recipient lane. Commit point = successful sendmsg.
+                        let dest_lane = self.conns.get(dest).and_then(|c| c.resource_lane.clone());
+                        match dest_lane {
+                            Some(lane) => {
+                                use std::os::unix::io::IntoRawFd;
+                                // SAFETY: sole ownership of escrow fd moves
+                                // into OwnedFd for the sendmsg; no second
+                                // wrapper is created.
+                                let owned = unsafe {
+                                    std::os::fd::OwnedFd::from_raw_fd(escrow_file.into_raw_fd())
+                                };
+                                match authority_fabric::native::unix::deliver_to_recipient(
+                                    &lane, *tid, *rid,
+                                    authority_fabric::native::unix::Escrowed(owned),
+                                ) {
+                                    Ok(()) => marker!("HOST_NATIVE_DELIVERED_UNIX tid={}", tid.0[0]),
+                                    Err(e) => marker!("HOST_NATIVE_COMMIT_FAILED tid={} err={}", tid.0[0], e),
+                                }
+                            }
+                            None => drop(escrow_file),
+                        }
+                    }
                 } else {
                     marker!("HOST_NATIVE_ESCROW_MISS tid={} had={}", tid.0[0], had);
                 }
             }
-            // Native pre-commit abort: restore escrow to SENDER and retarget
-            // the sender's Abort as NativeAbort carrying a sender-valid value.
+            // Native pre-commit abort: restore escrow to SENDER (windows
+            // duplicates the handle back; unix sendmsg's it over the lane).
             if let Frame::Xfer(XferMsg::Abort { tid: abort_tid }) = frame.clone() {
                 if let Some((escrow_file, sender_peer, rid)) = self.native_escrow.remove(&abort_tid) {
                     if *dest == sender_peer {
@@ -386,7 +458,27 @@ impl Fabric {
                             }
                         }
                         #[cfg(unix)]
-                        { drop(escrow_file); }
+                        {
+                            // Restore = sendmsg(SCM_RIGHTS) back over sender's
+                            // lane. Sender's lane thread resolves its wait slot.
+                            let sender_lane = self.conns.get(dest).and_then(|c| c.resource_lane.clone());
+                            match sender_lane {
+                                Some(lane) => {
+                                    use std::os::unix::io::IntoRawFd;
+                                    let owned = unsafe {
+                                        std::os::fd::OwnedFd::from_raw_fd(escrow_file.into_raw_fd())
+                                    };
+                                    match authority_fabric::native::unix::restore_to_sender(
+                                        &lane, abort_tid, rid,
+                                        authority_fabric::native::unix::Escrowed(owned),
+                                    ) {
+                                        Ok(()) => marker!("HOST_NATIVE_RESTORED_UNIX tid={}", abort_tid.0[0]),
+                                        Err(e) => marker!("HOST_NATIVE_RESTORE_FAILED tid={} err={}", abort_tid.0[0], e),
+                                    }
+                                }
+                                None => drop(escrow_file),
+                            }
+                        }
                     } else {
                         drop(escrow_file);
                     }
