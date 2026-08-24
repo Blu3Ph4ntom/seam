@@ -1,0 +1,13 @@
+warning: unused import: `authority_fabric::data_pipe::Consumer`
+ --> tests/compile-fail/pipe_consumer_no_clone.rs:1:5
+  |
+1 | use authority_fabric::data_pipe::Consumer;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0599]: no method named `clone` found for struct `Consumer` in the current scope
+ --> tests/compile-fail/pipe_consumer_no_clone.rs:7:18
+  |
+7 |     let twin = c.clone(); //~ ERROR the trait `Clone` is not implemented
+  |                  ^^^^^ method not found in `Consumer`

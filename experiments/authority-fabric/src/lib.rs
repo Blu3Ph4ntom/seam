@@ -3,6 +3,7 @@
 //! This crate is an EXPERIMENT. Nothing here is Seam's stable API, wire
 //! format, or transport. See `.agent/` (local-only) for the run charter.
 
+pub mod data_pipe;
 pub mod fabric_error;
 pub mod frame;
 pub mod id;
