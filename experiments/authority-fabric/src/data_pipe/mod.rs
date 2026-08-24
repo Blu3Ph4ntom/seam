@@ -12,6 +12,7 @@
 //! behind these types in a follow-up layer; backend choice stays replaceable.
 
 pub mod credit;
+pub mod direct;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
