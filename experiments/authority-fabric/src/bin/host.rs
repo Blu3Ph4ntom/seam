@@ -508,10 +508,14 @@ impl Fabric {
             // (Offer-time Data keeps escrow intact; only NativeCommit spends it.)
             if let Frame::Xfer(XferMsg::NativeCommit {
                 tid,
-                rid: _,
+                rid,
                 handle_value,
             }) = &mut frame
             {
+                // The unix commit branch forwards the resource id with the
+                // descriptor; windows carries only handle values.
+                #[cfg(windows)]
+                let _ = &*rid;
                 let had = self.native_escrow.contains_key(tid);
                 if let Some((escrow_file, _sender, _rid2)) = self.native_escrow.remove(tid) {
                     #[cfg(windows)]
