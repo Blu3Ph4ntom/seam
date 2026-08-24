@@ -21,6 +21,8 @@ fn grant_commit(r: &mut Router, to: authority_fabric::PeerId, ep: authority_fabr
         _ => panic!("grant"),
     };
     r.on_xfer(to, XferMsg::Accept { tid }).unwrap();
+    // D37: terminal results are retained until the sender acknowledges.
+    r.on_xfer(to, XferMsg::ResultAck { tid }).unwrap();
 }
 
 #[test]
