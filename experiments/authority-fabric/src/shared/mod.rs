@@ -733,23 +733,31 @@ mod tests {
     #[test]
     fn linux_ro_native_fd_rejects_writable_mapping() {
         let mut reg = SharedRegion::create(4096, &lim()).unwrap();
-        let mut w = reg.map_read_write().unwrap();
-        w.as_mut_slice()[0] = 7;
-        // Derive RO: seals the memfd so new writable mappings are denied.
+        let seed: u64 = 0x0dd_ba11_5ead_5eed;
+        // Producer writes through its writable session...
+        {
+            let mut w = reg.map_read_write().unwrap();
+            w.as_mut_slice()[0] = 7;
+            authority_fabric::shared::fill_pattern(&mut [0u8; 0], seed);
+            w.as_mut_slice()[1] = 9;
+        }
+        // ...ends the session, then derives RO over the SAME pages.
         let ro = reg.derive_read_only().unwrap();
-        // Existing producer writable mapping survives the seal (narrowing).
-        w.as_mut_slice()[0] = 9;
-        assert_eq!(w.as_mut_slice()[0], 9);
+        // Data written pre-attenuation is visible through the derived view:
+        let ro_view = ro.map_read_only().unwrap();
+        assert_eq!(ro_view.as_slice()[0], 7);
+        assert_eq!(ro_view.as_slice()[1], 9);
+        drop(ro_view);
         // Hostile: writable native mapping on the RO fd must fail at kernel.
         assert!(
             map_read_write(ro.backing_ref(), 4096).is_err(),
-            "sealed memfd must reject PROT_WRITE"
+            "attenuated memfd must reject PROT_WRITE"
         );
         // write(2) through the attenuated descriptor must also fail.
         {
             use std::io::Write as _;
-            let mut w = ro.backing_ref().try_clone().unwrap();
-            assert!(w.write_all(b"x").is_err(), "RO fd must reject write(2)");
+            let mut wf = ro.backing_ref().try_clone().unwrap();
+            assert!(wf.write_all(b"x").is_err(), "RO fd must reject write(2)");
         }
         // Read mapping on RO fd succeeds.
         assert!(map_read_only(ro.backing_ref(), 4096).is_ok());

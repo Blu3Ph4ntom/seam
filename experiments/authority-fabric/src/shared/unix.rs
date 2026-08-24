@@ -93,6 +93,11 @@ impl<'a> MappedReadOnly<'a> {
     pub fn as_slice(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(self.ptr, self.len) }
     }
+
+    /// Raw parts for lifetime-preserving slice construction in mod.rs.
+    pub(crate) fn raw_parts(&self) -> (*const u8, usize) {
+        (self.ptr, self.len)
+    }
 }
 
 impl Drop for MappedReadWrite<'_> {
