@@ -90,21 +90,22 @@ impl<'a> MappedReadOnly<'a> {
     }
 
     /// Raw parts for lifetime-preserving slice construction in mod.rs.
-    /// Reopen a descriptor read-only through the /proc/self/fd magic link.
-    /// A3: this is THE attenuation primitive; it must fail closed. There is
-    /// deliberately no dup() fallback — a caller that receives Err must not
-    /// mint any RO authority.
-    pub(crate) fn reopen_read_only(raw: std::os::fd::RawFd) -> std::io::Result<File> {
-        let link = std::path::Path::new("/proc/self/fd").join(raw.to_string());
-        let reopened = std::fs::OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(&link)?;
-        Ok(reopened)
-    }
     pub(crate) fn raw_parts(&self) -> (*const u8, usize) {
         (self.ptr, self.len)
     }
+}
+
+/// Reopen a descriptor read-only through the /proc/self/fd magic link.
+/// A3: this is THE attenuation primitive; it must fail closed. There is
+/// deliberately no dup() fallback — a caller that receives Err must not
+/// mint any RO authority.
+pub(crate) fn reopen_read_only(raw: std::os::fd::RawFd) -> std::io::Result<File> {
+    let link = std::path::Path::new("/proc/self/fd").join(raw.to_string());
+    let reopened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open(&link)?;
+    Ok(reopened)
 }
 
 impl Drop for MappedReadWrite<'_> {
