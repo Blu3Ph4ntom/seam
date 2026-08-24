@@ -250,7 +250,7 @@ fn driver() {
         child: c,
     };
 
-    let mut t = Vec::new();
+    let mut t: Vec<u128> = Vec::new();
     for _ in 0..5000 {
         let s = Instant::now();
         writeln!(p.w, "SYNC").unwrap();
@@ -313,7 +313,7 @@ fn driver() {
     let mut copy_all = Vec::new();
     for (name, size, iters) in SIZES.iter().copied() {
         let payload = vec![0xA5u8; size];
-        let mut t = Vec::new();
+        let mut t: Vec<u128> = Vec::new();
         for i in 0..iters {
             let s = Instant::now();
             writeln!(p.w, "COPY {size}").unwrap();
@@ -343,7 +343,7 @@ fn driver() {
     let _ = p.child.wait();
 }
 
-fn percentile(v: &mut Vec<u128>, p: f64) -> u128 {
+fn percentile(v: &mut [u128], p: f64) -> u128 {
     v.sort_unstable();
     let i = (((v.len() as f64) * p).ceil() as usize).saturating_sub(1);
     v[i.min(v.len() - 1)]
