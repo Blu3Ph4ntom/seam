@@ -442,6 +442,37 @@ fn shared_race_loop() {
 }
 
 #[test]
+fn shared_rw_death_pre_accept() {
+    let out = run_host(
+        &["shared_rw_death_pre_accept"],
+        &[],
+        Duration::from_secs(90),
+    );
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "rwdeath pre_accept\n{combined}");
+    assert_contains(&combined, "SHARED_DEATH_PREACCEPT_KILLED", "rwdeath");
+    assert_contains(&combined, "SVC_SHARED_RESTORED_WRITABLE_OK", "rwdeath");
+    assert_contains(&combined, "SHARED_RWDEATH_pre_accept_OK", "rwdeath");
+}
+
+#[test]
+fn shared_rw_death_post_commit() {
+    let out = run_host(
+        &["shared_rw_death_post_commit"],
+        &[],
+        Duration::from_secs(90),
+    );
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "rwdeath post_commit\n{combined}"
+    );
+    assert_contains(&combined, "SHARED_DEATH_POSTCOMMIT_KILLED", "rwdeath");
+    assert_contains(&combined, "SHARED_RWDEATH_post_commit_OK", "rwdeath");
+}
+
+#[test]
 fn shared_multi_reader() {
     let out = run_host(&["shared_multi_reader"], &[], Duration::from_secs(120));
     let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));

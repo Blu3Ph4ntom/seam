@@ -1262,6 +1262,8 @@ fn main() {
         "native_abort" => native_abort_case(lim),
         "native_stress" => native_stress_case(lim),
         "shared_happy" => shared_happy_case(lim),
+        "shared_rw_death_pre_accept" => shared_rw_death_case(lim, "pre_accept"),
+        "shared_rw_death_post_commit" => shared_rw_death_case(lim, "post_commit"),
         "shared_derive" => shared_derive_case(lim),
         "shared_rw_transfer" => shared_rw_transfer_case(lim),
         "shared_rw_abort" => shared_rw_abort_case(lim),
@@ -1275,6 +1277,23 @@ fn main() {
 fn fail(msg: &str) -> i32 {
     eprintln!("HOST_FAIL {msg}");
     2
+}
+
+fn kill_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
 }
 
 /// Full happy-path demonstration plus lifecycle proof. Prints all markers
@@ -2445,6 +2464,134 @@ fn shared_multi_reader_case(lim: Limits) -> i32 {
 /// reports only its 8-byte hash over the control channel -> Host derives RO
 /// and grants it to Consumer (service) with the expected hash riding the offer
 /// metadata -> Consumer maps FILE_MAP_READ-only, hashes all 4 MiB, verifies.
+/// Deterministic recipient-death around a STAGED writable transfer (D6/D8).
+/// phase=pre_accept : client killed before ACCEPT  -> restore to sender.
+/// phase=post_commit: client killed after commit   -> finality, no restore.
+fn shared_rw_death_case(lim: Limits, phase: &str) -> i32 {
+    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    let dir = std::env::temp_dir().join(format!("seam-rwdeath-{phase}-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let dir_s = dir.to_string_lossy().to_string();
+    let mut fab = Fabric::new(lim);
+    let mut cli_envs: Vec<(&str, String)> = vec![("SEAM_CLIENT_MODE", "shared_receive_rw".into())];
+    if phase == "pre_accept" {
+        cli_envs.push(("SEAM_BARRIER_DIR", dir_s.clone()));
+        cli_envs.push(("SEAM_PAUSE_SHARED_ACCEPT", "1".into()));
+    }
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "shared_wait_hold".into())],
+        &cli_envs,
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    let svc_os = fab.conns.get(&setup.svc).map(|c| c.child.id()).unwrap_or(0);
+    let cli_os = fab.conns.get(&setup.cli).map(|c| c.child.id()).unwrap_or(0);
+    marker!("HOST_PIDS svc={} cli={}", svc_os, cli_os);
+    if fab
+        .region_new_grant(
+            setup.svc,
+            setup.root_service_side,
+            0,
+            REGION_SIZE,
+            Rights::ReadWrite,
+            vec![],
+        )
+        .is_err()
+    {
+        return fail("initial grant failed");
+    }
+    // Deterministic gate: hold landed and was acknowledged.
+    if !settle_shared(&mut fab, Duration::from_secs(15), 1, 0) {
+        return fail("hold settle");
+    }
+    match phase {
+        "pre_accept" => {}
+        "post_commit" => {
+            std::env::set_var("SEAM_PAUSE_BEFORE_COMMIT", "1");
+            std::env::set_var("SEAM_PAUSE_AFTER_COMMIT", "1");
+        }
+        other => return fail(&format!("unknown phase {other}")),
+    }
+    // Supervisor kills the client the instant its barrier file appears.
+    let dir2 = dir.clone();
+    let barrier_name = match phase {
+        "pre_accept" => "peer_before_accept",
+        _ => "host_before_commit",
+    };
+    std::thread::spawn(move || {
+        let barrier = dir2.join(barrier_name);
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while Instant::now() < deadline {
+            if barrier.exists() {
+                kill_tree(cli_os);
+                let _ = std::fs::write(dir2.join("victim_killed"), b"1");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    match phase {
+        "post_commit" => match fab.wait_ctrl_raw(Duration::from_secs(30), |p| p.len() == 8) {
+            Ok(_) => marker!("SHARED_DEATH_POSTCOMMIT_KILLED"),
+            Err(e) => return fail(&e),
+        },
+        _ => {
+            // Wait until the supervisor confirms the kill; do NOT release the
+            // client's accept gate — the process must die parked.
+            let killed = dir.join("victim_killed");
+            let dl = Instant::now() + Duration::from_secs(30);
+            while !killed.exists() {
+                if Instant::now() >= dl {
+                    return fail("victim never killed at accept barrier");
+                }
+                fab.step(Instant::now() + Duration::from_millis(50));
+            }
+            marker!("SHARED_DEATH_PREACCEPT_KILLED");
+        }
+    }
+    // Release remaining HOST-side barriers only.
+    for b in ["host_before_commit", "host_after_commit"] {
+        let _ = std::fs::write(dir.join(format!("{b}.go")), b"1");
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let ra = fab.router.region_accounting();
+        let acct = fab.router.accounting();
+        let done_writer = match phase {
+            // Restored writer stays the service (T1/T2 semantics).
+            "pre_accept" => ra.writable_authorities == 1,
+            // Post-commit the writer belonged to the dead client; peer_gone
+            // vacates it and nothing is auto-minted (S3/T3).
+            _ => ra.writable_authorities <= 1,
+        };
+        if acct.shared_pending == 0 && done_writer && acct.shared_unacked == 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return fail(&format!(
+                "death settle timeout pend={} w={} r={} unacked={}",
+                acct.shared_pending,
+                ra.writable_authorities,
+                ra.readonly_authorities,
+                acct.shared_unacked
+            ));
+        }
+        fab.step(deadline);
+    }
+    let _ = fab.wait_exit(setup.svc, Duration::from_secs(10));
+    std::env::remove_var("SEAM_PAUSE_BEFORE_COMMIT");
+    std::env::remove_var("SEAM_PAUSE_AFTER_COMMIT");
+    fab.shutdown_orderly();
+    if let Some(m) = leak_check(&fab) {
+        return fail(&m);
+    }
+    println!("SHARED_RWDEATH_{phase}_OK");
+    let _ = std::fs::remove_dir_all(&dir);
+    0
+}
+
 fn shared_happy_case(lim: Limits) -> i32 {
     const REGION_SIZE: u64 = 4 * 1024 * 1024;
     let mut fab = Fabric::new(lim);

@@ -781,6 +781,14 @@ impl Router {
         if rec.state != NativeState::Escrowed {
             return Ok(RouteOutcome::default());
         }
+        // Deterministic fault injection: pause AFTER the authority move and
+        // escrow spend, BEFORE any frame emission (D8 kills here).
+        if std::env::var("SEAM_PAUSE_AFTER_COMMIT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            barrier_wait("host_after_commit");
+        }
         // Move authority in the RegionTable FIRST (reject-before-mutate rule):
         // a failed bookkeeping transition aborts before any frame is emitted.
         match rec.rights {
@@ -1060,7 +1068,12 @@ impl Router {
                     self.shared_results
                         .insert(tid, (s.sender, Cause::Graceful, s.rid));
                 } else {
-                    let _ = self.shared_abort_inner(tid, "recipient lost");
+                    // Dest died pre-commit: propagate the sender-restore
+                    // frames exactly like the native path above.
+                    let extra = self.shared_abort_inner(tid, "recipient lost");
+                    if let Ok(extra) = extra {
+                        out.send.extend(extra.send);
+                    }
                 }
             }
         }

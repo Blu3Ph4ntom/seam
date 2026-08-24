@@ -1050,6 +1050,27 @@ impl RuntimeInner {
     fn process_data(self: &Arc<Self>, d: DataInner) {
         // Shared-region OFFER: accept, park metadata until commit+backing join.
         if let Some(s) = d.shared.clone() {
+            // Deterministic fault injection: park BEFORE accepting so a
+            // supervisor can kill this process pre-accept (D6).
+            if std::env::var("SEAM_PAUSE_SHARED_ACCEPT")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                let dir = std::env::var("SEAM_BARRIER_DIR").unwrap_or_default();
+                let p = std::path::Path::new(&dir).join("peer_before_accept");
+                let g = std::path::Path::new(&dir).join("peer_before_accept.go");
+                let _ = std::fs::write(&p, b"1");
+                // Long window: this gate exists to be killed at.
+                for _ in 0..3000 {
+                    if g.exists() || self.broken.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if self.broken.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
             // Hostile/capacity drill: reject instead of accept.
             let reject_shared = std::env::var("SEAM_CLI_REJECT_SHARED")
                 .map(|v| v == "1")
