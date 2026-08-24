@@ -26,9 +26,9 @@ fn perr(m: &'static str) -> std::io::Error {
 }
 
 /// Encode a record. `body.len()` must be <= MAX_DATA for KIND_DATA.
-/// The trailing newline is protocol framing (line-delimited headers), so the
-/// lint against `write!`-with-newline is intentionally suppressed here.
+/// The trailing newline is protocol framing (line-delimited headers).
 #[allow(clippy::write_literal)]
+#[allow(clippy::write_with_newline)]
 pub fn encode(w: &mut dyn Write, rec: &Rec) -> std::io::Result<()> {
     match rec {
         Rec::Data(b) => {
