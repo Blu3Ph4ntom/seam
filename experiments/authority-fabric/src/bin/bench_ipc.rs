@@ -10,13 +10,22 @@ use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
-const SIZES: &[(&str, usize, usize)] = &[
-    ("4KiB", 4 * 1024, 2000),
-    ("64KiB", 64 * 1024, 1000),
-    ("1MiB", 1024 * 1024, 400),
-    ("4MiB", 4 * 1024 * 1024, 150),
-    ("64MiB", 64 * 1024 * 1024, 40),
-];
+fn sizes() -> Vec<(&'static str, usize, usize)> {
+    let k: f64 = std::env::var("SEAM_BENCH_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    [
+        ("4KiB", 4 * 1024, 2000),
+        ("64KiB", 64 * 1024, 1000),
+        ("1MiB", 1024 * 1024, 400),
+        ("4MiB", 4 * 1024 * 1024, 150),
+        ("64MiB", 64 * 1024 * 1024, 40),
+    ]
+    .into_iter()
+    .map(|(n, s, i)| (n, s, ((i as f64) * k).max(8.0) as usize))
+    .collect()
+}
 
 fn pct(v: &mut [u128], p: f64) -> u128 {
     v.sort();
@@ -288,7 +297,7 @@ fn driver() {
 
     let mut cold_all = Vec::new();
     let mut warm_all = Vec::new();
-    for (name, size, iters) in SIZES.iter().copied() {
+    for (name, size, iters) in sizes() {
         establish(&mut p, size);
         warm_handoff(&mut p, size, seed_of(0)); // warmup
         release(&mut p);
@@ -333,7 +342,7 @@ fn driver() {
     }
 
     let mut copy_all = Vec::new();
-    for (name, size, iters) in SIZES.iter().copied() {
+    for (name, size, iters) in sizes() {
         let payload = vec![0xA5u8; size];
         let mut t: Vec<u128> = Vec::new();
         for i in 0..iters {
