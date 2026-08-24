@@ -37,14 +37,15 @@ pub fn create_backing(size: u64) -> std::io::Result<File> {
 /// This is the honest Linux attenuation boundary: after RO derivation the
 /// writer may not create *new* writable mappings, but its existing one remains.
 pub fn duplicate_backing(file: &File, _writable: bool) -> std::io::Result<File> {
-    // SAFETY: dup a *borrowed* fd; the source `file` keeps owning its fd.
-    let duped = rustix::fd::dup(file.as_fd())?;
+    // std dup: a new owned descriptor referencing the same open file
+    // description; the source `file` keeps owning its own.
+    let duped = file.try_clone()?;
     // Seal FUTURE_WRITE on the shared inode so the derived (RO) fd cannot be
     // mapped writable by a compromised recipient. Existing mappings survive.
     // Sealing is inode-wide: it also narrows the producer's *future* writable
     // mappings (documented RUN 005B attenuation boundary).
     let _ = rustix::fs::fcntl_add_seals(&duped, rustix::fs::SealFlags::FUTURE_WRITE);
-    Ok(File::from(duped))
+    Ok(duped)
 }
 
 /// A live writable view of a region. Dropping unmaps; does NOT drop the

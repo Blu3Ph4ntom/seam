@@ -696,7 +696,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn linux_ro_native_fd_rejects_writable_mapping() {
-        let reg = SharedRegion::create(4096, &lim()).unwrap();
+        let mut reg = SharedRegion::create(4096, &lim()).unwrap();
         let mut w = reg.map_read_write().unwrap();
         w.as_mut_slice()[0] = 7;
         // Derive RO: seals the memfd so new writable mappings are denied.
