@@ -596,8 +596,16 @@ impl RuntimeInner {
                         continue;
                     }
                     st0.shared_recv.insert(msg.tid, std::fs::File::from(fd));
-                    if let Some(p) = st0.shared_parked.remove(&msg.tid) {
-                        if let Some((rid, rights, size)) = st0.shared_commit_meta.remove(&msg.tid) {
+                    // Join only when ALL THREE parts coexist; never consume a
+                    // part we cannot immediately pair (the commit frame may
+                    // still be in flight, or vice versa).
+                    let ready = st0.shared_parked.contains_key(&msg.tid)
+                        && st0.shared_commit_meta.contains_key(&msg.tid);
+                    if ready {
+                        if let (Some(p), Some((rid, rights, size))) = (
+                            st0.shared_parked.remove(&msg.tid),
+                            st0.shared_commit_meta.remove(&msg.tid),
+                        ) {
                             if let Some(file) = st0.shared_recv.remove(&msg.tid) {
                                 drop(st0);
                                 sh.complete_shared(p, rid, rights, size, file);
