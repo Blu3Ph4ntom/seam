@@ -16,7 +16,7 @@ const SIZES: &[(&str, usize, usize)] = &[
     ("64MiB", 64 * 1024 * 1024, 40),
 ];
 
-fn pct(v: &mut Vec<u128>, p: f64) -> u128 {
+fn pct(v: &mut [u128], p: f64) -> u128 {
     v.sort();
     let i = (((v.len() as f64) * p).ceil() as usize).saturating_sub(1);
     v[i.min(v.len() - 1)]
@@ -74,7 +74,7 @@ fn peer() {
         if r.read_line(&mut line).unwrap_or(0) == 0 {
             return;
         }
-        let p: Vec<&str> = line.trim().split_whitespace().collect();
+        let p: Vec<&str> = line.split_whitespace().collect();
         match p[0] {
             "SYNC" => {
                 out.write_all(b"ACK\n").unwrap();
