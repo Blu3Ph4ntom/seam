@@ -11,6 +11,8 @@
 //! zero unsafe). A cross-process kernel backend implements the same contract
 //! behind these types in a follow-up layer; backend choice stays replaceable.
 
+pub mod credit;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
