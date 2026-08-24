@@ -1826,7 +1826,8 @@ mod tests {
         // zero timing dependence.
         for i in 0..100u32 {
             let (from, to, from_ep) = if i % 2 == 0 { (a, b, x) } else { (b, a, y) };
-            let _oc = r\n                .on_data(from, shared_data(from_ep, rid, 1))
+            let _oc = r
+                .on_data(from, shared_data(from_ep, rid, 1))
                 .unwrap_or_else(|e| panic!("cycle {i} stage: {e:?}"));
             assert_eq!(r.accounting().shared_pending, 1);
             assert_eq!(r.region_writable_holder(rid), Some(from));
@@ -2491,4 +2492,3 @@ mod tests {
         assert_eq!(r.native_results.len(), 0);
     }
 }
-
