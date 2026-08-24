@@ -6,6 +6,7 @@
 //! writer thread (bounded outbound queue -> transport). A single state
 //! mutex, never held across blocking IO.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -50,9 +51,25 @@ pub struct CallResult {
     pub received_shared: Option<SharedRegion>,
 }
 
+/// Shared condvar cell used by every wait/slot table.
+type WaitCell<T> = Arc<(Mutex<Option<T>>, Condvar)>;
+/// Sender-side native hold slot: `None` = committed, `Some` = restored file.
+type NativeSlotCell = WaitCell<Option<NativeFile>>;
+/// Sender-side shared hold slot: `None` = committed, `Some` = restored region.
+type SharedSlotCell = WaitCell<Option<SharedRegion>>;
+/// Host-authoritative commit metadata joined with the backing + offer.
+type SharedCommitMeta = (RegionId, Rights, u64);
+/// Resolved reply cell for an in-flight call.
+type ReplyCell = CallCell<Result<CallResult, FabError>>;
+/// Status-query cell.
+type StatusCell = WaitCell<u8>;
+/// Caller wait cell.
+pub(crate) type CallCell<T> = WaitCell<T>;
+
+/// A message slot bound to one endpoint id, resolved by the reader thread.
 pub(crate) struct WaitSlot {
     pub ep: EpId,
-    inner: Arc<(Mutex<Option<Result<CallResult, FabError>>>, Condvar)>,
+    inner: ReplyCell,
 }
 
 impl WaitSlot {
@@ -67,7 +84,7 @@ impl WaitSlot {
         *m.lock().unwrap() = Some(res);
         cv.notify_all();
     }
-    fn peek(&self) -> Arc<(Mutex<Option<Result<CallResult, FabError>>>, Condvar)> {
+    fn peek(&self) -> ReplyCell {
         self.inner.clone()
     }
 }
@@ -154,11 +171,11 @@ struct State {
     arrival_order: Vec<EpId>,
     pending_offers: HashMap<TransferId, (EpId, EpId)>,
     xfer_wait: HashMap<TransferId, Arc<XferSlot>>,
-    status_wait: HashMap<TransferId, Arc<(Mutex<Option<u8>>, Condvar)>>,
+    status_wait: HashMap<TransferId, StatusCell>,
     /// Native transfer waiters + source hold (source stays open until the
     /// host confirms staging/commit — no premature close).
     /// Slot value: None => committed; Some(file) => abort-restored file.
-    native_wait: HashMap<TransferId, Arc<(Mutex<Option<Option<NativeFile>>>, Condvar)>>,
+    native_wait: HashMap<TransferId, NativeSlotCell>,
     native_hold: HashMap<TransferId, NativeFile>,
     /// Recipient-side native offer parked until COMMIT + fd arrival.
     native_parked: HashMap<TransferId, NativeParked>,
@@ -171,11 +188,11 @@ struct State {
     shared_parked: HashMap<TransferId, SharedParked>,
     shared_recv: HashMap<TransferId, std::fs::File>,
     /// Host-authoritative commit metadata: rid/rights/size from SharedCommit.
-    shared_commit_meta: HashMap<TransferId, (RegionId, Rights, u64)>,
+    shared_commit_meta: HashMap<TransferId, SharedCommitMeta>,
     /// Sender-side hold + wait slot. Slot value: None => committed;
     /// Some(region) => abort-restored capability.
     shared_hold: HashMap<TransferId, SharedRegion>,
-    shared_wait: HashMap<TransferId, Arc<(Mutex<Option<Option<SharedRegion>>>, Condvar)>>,
+    shared_wait: HashMap<TransferId, SharedSlotCell>,
     parked: Vec<Parked>,
 }
 
@@ -289,14 +306,11 @@ impl RuntimeInner {
         if st.terminal.is_some() {
             return None;
         }
-        if !st.handles.contains_key(&id) {
-            st.handles.insert(
-                id,
-                HState {
-                    partner,
-                    cause: None,
-                },
-            );
+        if let Entry::Vacant(e) = st.handles.entry(id) {
+            e.insert(HState {
+                partner,
+                cause: None,
+            });
             st.arrival_order.push(id);
         }
         st.partner_of_theirs.insert(partner, id);
@@ -756,14 +770,11 @@ impl RuntimeInner {
                 {
                     let mut st = self.st.lock().unwrap();
                     st.pending_offers.remove(&tid);
-                    if !st.handles.contains_key(&ep) {
-                        st.handles.insert(
-                            ep,
-                            HState {
-                                partner,
-                                cause: None,
-                            },
-                        );
+                    if let Entry::Vacant(e) = st.handles.entry(ep) {
+                        e.insert(HState {
+                            partner,
+                            cause: None,
+                        });
                         st.arrival_order.push(ep);
                     }
                     st.partner_of_theirs.insert(partner, ep);
@@ -1380,10 +1391,9 @@ impl Endpoint {
                 native: None,
                 shared: None,
             }))
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 let mut st = self.shared.st.lock().unwrap();
                 st.waiters.remove(&corr);
-                e
             })?;
 
         let (m, cv) = &*slot;
@@ -1594,9 +1604,8 @@ impl Runtime {
         {
             let mut st = self.shared.st.lock().unwrap();
             for mut cap in caps {
-                match st.handles.get(&cap.id).and_then(|h| h.cause) {
-                    Some(c) => return Err(FabError::Closed(c)),
-                    None => {}
+                if let Some(c) = st.handles.get(&cap.id).and_then(|h| h.cause) {
+                    return Err(FabError::Closed(c));
                 }
                 let partner = st.handles.get(&cap.id).unwrap().partner;
                 let tid = fresh_transfer_id(&EmptyTid);
@@ -1963,24 +1972,18 @@ impl Runtime {
             match g.take() {
                 Some(CreateOutcome::Done(imp, tra)) => {
                     let mut st = self.shared.st.lock().unwrap();
-                    if !st.handles.contains_key(&imp) {
-                        st.handles.insert(
-                            imp,
-                            HState {
-                                partner: tra,
-                                cause: None,
-                            },
-                        );
+                    if let Entry::Vacant(e) = st.handles.entry(imp) {
+                        e.insert(HState {
+                            partner: tra,
+                            cause: None,
+                        });
                         st.arrival_order.push(imp);
                     }
-                    if !st.handles.contains_key(&tra) {
-                        st.handles.insert(
-                            tra,
-                            HState {
-                                partner: imp,
-                                cause: None,
-                            },
-                        );
+                    if let Entry::Vacant(e) = st.handles.entry(tra) {
+                        e.insert(HState {
+                            partner: imp,
+                            cause: None,
+                        });
                         st.arrival_order.push(tra);
                     }
                     // Demux: a DATA addressed with the peer's handle (the

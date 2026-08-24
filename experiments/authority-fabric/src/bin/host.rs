@@ -101,6 +101,7 @@ fn deliver_to_dest(
     let owned = unsafe {
         std::os::windows::io::OwnedHandle::from_raw_handle(escrow_file.into_raw_handle())
     };
+    // Escrow handle staged by this module; recipient gets the sole new value.
     let hval = authority_fabric::native::windows::commit_to_recipient(
         dest_proc_raw,
         authority_fabric::native::windows::Escrowed(owned),
@@ -1087,6 +1088,7 @@ impl Fabric {
         self.grant_existing(rid, dest, target, 0, rights, payload, escrow_copy)
     }
 
+    #[allow(clippy::too_many_arguments)] // grant metadata is naturally wide
     fn grant_existing(
         &mut self,
         rid: RegionId,
@@ -1729,14 +1731,13 @@ fn preflight_p1(lim: Limits) -> i32 {
     while Instant::now() < deadline {
         fab.step(deadline);
         // Check if cli is gone and service still alive, and escrow cleared
-        if fab.exit_codes.contains_key(&cli_peer) || fab.router.accounting().escrowed == 0 {
-            if fab.router.accounting().unacked_results == 0
-                || fab.router.accounting().pending_transfers == 0
-            {
-                // service should have restored
-                saw_restore = true;
-                break;
-            }
+        if (fab.exit_codes.contains_key(&cli_peer) || fab.router.accounting().escrowed == 0)
+            && (fab.router.accounting().unacked_results == 0
+                || fab.router.accounting().pending_transfers == 0)
+        {
+            // service should have restored
+            saw_restore = true;
+            break;
         }
         if fab.exit_codes.contains_key(&cli) {
             break;
@@ -2336,7 +2337,7 @@ fn shared_ro_transfer_case(lim: Limits) -> i32 {
     // Reader A signals it is done with its view; Host then derives an
     // independent RO authority for reader B over the same backing.
     fab.host_send(setup.ctrl_host_side, 778, b"DROP_RO".to_vec());
-    let mut step_deadline = Instant::now() + Duration::from_secs(2);
+    let step_deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < step_deadline {
         fab.step(step_deadline);
     }

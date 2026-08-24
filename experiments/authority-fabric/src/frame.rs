@@ -10,17 +10,17 @@
 //! ```
 //!
 //! Kinds:
-//! - `Hello        (1)`: u16 magic | u16 version                      child -> host once
-//! - `Data         (2)`: 16B target | u32 corr | u8 natt |
-//!                       natt*(16B tid | 16B id | 16B partner) | payload
-//! - `Close        (3)`: 16B target
+//! - `Hello (1)`: u16 magic | u16 version; child -> host once
+//! - `Data (2)`: 16B target | u32 corr | u8 natt |
+//!   natt*(16B tid | 16B id | 16B partner) | native? | shared? | payload
+//! - `Close (3)`: 16B target
 //! - `ClosedNotify (4)`: u16 count | count*(16B id | u8 cause)
-//! - `Grant        (5)`: 16B ep | 16B partner | 16B tid               host -> peer (offer)
-//! - `Create       (6)`: empty
-//! - `Shutdown     (7)`: empty
-//! - `CreateAck    (8)`: 16B impl | 16B transferable                  host -> peer
-//! - `Error        (9)`: u8 code
-//! - `Xfer        (10)`: u8 sub | 16B tid | optional ids              transfer control
+//! - `Grant (5)`: 16B ep | 16B partner | 16B tid; host -> peer (offer)
+//! - `Create (6)`: empty
+//! - `Shutdown (7)`: empty
+//! - `CreateAck (8)`: 16B impl | 16B transferable; host -> peer
+//! - `Error (9)`: u8 code
+//! - `Xfer (10)`: u8 sub | 16B tid | optional ids; transfer control
 
 use std::io::Read;
 

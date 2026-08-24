@@ -63,7 +63,7 @@ pub fn duplicate_backing(file: &File, writable: bool) -> std::io::Result<File> {
             src,
             GetCurrentProcess(),
             &mut out,
-            access as u32,
+            access,
             0,
             0,
         );
@@ -128,7 +128,7 @@ pub fn map_read_write(file: &File, len: usize) -> std::io::Result<MappedReadWrit
     unsafe {
         let p = MapViewOfFile(
             file.as_raw_handle() as *mut winapi::ctypes::c_void,
-            FILE_MAP_WRITE as u32,
+            FILE_MAP_WRITE,
             0,
             0,
             0,
@@ -147,7 +147,7 @@ pub fn map_read_only(file: &File, len: usize) -> std::io::Result<MappedReadOnly>
     unsafe {
         let p = MapViewOfFile(
             file.as_raw_handle() as *mut winapi::ctypes::c_void,
-            FILE_MAP_READ as u32,
+            FILE_MAP_READ,
             0,
             0,
             0,

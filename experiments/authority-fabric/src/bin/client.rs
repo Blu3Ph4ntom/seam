@@ -710,6 +710,7 @@ fn abort_cycle(rt: &Runtime) -> i32 {
     0
 }
 
+#[allow(clippy::needless_return)] // early-exit arms read clearer than tail exprs
 fn txn_once(rt: &Runtime) -> i32 {
     let mut seen = HashSet::new();
     let root = match claim_ep(rt, &mut seen) {
@@ -952,6 +953,7 @@ fn shared_produce(rt: &Runtime) -> i32 {
     marker!("SHARED_PRODUCER_WRITTEN");
     // Hold writer authority until the fabric shuts down; a Host-sent "GEN2"
     // control payload triggers a synchronized second generation write.
+    #[allow(clippy::while_let_loop)] // Err arm carries the exit
     loop {
         match rt.wait_inbound(Duration::from_secs(600)) {
             Ok(req2) => {
@@ -986,6 +988,7 @@ fn shared_produce(rt: &Runtime) -> i32 {
 
 /// Shared-memory Consumer (client-side second reader): verifies an RO
 /// capability against the expected hash riding the offer, then holds.
+#[allow(clippy::while_let_loop)] // verify work happens inside the Ok arm
 fn shared_verify_client(rt: &Runtime) -> i32 {
     let mut verified = 0usize;
     loop {
@@ -1122,6 +1125,7 @@ fn shared_receive_rw(rt: &Runtime) -> i32 {
     };
     let _ = ctrl.call(hash.to_le_bytes().to_vec(), Duration::from_millis(500));
     marker!("SHARED_PRODUCER_WRITTEN");
+    #[allow(clippy::while_let_loop)] // Err arm carries the exit
     loop {
         match rt.wait_inbound(Duration::from_secs(600)) {
             Ok(_) => {}

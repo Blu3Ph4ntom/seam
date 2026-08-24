@@ -901,7 +901,6 @@ impl Router {
     }
 
     /// Process CLOSE of one end by its current holder.
-
     pub fn on_close(&mut self, from: PeerId, target: EpId) -> Result<RouteOutcome, Poison> {
         if !*self
             .peers
@@ -2101,7 +2100,7 @@ mod tests {
                         if entries.iter().any(|(id, c)| *id == y && *c == Cause::Graceful)
                 )
         }));
-        assert!(r.peers.get(&a).is_none());
+        assert!(!r.peers.contains_key(&a));
     }
 
     #[test]

@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `SharedRegion` in the current scope
+ --> tests/compile-fail/shared_no_clone.rs:7:20
+  |
+7 |     let twin = reg.clone(); //~ ERROR the trait `Clone` is not implemented
+  |                    ^^^^^ method not found in `SharedRegion`
