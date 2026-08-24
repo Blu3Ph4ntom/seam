@@ -147,7 +147,7 @@ fn peer() {
                 // Release mapping + backing fd so repeated iterations cannot
                 // exhaust address space or descriptors (bench hygiene).
                 PEER_PTR.with(|c| {
-                    if let Some((ptr, len)) = c.borrow_mut().take() {
+                    if let Some((ptr, _len)) = c.borrow_mut().take() {
                         #[cfg(windows)]
                         authority_fabric::shared::unmap_view(ptr);
                         #[cfg(unix)]
