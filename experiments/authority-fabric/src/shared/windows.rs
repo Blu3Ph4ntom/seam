@@ -112,6 +112,11 @@ impl<'a> MappedReadOnly<'a> {
     }
 
     /// Raw parts for lifetime-preserving slice construction in mod.rs.
+    /// Bench access to mapping coordinates.
+    pub fn raw_parts_pub(&self) -> (*const u8, usize) {
+        self.raw_parts()
+    }
+
     pub(crate) fn raw_parts(&self) -> (*const u8, usize) {
         (self.ptr, self.len)
     }

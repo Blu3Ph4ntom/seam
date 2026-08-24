@@ -120,6 +120,14 @@ pub fn fnv64(buf: &[u8]) -> u64 {
     h
 }
 
+/// Bench-only: wrap a raw section handle value valid in THIS process.
+#[cfg(windows)]
+pub fn windows_handle_to_file(hval: u64) -> File {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    let owned = unsafe { OwnedHandle::from_raw_handle(hval as *mut std::ffi::c_void) };
+    File::from(owned)
+}
+
 // ----------------------------------------------------------------- rights --
 
 /// Minimal explicit rights model. No giant lattice.
