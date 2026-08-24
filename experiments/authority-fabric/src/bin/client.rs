@@ -1036,8 +1036,6 @@ fn shared_reject_call(rt: &Runtime) -> i32 {
             return 1;
         }
     };
-    // Let the Host's initial grant land before requesting.
-    std::thread::sleep(Duration::from_millis(500));
     match root.call(
         proto::encode_root_request(RootRequest::OpenCounter),
         CALL_TIMEOUT,
@@ -1079,9 +1077,6 @@ fn shared_receive_rw(rt: &Runtime) -> i32 {
             return 1;
         }
     };
-    // Let the Host's initial grant land before requesting (deterministic
-    // ordering without adding a barrier protocol).
-    std::thread::sleep(Duration::from_millis(500));
     let res = match root.call(
         proto::encode_root_request(RootRequest::OpenCounter),
         CALL_TIMEOUT,

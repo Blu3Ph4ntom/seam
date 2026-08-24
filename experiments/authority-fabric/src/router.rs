@@ -709,6 +709,11 @@ impl Router {
         self.regions.size_of(rid)
     }
 
+    /// Current writable holder of a region (authority introspection).
+    pub fn region_writable_holder(&self, rid: RegionId) -> Option<PeerId> {
+        self.regions.writable_holder(rid)
+    }
+
     /// Host-initiated grant of a region capability to `dest`. The offer Data
     /// rides the generic transaction; on Accept it commits exactly like a
     /// peer-to-peer transfer. `rights` must be authorized against the
@@ -723,6 +728,11 @@ impl Router {
     ) -> Result<(TransferId, RouteOutcome), Poison> {
         if !self.regions.region_exists(rid) {
             return Err(Poison("unknown region id"));
+        }
+        // The Host cannot hold a wire conversation with itself: granting to
+        // the sentinel would mint an unwirable authority record.
+        if dest == HOST_PEER {
+            return Err(Poison("cannot grant to host sentinel"));
         }
         // One writer ever: granting RW requires the Host to currently hold it.
         if rights == Rights::ReadWrite && self.regions.writable_holder(rid) != Some(HOST_PEER) {
@@ -1793,6 +1803,95 @@ mod tests {
         // Reader count unchanged by a move (b lost it, a gained it).
         assert_eq!(r.region_accounting().readonly_authorities, 1);
         r.on_xfer(b, XferMsg::ResultAck { tid }).unwrap();
+    }
+
+    /// G6: the grant->materialize transition must be deterministic. 100
+    /// consecutive grant/commit/ack cycles with zero timing dependence; the
+    /// writer holder flips Host-sentinel -> peer -> (next cycle) sentinel.
+    #[test]
+    fn hundred_grant_materialize_cycles_deterministic() {
+        let lim = Limits::default();
+        let (mut r, a, b, x, y) = primed();
+        let rid = region();
+        r.region_create(rid, 4096, &lim).unwrap();
+        // Establish: Host -> a (the grant/materialize/ack conjunction).
+        let (tid0, _) = r
+            .host_grant_region(a, x, 0, rid, Rights::ReadWrite)
+            .unwrap();
+        r.on_xfer(a, XferMsg::Accept { tid: tid0 }).unwrap();
+        r.on_xfer(a, XferMsg::ResultAck { tid: tid0 }).unwrap();
+
+        // 100 deterministic writer flips through the peer-staging path:
+        // every cycle is offer -> accept -> commit -> materialize-ack with
+        // zero timing dependence.
+        for i in 0..100u32 {
+            let (from, to, from_ep) = if i % 2 == 0 { (a, b, x) } else { (b, a, y) };
+            let oc = r
+                .on_data(from, shared_data(from_ep, rid, 1))
+                .unwrap_or_else(|e| panic!("cycle {i} stage: {e:?}"));
+            assert_eq!(r.accounting().shared_pending, 1);
+            assert_eq!(r.region_writable_holder(rid), Some(from));
+            let tid = *r.shared_pending.keys().next().expect("pending");
+            r.on_xfer(to, XferMsg::Accept { tid }).unwrap();
+            assert_eq!(r.region_writable_holder(rid), Some(to), "cycle {i}: holder");
+            r.on_xfer(from, XferMsg::ResultAck { tid }).unwrap();
+            assert_eq!(r.accounting().shared_unacked, 0, "cycle {i}");
+            assert_eq!(r.accounting().shared_pending, 0, "cycle {i}");
+        }
+    }
+
+    /// G8: the Host sentinel is not claimable. Peers cannot be granted as
+    /// the sentinel, cannot stage offers from it, and host-only shared
+    /// frames sent BY a peer are poisoned like their native twins.
+    #[test]
+    fn host_sentinel_cannot_be_impersonated() {
+        let lim = Limits::default();
+        let (mut r, a, b, x, y) = primed();
+        let rid = region();
+        r.region_create(rid, 4096, &lim).unwrap();
+
+        // Granting TO the sentinel is nonsense and rejected outright.
+        assert!(r
+            .host_grant_region(crate::router::HOST_PEER, x, 0, rid, Rights::ReadWrite)
+            .is_err());
+
+        // A peer staging an offer is bound by its wire peer id: even a
+        // hand-crafted SharedRec with sender=HOST would never enter through
+        // on_data, whose `from` is connection-assigned. Prove the claim
+        // validation rejects a peer offering when the table records HOST:
+        let err = r.on_data(a, shared_data(x, rid, 1)).unwrap_err();
+        assert_eq!(err.0, "shared rights claim denied");
+
+        // Peer-sent SharedCommit / SharedAbort are host-only frames.
+        let tid = crate::id::fresh_transfer_id(&AnyTid);
+        let p1 = r.on_xfer(
+            b,
+            XferMsg::SharedCommit {
+                tid,
+                rid,
+                rights: 1,
+                size: 4096,
+                handle_value: 5,
+            },
+        );
+        assert_eq!(p1.unwrap_err().0, "peer sent host-only xfer");
+        let p2 = r.on_xfer(
+            b,
+            XferMsg::SharedAbort {
+                tid,
+                rid,
+                handle_value: 5,
+            },
+        );
+        assert_eq!(p2.unwrap_err().0, "peer sent host-only xfer");
+
+        // Sanity after hostility: table untouched.
+        assert_eq!(r.region_accounting().writable_authorities, 1);
+        assert_eq!(
+            r.region_writable_holder(rid),
+            Some(crate::router::HOST_PEER)
+        );
+        let _ = y;
     }
 
     #[test]

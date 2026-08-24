@@ -49,12 +49,19 @@ fn main() {
     let mut restored_q: Vec<Endpoint> = Vec::new();
     let mut restored_q_native: Vec<NativeFile> = Vec::new();
     let mut restored_q_shared: Vec<SharedRegion> = Vec::new();
+    // Requests that arrived before their held capability did. Event-driven
+    // ordering: they are replayed the moment the hold lands — no polling.
+    let mut deferred_reqs: Vec<Inbound> = Vec::new();
 
     loop {
-        let req: Inbound = match rt.wait_inbound(Duration::from_secs(600)) {
-            Ok(r) => r,
-            Err(FabError::Timeout) => continue,
-            Err(_) => break, // fabric gone (orderly or death)
+        let req: Inbound = if !deferred_reqs.is_empty() && !restored_q_shared.is_empty() {
+            deferred_reqs.remove(0)
+        } else {
+            match rt.wait_inbound(Duration::from_secs(600)) {
+                Ok(r) => r,
+                Err(FabError::Timeout) => continue,
+                Err(_) => break, // fabric gone (orderly or death)
+            }
         };
         if mode == "hold" {
             continue;
@@ -91,6 +98,19 @@ fn main() {
             }
             continue;
         }
+        // A request that outran its held capability: park it event-wise; the
+        // loop head replays it as soon as the hold arrives.
+        if mode == "shared_wait_hold"
+            && req.local == root_id
+            && restored_q_shared.is_empty()
+            && matches!(
+                proto::decode_root_request(&req.payload),
+                Ok(RootRequest::OpenCounter)
+            )
+        {
+            deferred_reqs.push(req);
+            continue;
+        }
         if req.local == root_id {
             match proto::decode_root_request(&req.payload) {
                 Ok(RootRequest::Ping) => {
@@ -104,16 +124,6 @@ fn main() {
                     );
                 }
                 Ok(RootRequest::OpenCounter) => {
-                    if mode == "shared_wait_hold" {
-                        // Deterministic ordering: wait until the Host-granted
-                        // region has landed before serving the request.
-                        for _ in 0..1500 {
-                            if !restored_q_shared.is_empty() {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(20));
-                        }
-                    }
                     if mode == "shared_fwd" || !restored_q_shared.is_empty() {
                         // Stage a held shared region through the generic
                         // transaction (peer-sender path). On pre-commit abort

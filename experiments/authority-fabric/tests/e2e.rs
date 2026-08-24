@@ -428,6 +428,19 @@ fn shared_ro_transfer() {
     }
 }
 
+/// G6 race regression: the grant->materialize->staged-reply path must be
+/// deterministic with ZERO artificial delays. Ten back-to-back full-process
+/// runs of the scenario that used to require a 500 ms client sleep.
+#[test]
+fn shared_race_loop() {
+    for i in 0..10 {
+        let out = run_host(&["shared_rw_transfer"], &[], Duration::from_secs(90));
+        let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+        assert_eq!(out.status.code(), Some(0), "race loop iter {i}\n{combined}");
+        assert_contains(&combined, "SHARED_RW_TRANSFER_OK", "race loop");
+    }
+}
+
 #[test]
 fn shared_multi_reader() {
     let out = run_host(&["shared_multi_reader"], &[], Duration::from_secs(120));
