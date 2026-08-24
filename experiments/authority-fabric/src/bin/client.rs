@@ -891,7 +891,11 @@ fn adopt_native_lane(_rt: &Runtime) {}
 /// capability is held until fabric shutdown (writer authority must stay
 /// alive for RegionTable consistency).
 fn shared_produce(rt: &Runtime) -> i32 {
-    const REGION_SIZE: usize = 4 * 1024 * 1024;
+    let region_size: usize = std::env::var("SEAM_REGION_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| (mb * 1024 * 1024) as usize)
+        .unwrap_or(4 * 1024 * 1024);
     let seed: u64 = 0x1234_5678_9abc_def0;
     let req = match rt.wait_inbound(Duration::from_secs(30)) {
         Ok(r) => r,
@@ -908,7 +912,7 @@ fn shared_produce(rt: &Runtime) -> i32 {
         }
     };
     if reg.rights() != authority_fabric::shared::Rights::ReadWrite
-        || reg.size() as usize != REGION_SIZE
+        || reg.size() as usize != region_size
     {
         eprintln!(
             "CLIENT_SHARED_FAIL rights={:?} size={}",
@@ -1064,7 +1068,11 @@ fn shared_reject_call(rt: &Runtime) -> i32 {
 /// the writable region inside the reply, proves it is genuinely writable and
 /// reports the new hash to the Host over the control channel.
 fn shared_receive_rw(rt: &Runtime) -> i32 {
-    const REGION_SIZE: usize = 4 * 1024 * 1024;
+    let region_size: usize = std::env::var("SEAM_REGION_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| (mb * 1024 * 1024) as usize)
+        .unwrap_or(4 * 1024 * 1024);
     let mut seen = std::collections::HashSet::new();
     let root = match claim_ep(rt, &mut seen) {
         Ok(r) => r,
@@ -1098,7 +1106,7 @@ fn shared_receive_rw(rt: &Runtime) -> i32 {
         }
     };
     if reg.rights() != authority_fabric::shared::Rights::ReadWrite
-        || reg.size() as usize != REGION_SIZE
+        || reg.size() as usize != region_size
     {
         eprintln!(
             "CLIENT_SHARED_FAIL rights={:?} size={}",

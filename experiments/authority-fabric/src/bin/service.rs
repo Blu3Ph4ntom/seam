@@ -77,7 +77,12 @@ fn main() {
                 let got = reg
                     .map_read_only()
                     .map(|v| authority_fabric::shared::fnv64(v.as_slice()));
-                let size_ok = reg.size() == 4 * 1024 * 1024;
+                let expected_size: u64 = std::env::var("SEAM_REGION_SIZE_MB")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|mb| mb * 1024 * 1024)
+                    .unwrap_or(4 * 1024 * 1024);
+                let size_ok = reg.size() == expected_size;
                 match got {
                     Ok(h) if h == expected && size_ok => {
                         marker!(

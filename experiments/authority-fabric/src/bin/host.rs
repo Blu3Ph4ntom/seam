@@ -2099,7 +2099,12 @@ fn native_stress_case(lim: Limits) -> i32 {
 /// shared_derive: derivation is NOT a move. Producer keeps RW across two
 /// synchronized generations while the Consumer re-verifies each one.
 fn shared_derive_case(lim: Limits) -> i32 {
-    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    // Env-overridable for large-region gates (4/64/256 MiB cross-process).
+    let region_size: u64 = std::env::var("SEAM_REGION_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(4 * 1024 * 1024);
     let mut fab = Fabric::new(lim);
     let setup = match bootstrap(
         &mut fab,
@@ -2113,7 +2118,7 @@ fn shared_derive_case(lim: Limits) -> i32 {
         setup.cli,
         setup.ctrl_client_side,
         0,
-        REGION_SIZE,
+        region_size,
         Rights::ReadWrite,
         vec![],
     ) {
@@ -2201,7 +2206,12 @@ fn leak_check(fab: &Fabric) -> Option<String> {
 /// shared_rw_transfer: the writable capability moves Producer->Consumer via
 /// the PEER-SENDER staging path (service replies with a held region).
 fn shared_rw_transfer_case(lim: Limits) -> i32 {
-    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    // Env-overridable for large-region gates (4/64/256 MiB cross-process).
+    let region_size: u64 = std::env::var("SEAM_REGION_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(4 * 1024 * 1024);
     let mut fab = Fabric::new(lim);
     let setup = match bootstrap(
         &mut fab,
@@ -2217,7 +2227,7 @@ fn shared_rw_transfer_case(lim: Limits) -> i32 {
             setup.svc,
             setup.root_service_side,
             0,
-            REGION_SIZE,
+            region_size,
             Rights::ReadWrite,
             vec![],
         )
@@ -2252,7 +2262,12 @@ fn shared_rw_transfer_case(lim: Limits) -> i32 {
 /// to the sender with identical rights and the restored writer proves it can
 /// still map writable and write.
 fn shared_rw_abort_case(lim: Limits) -> i32 {
-    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    // Env-overridable for large-region gates (4/64/256 MiB cross-process).
+    let region_size: u64 = std::env::var("SEAM_REGION_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(4 * 1024 * 1024);
     let mut fab = Fabric::new(lim);
     let setup = match bootstrap(
         &mut fab,
@@ -2270,7 +2285,7 @@ fn shared_rw_abort_case(lim: Limits) -> i32 {
             setup.svc,
             setup.root_service_side,
             0,
-            REGION_SIZE,
+            region_size,
             Rights::ReadWrite,
             vec![],
         )
@@ -2313,7 +2328,12 @@ fn shared_rw_abort_case(lim: Limits) -> i32 {
 /// the second or the writer. (RegionTable rows persist until peer death —
 /// documented RUN 005B limitation; no revocation is claimed.)
 fn shared_ro_transfer_case(lim: Limits) -> i32 {
-    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    // Env-overridable for large-region gates (4/64/256 MiB cross-process).
+    let region_size: u64 = std::env::var("SEAM_REGION_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(4 * 1024 * 1024);
     let mut fab = Fabric::new(lim);
     let setup = match bootstrap(
         &mut fab,
@@ -2332,7 +2352,7 @@ fn shared_ro_transfer_case(lim: Limits) -> i32 {
         setup.cli,
         setup.ctrl_client_side,
         0,
-        REGION_SIZE,
+        region_size,
         Rights::ReadWrite,
         vec![],
     ) {
@@ -2379,7 +2399,12 @@ fn shared_ro_transfer_case(lim: Limits) -> i32 {
 /// shared_multi_reader: one writer, TWO independent reader processes, both
 /// verifying generation 1 then generation 2 of the same pages.
 fn shared_multi_reader_case(lim: Limits) -> i32 {
-    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    // Env-overridable for large-region gates (4/64/256 MiB cross-process).
+    let region_size: u64 = std::env::var("SEAM_REGION_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(4 * 1024 * 1024);
     let mut fab = Fabric::new(lim);
     let setup = match bootstrap(
         &mut fab,
@@ -2399,7 +2424,7 @@ fn shared_multi_reader_case(lim: Limits) -> i32 {
         setup.cli,
         setup.ctrl_client_side,
         0,
-        REGION_SIZE,
+        region_size,
         Rights::ReadWrite,
         vec![],
     ) {
@@ -2468,7 +2493,12 @@ fn shared_multi_reader_case(lim: Limits) -> i32 {
 /// phase=pre_accept : client killed before ACCEPT  -> restore to sender.
 /// phase=post_commit: client killed after commit   -> finality, no restore.
 fn shared_rw_death_case(lim: Limits, phase: &str) -> i32 {
-    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    // Env-overridable for large-region gates (4/64/256 MiB cross-process).
+    let region_size: u64 = std::env::var("SEAM_REGION_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(4 * 1024 * 1024);
     let dir = std::env::temp_dir().join(format!("seam-rwdeath-{phase}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let dir_s = dir.to_string_lossy().to_string();
@@ -2494,7 +2524,7 @@ fn shared_rw_death_case(lim: Limits, phase: &str) -> i32 {
             setup.svc,
             setup.root_service_side,
             0,
-            REGION_SIZE,
+            region_size,
             Rights::ReadWrite,
             vec![],
         )
@@ -2593,7 +2623,12 @@ fn shared_rw_death_case(lim: Limits, phase: &str) -> i32 {
 }
 
 fn shared_happy_case(lim: Limits) -> i32 {
-    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    // Env-overridable for large-region gates (4/64/256 MiB cross-process).
+    let region_size: u64 = std::env::var("SEAM_REGION_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(4 * 1024 * 1024);
     let mut fab = Fabric::new(lim);
     let setup = match bootstrap(
         &mut fab,
@@ -2608,7 +2643,7 @@ fn shared_happy_case(lim: Limits) -> i32 {
         setup.cli,
         setup.ctrl_client_side,
         0,
-        REGION_SIZE,
+        region_size,
         Rights::ReadWrite,
         vec![],
     ) {
