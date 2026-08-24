@@ -44,6 +44,8 @@ fn table(name: &str, rows: &[(String, usize, u128, u128)], thr: bool) {
 thread_local! {
     static PEER_PTR: std::cell::RefCell<Option<(*const u8, usize)>> =
         const { std::cell::RefCell::new(None) };
+    static PEER_FILES: std::cell::RefCell<Vec<std::fs::File>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static CUR_REGION: std::cell::RefCell<Option<authority_fabric::shared::SharedRegion>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -90,8 +92,8 @@ fn peer() {
                     let f = authority_fabric::shared::windows_handle_to_file(hv);
                     let v = authority_fabric::shared::map_read_only(&f, sz).unwrap();
                     let parts = v.raw_parts_pub();
-                    std::mem::forget(v); // process-lifetime mapping
-                    std::mem::forget(f); // section stays alive for the view
+                    std::mem::forget(v); // unmapped via UNMAP control message
+                    PEER_FILES.with(|g| g.borrow_mut().push(f));
                     PEER_PTR.with(|c| *c.borrow_mut() = Some(parts));
                 }
                 #[cfg(not(windows))]
@@ -111,8 +113,8 @@ fn peer() {
                     let f = std::fs::OpenOptions::new().read(true).open(path).unwrap();
                     let v = authority_fabric::shared::map_read_only(&f, sz).unwrap();
                     let parts = v.raw_parts_pub();
-                    std::mem::forget(v);
-                    std::mem::forget(f);
+                    std::mem::forget(v); // unmapped via UNMAP control message
+                    PEER_FILES.with(|g| g.borrow_mut().push(f));
                     PEER_PTR.with(|c| *c.borrow_mut() = Some(parts));
                 }
                 #[cfg(not(unix))]
@@ -138,6 +140,21 @@ fn peer() {
                 buf.resize(n, 0);
                 r.read_exact(&mut buf).unwrap();
                 std::hint::black_box(touch(&buf));
+                out.write_all(b"ACK\n").unwrap();
+                out.flush().unwrap();
+            }
+            "UNMAP" => {
+                // Release mapping + backing fd so repeated iterations cannot
+                // exhaust address space or descriptors (bench hygiene).
+                PEER_PTR.with(|c| {
+                    if let Some((ptr, len)) = c.borrow_mut().take() {
+                        #[cfg(windows)]
+                        authority_fabric::shared::unmap_view(ptr);
+                        #[cfg(unix)]
+                        authority_fabric::shared::unmap_view(ptr, len);
+                    }
+                });
+                PEER_FILES.with(|g| g.borrow_mut().clear());
                 out.write_all(b"ACK\n").unwrap();
                 out.flush().unwrap();
             }
@@ -207,7 +224,10 @@ fn establish(p: &mut Peer, size: usize) {
     p.line("READY");
 }
 
-fn release(_p: &mut Peer) {
+fn release(p: &mut Peer) {
+    writeln!(p.w, "UNMAP").unwrap();
+    p.w.flush().unwrap();
+    p.ack();
     CUR_REGION.with(|c| *c.borrow_mut() = None); // drops backing+view session
 }
 

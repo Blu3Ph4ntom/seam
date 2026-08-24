@@ -22,12 +22,12 @@ mod windows;
 
 #[cfg(unix)]
 pub use unix::{
-    create_backing, duplicate_backing, map_read_only, map_read_write, MappedReadOnly,
+    create_backing, duplicate_backing, map_read_only, map_read_write, unmap_view, MappedReadOnly,
     MappedReadWrite,
 };
 #[cfg(windows)]
 pub use windows::{
-    create_backing, duplicate_backing, map_read_only, map_read_write, MappedReadOnly,
+    create_backing, duplicate_backing, map_read_only, map_read_write, unmap_view, MappedReadOnly,
     MappedReadWrite, SECTION_RO_ACCESS, SECTION_RW_ACCESS,
 };
 

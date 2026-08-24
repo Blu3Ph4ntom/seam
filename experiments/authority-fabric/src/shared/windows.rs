@@ -180,3 +180,12 @@ pub fn map_read_only<'a>(file: &File, len: usize) -> std::io::Result<MappedReadO
         })
     }
 }
+
+/// Bench support: unmap a raw view previously obtained via raw_parts_pub.
+pub fn unmap_view(ptr: *const u8) {
+    // SAFETY: pointer came from MapViewOfFile for a live mapping owned by
+    // the caller's leaked view wrapper.
+    unsafe {
+        UnmapViewOfFile(ptr as *mut winapi::ctypes::c_void);
+    }
+}

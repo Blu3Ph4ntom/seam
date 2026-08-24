@@ -183,3 +183,11 @@ mod tests {
         assert!(res.is_err(), "stale-fd reopen must fail closed");
     }
 }
+
+/// Bench support: unmap a raw view previously obtained via raw_parts_pub.
+pub fn unmap_view(ptr: *const u8, len: usize) {
+    // SAFETY: pointer/length came from mmap for a live caller-owned view.
+    unsafe {
+        let _ = rustix::mm::munmap(ptr as *mut _, len);
+    }
+}
