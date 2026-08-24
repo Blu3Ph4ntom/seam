@@ -5,6 +5,8 @@
 //! handed to the peer; copy baseline uses the same kernel pipe as transport.
 
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
