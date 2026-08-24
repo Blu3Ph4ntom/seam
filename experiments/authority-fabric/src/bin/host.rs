@@ -819,10 +819,20 @@ impl Fabric {
                                         authority_fabric::native::ResourceId(s_rid.0),
                                         authority_fabric::native::unix::Escrowed(owned),
                                     ) {
-                                        Ok(()) => marker!(
-                                            "HOST_SHARED_RESTORED_UNIX tid={}",
-                                            abort_tid.0[0]
-                                        ),
+                                        Ok(()) => {
+                                            // Sender needs the typed frame so
+                                            // its runtime acknowledges the
+                                            // terminal outcome.
+                                            frame = Frame::Xfer(XferMsg::SharedAbort {
+                                                tid: abort_tid,
+                                                rid: s_rid,
+                                                handle_value: 0,
+                                            });
+                                            marker!(
+                                                "HOST_SHARED_RESTORED_UNIX tid={}",
+                                                abort_tid.0[0]
+                                            );
+                                        }
                                         Err(e) => marker!(
                                             "HOST_SHARED_RESTORE_FAILED tid={} err={}",
                                             abort_tid.0[0],
