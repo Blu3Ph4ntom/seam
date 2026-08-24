@@ -26,27 +26,26 @@ fn perr(m: &'static str) -> std::io::Error {
 }
 
 /// Encode a record. `body.len()` must be <= MAX_DATA for KIND_DATA.
+/// The trailing newline is protocol framing (line-delimited headers), so the
+/// lint against `write!`-with-newline is intentionally suppressed here.
+#[allow(clippy::write_literal)]
 pub fn encode(w: &mut dyn Write, rec: &Rec) -> std::io::Result<()> {
     match rec {
         Rec::Data(b) => {
             if b.len() > MAX_DATA {
                 return Err(perr("data exceeds bound"));
             }
-            let _ = write!(w, "{} {}\n", KIND_DATA, b.len())?;
+            write!(w, "{} {}\n", KIND_DATA, b.len())?;
             w.write_all(b)?;
         }
-        Rec::Close => {
-            let _ = write!(w, "{} 0\n", KIND_CLOSE);
-        }
+        Rec::Close => write!(w, "{} 0\n", KIND_CLOSE)?,
         Rec::Credit(k) => {
             if *k > MAX_DATA {
                 return Err(perr("credit exceeds bound"));
             }
-            let _ = write!(w, "{} {}\n", KIND_CREDIT, k)?;
+            write!(w, "{} {}\n", KIND_CREDIT, k)?;
         }
-        Rec::ConsumerClose => {
-            let _ = write!(w, "{} 0\n", KIND_CONSUMER_CLOSE);
-        }
+        Rec::ConsumerClose => write!(w, "{} 0\n", KIND_CONSUMER_CLOSE)?,
     }
     w.flush()
 }
