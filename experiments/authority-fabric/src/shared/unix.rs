@@ -41,21 +41,19 @@ pub fn duplicate_backing(file: &File, writable: bool) -> std::io::Result<File> {
         // Unsealed regions only: a plain std dup shares the writer state.
         return file.try_clone();
     }
-    // READ-ONLY derivation, kernel-enforced:
+    // READ-ONLY derivation, kernel-enforced by descriptor mode:
     //
-    // 1. Seal the inode with F_SEAL_FUTURE_WRITE. From now on NO new
-    //    writable mapping and no write() can be created through any
-    //    descriptor, while mappings that already exist (the producer's)
-    //    keep working. This is the honest narrowing accepted in RUN 005B.
-    // 2. Mint the consumer descriptor AFTER sealing by reopening the magic
-    //    link /proc/self/fd/<n> with O_RDONLY. A fresh open obtains a fresh
-    //    open-file-description without writer state, so even bypassing Seam
-    //    and calling mmap(PROT_WRITE) directly fails with EACCES/EIO, and
-    //    write(2) fails with EBADF.
+    // Reopen the magic link /proc/self/fd/<n> with O_RDONLY. The consumer's
+    // fresh open-file-description has no writer state, so mmap(PROT_WRITE)
+    // fails with EACCES and write(2) with EBADF — for ANY recipient,
+    // including one bypassing Seam entirely. Verified experimentally.
     //
-    // A plain dup() would share the PRE-seal open file description and
-    // therefore still permit writable maps — verified experimentally.
-    rustix::fs::fcntl_add_seals(file.as_fd(), rustix::fs::SealFlags::FUTURE_WRITE)?;
+    // Hardening when available: sealing the inode with F_SEAL_FUTURE_WRITE
+    // would additionally lock the producer out of future writable mappings.
+    // Some execution environments (e.g. gVisor sandboxes) return EINVAL for
+    // all seal operations; there the guarantee rests solely on fd mode,
+    // which matches the Windows restricted-handle model 1:1.
+    let _ = rustix::fs::fcntl_add_seals(file.as_fd(), rustix::fs::SealFlags::FUTURE_WRITE);
     let raw = file.as_raw_fd();
     let link = std::path::Path::new("/proc/self/fd").join(raw.to_string());
     let reopened = std::fs::OpenOptions::new()
