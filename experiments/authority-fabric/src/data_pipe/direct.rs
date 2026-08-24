@@ -32,17 +32,21 @@ pub fn encode(w: &mut dyn Write, rec: &Rec) -> std::io::Result<()> {
             if b.len() > MAX_DATA {
                 return Err(perr("data exceeds bound"));
             }
-            write!(w, "{} {}\n", KIND_DATA, b.len())?;
+            let _ = write!(w, "{} {}\n", KIND_DATA, b.len())?;
             w.write_all(b)?;
         }
-        Rec::Close => write!(w, "{} 0\n", KIND_CLOSE)?,
+        Rec::Close => {
+            let _ = write!(w, "{} 0\n", KIND_CLOSE);
+        }
         Rec::Credit(k) => {
             if *k > MAX_DATA {
                 return Err(perr("credit exceeds bound"));
             }
-            write!(w, "{} {}\n", KIND_CREDIT, k)?;
+            let _ = write!(w, "{} {}\n", KIND_CREDIT, k)?;
         }
-        Rec::ConsumerClose => write!(w, "{} 0\n", KIND_CONSUMER_CLOSE)?,
+        Rec::ConsumerClose => {
+            let _ = write!(w, "{} 0\n", KIND_CONSUMER_CLOSE);
+        }
     }
     w.flush()
 }
