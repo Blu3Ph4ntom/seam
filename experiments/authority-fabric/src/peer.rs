@@ -854,6 +854,18 @@ impl RuntimeInner {
                 {
                     let mut st = self.st.lock().unwrap();
                     st.pending_offers.remove(&tid);
+                    // Aborted transaction: any parked offer metadata and any
+                    // already-arrived backing must die together. A late lane
+                    // delivery after this point finds no join state and its
+                    // kernel object closes via Drop (T6).
+                    if let Some(_p) = st.shared_parked.remove(&tid) {
+                        let _file = st.shared_recv.remove(&tid);
+                        st.shared_commit_meta.remove(&tid);
+                    }
+                    if st.native_parked.remove(&tid).is_some() {
+                        let _file = st.native_recv.remove(&tid);
+                        st.native_commit_seen.remove(&tid);
+                    }
                     if let Some(slot) = st.xfer_wait.remove(&tid) {
                         resolve_slot(&slot, XferLocal::Aborted);
                         ack = true;
@@ -2100,5 +2112,84 @@ impl Runtime {
         let _ = self.shared.push_out(Frame::Shutdown);
         std::thread::sleep(Duration::from_millis(40));
         self.shared.go_terminal_pub(Cause::Graceful);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::{DataInner, SharedAttachment};
+    use crate::id::TransferId;
+    use crate::limits::Limits;
+    use crate::shared::{RegionId, Rights};
+
+    fn offer_frame(tid: TransferId, rid: RegionId) -> Frame {
+        Frame::Data(DataInner {
+            target: EpId([9; 16]),
+            corr: 0,
+            attachments: vec![],
+            payload: vec![b'm'],
+            native: None,
+            shared: Some(SharedAttachment {
+                tid,
+                rid,
+                rights: Rights::ReadOnly.wire_byte(),
+                handle_value: 0,
+            }),
+        })
+    }
+
+    /// T5/T6: aborting an offered shared transaction destroys the recipient's
+    /// join state, so a late lane delivery cannot pair with anything and its
+    /// backing closes without minting authority.
+    #[test]
+    fn abort_clears_shared_join_state() {
+        let sh = RuntimeInner::__for_tests(Limits::default());
+        let tid = TransferId([7; 16]);
+        let rid = RegionId([8; 16]);
+        assert!(sh.process(offer_frame(tid, rid)));
+        {
+            let st = sh.st.lock().unwrap();
+            assert!(st.shared_parked.contains_key(&tid));
+        }
+        assert!(sh.process(Frame::Xfer(XferMsg::Abort { tid })));
+        let st = sh.st.lock().unwrap();
+        assert!(!st.shared_parked.contains_key(&tid));
+        assert!(!st.shared_recv.contains_key(&tid));
+        assert!(!st.shared_commit_meta.contains_key(&tid));
+        // Native twin shares the same fate.
+        assert!(st.native_parked.is_empty());
+        assert!(st.native_recv.is_empty());
+    }
+
+    /// A second COMMIT for an already-materialized transaction must not mint
+    /// a second authority: the first join consumed the parked metadata.
+    #[cfg(windows)]
+    #[test]
+    fn duplicate_commit_mints_one_authority() {
+        let sh = RuntimeInner::__for_tests(Limits::default());
+        let tid = TransferId([3; 16]);
+        let rid = RegionId([4; 16]);
+        assert!(sh.process(offer_frame(tid, rid)));
+        let commit = |hv| {
+            Frame::Xfer(XferMsg::SharedCommit {
+                tid,
+                rid,
+                rights: Rights::ReadOnly.wire_byte(),
+                size: 4096,
+                handle_value: hv,
+            })
+        };
+        assert!(sh.process(commit(0x1111)));
+        assert!(sh.process(commit(0x2222)));
+        // Exactly one inbound capability materialized.
+        let first = sh
+            .inbound
+            .pop_deadline(Instant::now() + Duration::from_secs(1));
+        assert!(first.is_ok(), "first delivery expected");
+        let second = sh
+            .inbound
+            .pop_deadline(Instant::now() + Duration::from_millis(50));
+        assert!(second.is_err(), "no duplicate authority");
     }
 }
