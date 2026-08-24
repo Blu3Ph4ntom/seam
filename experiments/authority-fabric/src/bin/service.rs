@@ -63,26 +63,31 @@ fn main() {
         // the expected 8-byte hash riding the offer metadata. Verify by
         // hashing the mapped shared pages (payload bytes never touch frames).
         if let Some(reg) = req.received_shared {
-            let expected = if req.payload.len() == 8 {
-                u64::from_le_bytes(req.payload[..8].try_into().unwrap())
+            if req.payload.len() == 8 {
+                // Verification grant: hash mapped pages against the expected
+                // hash that rode the offer metadata.
+                let expected = u64::from_le_bytes(req.payload[..8].try_into().unwrap());
+                let got = reg
+                    .map_read_only()
+                    .map(|v| authority_fabric::shared::fnv64(v.as_slice()));
+                let size_ok = reg.size() == 4 * 1024 * 1024;
+                match got {
+                    Ok(h) if h == expected && size_ok => {
+                        marker!(
+                            "SVC_SHARED_VERIFIED ro={} size={}",
+                            reg.rights() == authority_fabric::shared::Rights::ReadOnly,
+                            reg.size()
+                        );
+                    }
+                    other => {
+                        marker!("SVC_SHARED_VERIFY_FAIL {:?}", other.map(|h| (h, size_ok)));
+                    }
+                }
             } else {
-                u64::MAX
-            };
-            let got = reg
-                .map_read_only()
-                .map(|v| authority_fabric::shared::fnv64(v.as_slice()));
-            let size_ok = reg.size() == 4 * 1024 * 1024;
-            match got {
-                Ok(h) if h == expected && size_ok => {
-                    marker!(
-                        "SVC_SHARED_VERIFIED ro={} size={}",
-                        reg.rights() == authority_fabric::shared::Rights::ReadOnly,
-                        reg.size()
-                    );
-                }
-                other => {
-                    marker!("SVC_SHARED_VERIFY_FAIL {:?}", other.map(|h| (h, size_ok)));
-                }
+                // Hold request (empty payload): keep the capability alive for
+                // a later staged reply through the generic transaction.
+                restored_q_shared.push(reg);
+                marker!("SVC_SHARED_HELD n={}", restored_q_shared.len());
             }
             continue;
         }
@@ -99,6 +104,59 @@ fn main() {
                     );
                 }
                 Ok(RootRequest::OpenCounter) => {
+                    if mode == "shared_wait_hold" {
+                        // Deterministic ordering: wait until the Host-granted
+                        // region has landed before serving the request.
+                        for _ in 0..1500 {
+                            if !restored_q_shared.is_empty() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                    if mode == "shared_fwd" || !restored_q_shared.is_empty() {
+                        // Stage a held shared region through the generic
+                        // transaction (peer-sender path). On pre-commit abort
+                        // prove the restored writer is still writable.
+                        if let Some(reg) = restored_q_shared.pop() {
+                            match rt.reply_with_shared(
+                                &req,
+                                proto::encode_root_response(RootResponse::Counter),
+                                Some(reg),
+                            ) {
+                                Ok(TransferOutcome::Committed) => {}
+                                Ok(TransferOutcome::SharedAborted(mut back)) => {
+                                    marker!("SVC_SHARED_RESTORED n={}", back.len());
+                                    for mut r in back.drain(..) {
+                                        // Prove the restored writer is genuinely
+                                        // writable: write a probe through a RW
+                                        // view, read it back through an RO view.
+                                        let seed: u64 = 0xfeed_face_dead_beef;
+                                        let mut probe = [0u8; 64];
+                                        authority_fabric::shared::fill_pattern(&mut probe, seed);
+                                        let ok = (|| -> std::io::Result<bool> {
+                                            {
+                                                let mut v = r.map_read_write()?;
+                                                v.as_mut_slice()[..64].copy_from_slice(&probe);
+                                            }
+                                            let v = r.map_read_only()?;
+                                            Ok(v.as_slice()[..64] == probe)
+                                        })()
+                                        .unwrap_or(false);
+                                        if ok {
+                                            marker!("SVC_SHARED_RESTORED_WRITABLE_OK");
+                                        } else {
+                                            marker!("SVC_SHARED_RESTORED_WRITE_FAIL");
+                                        }
+                                        restored_q_shared.push(r);
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => eprintln!("SERVICE_FAIL shared reply: {e}"),
+                            }
+                            continue;
+                        }
+                    }
                     if mode == "native" || !restored_q_native.is_empty() {
                         // Retransfer a restored native file first (proves the
                         // returned resource is usable and retransferrable);

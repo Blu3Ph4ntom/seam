@@ -63,6 +63,9 @@ fn main() {
         "native_abort" => native_abort(&rt),
         "native_stress" => native_stress(&rt),
         "shared_produce" => shared_produce(&rt),
+        "shared_receive_rw" => shared_receive_rw(&rt),
+        "shared_verify_client" => shared_verify_client(&rt),
+        "shared_reject_call" => shared_reject_call(&rt),
         "preflight_p1_client" => preflight_p1_client(&rt),
         "preflight_p3_client" => preflight_p3_client(&rt),
         _ => full_demo(&rt),
@@ -935,20 +938,195 @@ fn shared_produce(rt: &Runtime) -> i32 {
         authority_fabric::shared::fnv64(view.as_slice())
     };
     // Report the hash over the control channel via the endpoint the offer
-    // arrived on (pair-routing delivers it to the Host).
-    let ep = match rt.endpoint_for(req.local) {
-        Some(e) => e,
-        None => {
-            eprintln!("CLIENT_SHARED_FAIL offer endpoint not held");
+    // arrived on (pair-routing delivers it to the Host). Fire-and-forget:
+    // the Host consumes the frame from its control drain; there is no reply
+    // leg, so a short timeout is expected and ignored.
+    let reporter = rt.endpoint_for(req.local);
+    if reporter.is_none() {
+        eprintln!("CLIENT_SHARED_FAIL offer endpoint not held");
+        return 1;
+    }
+    if let Some(ep) = &reporter {
+        let _ = ep.call(hash.to_le_bytes().to_vec(), Duration::from_millis(500));
+    }
+    marker!("SHARED_PRODUCER_WRITTEN");
+    // Hold writer authority until the fabric shuts down; a Host-sent "GEN2"
+    // control payload triggers a synchronized second generation write.
+    loop {
+        match rt.wait_inbound(Duration::from_secs(600)) {
+            Ok(req2) => {
+                if req2.payload == b"GEN2" {
+                    let seed2 = seed ^ 0xa5a5_5a5a_dead_beef;
+                    {
+                        let mut view = match reg.map_read_write() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("CLIENT_SHARED_FAIL gen2 map rw: {e}");
+                                return 1;
+                            }
+                        };
+                        authority_fabric::shared::fill_pattern(view.as_mut_slice(), seed2);
+                    }
+                    let hash2 = {
+                        let view = reg.map_read_only().expect("gen2 ro");
+                        authority_fabric::shared::fnv64(view.as_slice())
+                    };
+                    if let Some(ep) = &reporter {
+                        let _ = ep.call(hash2.to_le_bytes().to_vec(), Duration::from_millis(500));
+                    }
+                    marker!("SHARED_PRODUCER_GEN2_WRITTEN");
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    marker!("CLIENT_SHARED_DONE");
+    0
+}
+
+/// Shared-memory Consumer (client-side second reader): verifies an RO
+/// capability against the expected hash riding the offer, then holds.
+fn shared_verify_client(rt: &Runtime) -> i32 {
+    let mut verified = 0usize;
+    loop {
+        let req = match rt.wait_inbound(Duration::from_secs(600)) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let reg = match req.received_shared {
+            Some(r) => r,
+            None => continue,
+        };
+        let expected = if req.payload.len() == 8 {
+            u64::from_le_bytes(req.payload[..8].try_into().unwrap())
+        } else {
+            u64::MAX
+        };
+        let got = reg
+            .map_read_only()
+            .map(|v| authority_fabric::shared::fnv64(v.as_slice()));
+        match got {
+            Ok(h)
+                if h == expected && reg.rights() == authority_fabric::shared::Rights::ReadOnly =>
+            {
+                verified += 1;
+                marker!("CLIENT2_SHARED_VERIFIED");
+            }
+            other => {
+                eprintln!("CLIENT_SHARED_FAIL verify: {other:?}");
+                return 1;
+            }
+        }
+    }
+    if verified == 0 {
+        eprintln!("CLIENT_SHARED_FAIL never verified");
+        return 1;
+    }
+    0
+}
+
+/// Hostile-drill client: requests a shared capability and rejects the offer
+/// (SEAM_CLI_REJECT_SHARED drives the runtime-side reject).
+fn shared_reject_call(rt: &Runtime) -> i32 {
+    let mut seen = std::collections::HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_SHARED_FAIL no root: {e}");
             return 1;
         }
     };
-    // Fire-and-forget hash report: the Host consumes the frame from the
-    // control drain; there is no reply leg, so a short timeout is expected.
-    let _ = ep.call(hash.to_le_bytes().to_vec(), Duration::from_millis(500));
+    // Let the Host's initial grant land before requesting.
+    std::thread::sleep(Duration::from_millis(500));
+    match root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        CALL_TIMEOUT,
+    ) {
+        // Reject leaves the caller without a reply leg: Timeout is the
+        // expected observation alongside explicit abort errors.
+        Err(FabError::TransferAborted(_)) | Err(FabError::Closed(_)) | Err(FabError::Timeout) => {
+            marker!("CLIENT_SHARED_REJECTED_OK");
+            0
+        }
+        Ok(_) => {
+            eprintln!("CLIENT_SHARED_FAIL expected rejection, got capability");
+            1
+        }
+        Err(e) => {
+            eprintln!("CLIENT_SHARED_FAIL unexpected error: {e:?}");
+            1
+        }
+    }
+}
+
+/// Shared RW recipient of a STAGED peer transfer: calls OpenCounter, receives
+/// the writable region inside the reply, proves it is genuinely writable and
+/// reports the new hash to the Host over the control channel.
+fn shared_receive_rw(rt: &Runtime) -> i32 {
+    const REGION_SIZE: usize = 4 * 1024 * 1024;
+    let mut seen = std::collections::HashSet::new();
+    let root = match claim_ep(rt, &mut seen) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_SHARED_FAIL no root: {e}");
+            return 1;
+        }
+    };
+    let ctrl = match claim_ep(rt, &mut seen) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("CLIENT_SHARED_FAIL no ctrl: {e}");
+            return 1;
+        }
+    };
+    // Let the Host's initial grant land before requesting (deterministic
+    // ordering without adding a barrier protocol).
+    std::thread::sleep(Duration::from_millis(500));
+    let res = match root.call(
+        proto::encode_root_request(RootRequest::OpenCounter),
+        CALL_TIMEOUT,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_SHARED_FAIL open: {e:?}");
+            return 1;
+        }
+    };
+    let mut reg = match res.received_shared {
+        Some(r) => r,
+        None => {
+            eprintln!("CLIENT_SHARED_FAIL reply without capability");
+            return 1;
+        }
+    };
+    if reg.rights() != authority_fabric::shared::Rights::ReadWrite
+        || reg.size() as usize != REGION_SIZE
+    {
+        eprintln!(
+            "CLIENT_SHARED_FAIL rights={:?} size={}",
+            reg.rights(),
+            reg.size()
+        );
+        return 1;
+    }
+    marker!("CLIENT_SHARED_RW_RECEIVED");
+    let seed: u64 = 0x0f1e_2d3c_4b5a_6978;
+    {
+        let mut view = match reg.map_read_write() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("CLIENT_SHARED_FAIL map rw: {e}");
+                return 1;
+            }
+        };
+        authority_fabric::shared::fill_pattern(view.as_mut_slice(), seed);
+    }
+    let hash = {
+        let view = reg.map_read_only().expect("rw readback");
+        authority_fabric::shared::fnv64(view.as_slice())
+    };
+    let _ = ctrl.call(hash.to_le_bytes().to_vec(), Duration::from_millis(500));
     marker!("SHARED_PRODUCER_WRITTEN");
-    // Hold writer authority until the fabric shuts down; dropping early would
-    // vacate the writer slot mid-experiment.
     loop {
         match rt.wait_inbound(Duration::from_secs(600)) {
             Ok(_) => {}

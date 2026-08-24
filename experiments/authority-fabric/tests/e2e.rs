@@ -360,3 +360,93 @@ fn shared_happy() {
         assert_contains(&combined, m, "shared_happy");
     }
 }
+
+#[test]
+fn shared_derive() {
+    let out = run_host(&["shared_derive"], &[], Duration::from_secs(90));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "shared_derive\n{combined}");
+    for m in [
+        "SHARED_PRODUCER_GEN2_WRITTEN",
+        "SHARED_RO_DERIVED",
+        "SVC_SHARED_VERIFIED",
+        "SHARED_DERIVE_OK",
+    ] {
+        assert_contains(&combined, m, "shared_derive");
+    }
+    // Consumer verified BOTH generations through derived RO views.
+    assert!(
+        combined.matches("SVC_SHARED_VERIFIED").count() >= 2,
+        "expected two verifications:\n{combined}"
+    );
+}
+
+#[test]
+fn shared_rw_transfer() {
+    let out = run_host(&["shared_rw_transfer"], &[], Duration::from_secs(90));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "shared_rw_transfer\n{combined}");
+    for m in [
+        "SVC_SHARED_HELD",
+        "HOST_SHARED_ESCROWED",
+        "HOST_SHARED_DELIVERED",
+        "CLIENT_SHARED_RW_RECEIVED",
+        "SHARED_PRODUCER_WRITTEN",
+        "SHARED_RW_TRANSFER_OK",
+    ] {
+        assert_contains(&combined, m, "shared_rw_transfer");
+    }
+}
+
+#[test]
+fn shared_rw_abort() {
+    let out = run_host(&["shared_rw_abort"], &[], Duration::from_secs(90));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "shared_rw_abort\n{combined}");
+    for m in [
+        "CLIENT_SHARED_REJECTED_OK",
+        "HOST_SHARED_RESTORED",
+        "SVC_SHARED_RESTORED_WRITABLE_OK",
+        "SHARED_RW_ABORT_SETTLED",
+        "SHARED_RW_ABORT_OK",
+    ] {
+        assert_contains(&combined, m, "shared_rw_abort");
+    }
+}
+
+#[test]
+fn shared_ro_transfer() {
+    let out = run_host(&["shared_ro_transfer"], &[], Duration::from_secs(90));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "shared_ro_transfer\n{combined}");
+    for m in [
+        "SVC_SHARED_VERIFIED",
+        "CLIENT2_SHARED_VERIFIED",
+        "SHARED_RO_TRANSFER_OK",
+    ] {
+        assert_contains(&combined, m, "shared_ro_transfer");
+    }
+}
+
+#[test]
+fn shared_multi_reader() {
+    let out = run_host(&["shared_multi_reader"], &[], Duration::from_secs(120));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "shared_multi_reader\n{combined}"
+    );
+    for m in ["SHARED_PRODUCER_GEN2_WRITTEN", "SHARED_MULTI_READER_OK"] {
+        assert_contains(&combined, m, "shared_multi_reader");
+    }
+    // Two reader processes verified both generations.
+    assert!(
+        combined.matches("SVC_SHARED_VERIFIED").count() >= 2,
+        "svc verifications:\n{combined}"
+    );
+    assert!(
+        combined.matches("CLIENT2_SHARED_VERIFIED").count() >= 2,
+        "client2 verifications:\n{combined}"
+    );
+}

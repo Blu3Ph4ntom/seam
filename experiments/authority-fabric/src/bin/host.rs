@@ -896,6 +896,17 @@ impl Fabric {
         }
     }
 
+    /// Spawn an additional client-role process with its own host-paired
+    /// control endpoint (used for a second independent consumer process).
+    fn spawn_extra_consumer(&mut self, envs: &[(&str, String)]) -> Result<(PeerId, EpId), String> {
+        let pid = self.spawn_role("client", envs)?;
+        let (cc, _ch) = self.router.create_host_pair();
+        let cc_ep = cc;
+        self.grant(pid, cc_ep);
+        let _ = self.settle_escrow(Duration::from_secs(5));
+        Ok((pid, cc_ep))
+    }
+
     fn settle_escrow(&mut self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         while self.router.accounting().escrowed > 0 {
@@ -1235,6 +1246,11 @@ fn main() {
         "native_abort" => native_abort_case(lim),
         "native_stress" => native_stress_case(lim),
         "shared_happy" => shared_happy_case(lim),
+        "shared_derive" => shared_derive_case(lim),
+        "shared_rw_transfer" => shared_rw_transfer_case(lim),
+        "shared_rw_abort" => shared_rw_abort_case(lim),
+        "shared_ro_transfer" => shared_ro_transfer_case(lim),
+        "shared_multi_reader" => shared_multi_reader_case(lim),
         other => fail(&format!("unknown host mode {other:?}")),
     };
     std::process::exit(code);
@@ -2046,7 +2062,368 @@ fn native_stress_case(lim: Limits) -> i32 {
     0
 }
 
-/// Primary cross-process shared-memory proof (Windows-first).
+/// shared_derive: derivation is NOT a move. Producer keeps RW across two
+/// synchronized generations while the Consumer re-verifies each one.
+fn shared_derive_case(lim: Limits) -> i32 {
+    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "normal".into())],
+        &[("SEAM_CLIENT_MODE", "shared_produce".into())],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    let (_t1, rid) = match fab.region_new_grant(
+        setup.cli,
+        setup.ctrl_client_side,
+        0,
+        REGION_SIZE,
+        Rights::ReadWrite,
+        vec![],
+    ) {
+        Ok(v) => v,
+        Err(e) => return fail(&e),
+    };
+    let hash1 = match fab.wait_ctrl_raw(Duration::from_secs(30), |p| p.len() == 8) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    marker!("SHARED_PRODUCER_WRITTEN");
+    if let Err(e) = fab.region_derive_grant(
+        rid,
+        setup.svc,
+        setup.root_service_side,
+        Rights::ReadOnly,
+        hash1.clone(),
+    ) {
+        return fail(&e);
+    }
+    marker!("SHARED_RO_DERIVED");
+    if !settle_shared(&mut fab, Duration::from_secs(15), 1, 1) {
+        return fail("derive settle 1");
+    }
+    // Generation 2: producer mutates the SAME pages; consumer re-verifies.
+    fab.host_send(setup.ctrl_host_side, 777, b"GEN2".to_vec());
+    let hash2 = match fab.wait_ctrl_raw(Duration::from_secs(30), |p| p.len() == 8) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    if let Err(e) = fab.region_derive_grant(
+        rid,
+        setup.svc,
+        setup.root_service_side,
+        Rights::ReadOnly,
+        hash2,
+    ) {
+        return fail(&e);
+    }
+    if !settle_shared(&mut fab, Duration::from_secs(15), 1, 1) {
+        return fail("derive settle 2");
+    }
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(10));
+    let _ = fab.wait_exit(setup.svc, Duration::from_secs(10));
+    fab.shutdown_orderly();
+    if let Some(m) = leak_check(&fab) {
+        return fail(&m);
+    }
+    println!("SHARED_DERIVE_OK");
+    0
+}
+
+/// Poll until region accounting hits the expected writer/reader counts and
+/// every retained result has been acknowledged.
+fn settle_shared(fab: &mut Fabric, timeout: Duration, want_w: usize, want_r: usize) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ra = fab.router.region_accounting();
+        let acct = fab.router.accounting();
+        if ra.writable_authorities == want_w
+            && ra.readonly_authorities == want_r
+            && acct.shared_unacked == 0
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        fab.step(deadline);
+    }
+}
+
+fn leak_check(fab: &Fabric) -> Option<String> {
+    let a = fab.router.accounting();
+    if a.peers != 0 || a.shared_pending != 0 || a.shared_unacked != 0 {
+        return Some(format!("fabric leak {a:?}"));
+    }
+    let ra = fab.router.region_accounting();
+    if ra.regions != 0 || ra.writable_authorities != 0 || ra.readonly_authorities != 0 {
+        return Some(format!("region table leak {ra:?}"));
+    }
+    None
+}
+
+/// shared_rw_transfer: the writable capability moves Producer->Consumer via
+/// the PEER-SENDER staging path (service replies with a held region).
+fn shared_rw_transfer_case(lim: Limits) -> i32 {
+    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "shared_wait_hold".into())],
+        &[("SEAM_CLIENT_MODE", "shared_receive_rw".into())],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    // Host grants RW to the service (held for its next staged reply).
+    if fab
+        .region_new_grant(
+            setup.svc,
+            setup.root_service_side,
+            0,
+            REGION_SIZE,
+            Rights::ReadWrite,
+            vec![],
+        )
+        .is_err()
+    {
+        return fail("initial rw grant failed");
+    }
+    if !settle_shared(&mut fab, Duration::from_secs(15), 1, 0) {
+        return fail("hold settle");
+    }
+    // Client's OpenCounter triggers reply_with_shared: peer stages -> Host
+    // escrows -> commit delivers a writable handle to the client.
+    let _hash = match fab.wait_ctrl_raw(Duration::from_secs(30), |p| p.len() == 8) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    marker!("SHARED_PRODUCER_WRITTEN");
+    if !settle_shared(&mut fab, Duration::from_secs(15), 1, 0) {
+        return fail("transfer settle");
+    }
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(10));
+    let _ = fab.wait_exit(setup.svc, Duration::from_secs(10));
+    fab.shutdown_orderly();
+    if let Some(m) = leak_check(&fab) {
+        return fail(&m);
+    }
+    println!("SHARED_RW_TRANSFER_OK");
+    0
+}
+
+/// shared_rw_abort: recipient rejects pre-commit; the staged backing returns
+/// to the sender with identical rights and the restored writer proves it can
+/// still map writable and write.
+fn shared_rw_abort_case(lim: Limits) -> i32 {
+    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "shared_wait_hold".into())],
+        &[
+            ("SEAM_CLIENT_MODE", "shared_reject_call".into()),
+            ("SEAM_CLI_REJECT_SHARED", "1".into()),
+        ],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    if fab
+        .region_new_grant(
+            setup.svc,
+            setup.root_service_side,
+            0,
+            REGION_SIZE,
+            Rights::ReadWrite,
+            vec![],
+        )
+        .is_err()
+    {
+        return fail("initial rw grant failed");
+    }
+    if !settle_shared(&mut fab, Duration::from_secs(15), 1, 0) {
+        return fail("hold settle");
+    }
+    // Client rejects the staged offer; abort restores RW to the service.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let ra = fab.router.region_accounting();
+        let acct = fab.router.accounting();
+        if acct.shared_pending == 0 && ra.writable_authorities == 1 && acct.shared_unacked == 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return fail(&format!(
+                "abort settle timeout pend={} w={} unacked={}",
+                acct.shared_pending, ra.writable_authorities, acct.shared_unacked
+            ));
+        }
+        fab.step(deadline);
+    }
+    marker!("SHARED_RW_ABORT_SETTLED");
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(10));
+    let _ = fab.wait_exit(setup.svc, Duration::from_secs(10));
+    fab.shutdown_orderly();
+    if let Some(m) = leak_check(&fab) {
+        return fail(&m);
+    }
+    println!("SHARED_RW_ABORT_OK");
+    0
+}
+
+/// shared_ro_transfer: an RO capability derived for one reader coexists with
+/// a second reader over the same pages; dropping the first does not disturb
+/// the second or the writer. (RegionTable rows persist until peer death —
+/// documented RUN 005B limitation; no revocation is claimed.)
+fn shared_ro_transfer_case(lim: Limits) -> i32 {
+    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "normal".into())],
+        &[("SEAM_CLIENT_MODE", "shared_produce".into())],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    let (pid_b, cc_b) =
+        match fab.spawn_extra_consumer(&[("SEAM_CLIENT_MODE", "shared_verify_client".into())]) {
+            Ok(v) => v,
+            Err(e) => return fail(&e),
+        };
+    let (_t1, rid) = match fab.region_new_grant(
+        setup.cli,
+        setup.ctrl_client_side,
+        0,
+        REGION_SIZE,
+        Rights::ReadWrite,
+        vec![],
+    ) {
+        Ok(v) => v,
+        Err(e) => return fail(&e),
+    };
+    let hash1 = match fab.wait_ctrl_raw(Duration::from_secs(30), |p| p.len() == 8) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    marker!("SHARED_PRODUCER_WRITTEN");
+    if let Err(e) = fab.region_derive_grant(
+        rid,
+        setup.svc,
+        setup.root_service_side,
+        Rights::ReadOnly,
+        hash1.clone(),
+    ) {
+        return fail(&e);
+    }
+    // Reader A signals it is done with its view; Host then derives an
+    // independent RO authority for reader B over the same backing.
+    fab.host_send(setup.ctrl_host_side, 778, b"DROP_RO".to_vec());
+    let mut step_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < step_deadline {
+        fab.step(step_deadline);
+    }
+    if let Err(e) = fab.region_derive_grant(rid, pid_b, cc_b, Rights::ReadOnly, hash1.clone()) {
+        return fail(&e);
+    }
+    if !settle_shared(&mut fab, Duration::from_secs(20), 1, 1) {
+        return fail("ro transfer settle");
+    }
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(10));
+    let _ = fab.wait_exit(pid_b, Duration::from_secs(10));
+    fab.shutdown_orderly();
+    if let Some(m) = leak_check(&fab) {
+        return fail(&m);
+    }
+    println!("SHARED_RO_TRANSFER_OK");
+    0
+}
+
+/// shared_multi_reader: one writer, TWO independent reader processes, both
+/// verifying generation 1 then generation 2 of the same pages.
+fn shared_multi_reader_case(lim: Limits) -> i32 {
+    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "normal".into())],
+        &[("SEAM_CLIENT_MODE", "shared_produce".into())],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    let (pid_b, cc_b) =
+        match fab.spawn_extra_consumer(&[("SEAM_CLIENT_MODE", "shared_verify_client".into())]) {
+            Ok(v) => v,
+            Err(e) => return fail(&e),
+        };
+    let _ = (pid_b, cc_b);
+    let (_t1, rid) = match fab.region_new_grant(
+        setup.cli,
+        setup.ctrl_client_side,
+        0,
+        REGION_SIZE,
+        Rights::ReadWrite,
+        vec![],
+    ) {
+        Ok(v) => v,
+        Err(e) => return fail(&e),
+    };
+    let hash1 = match fab.wait_ctrl_raw(Duration::from_secs(30), |p| p.len() == 8) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    marker!("SHARED_PRODUCER_WRITTEN");
+    if let Err(e) = fab.region_derive_grant(
+        rid,
+        setup.svc,
+        setup.root_service_side,
+        Rights::ReadOnly,
+        hash1.clone(),
+    ) {
+        return fail(&e);
+    }
+    if let Err(e) = fab.region_derive_grant(rid, pid_b, cc_b, Rights::ReadOnly, hash1.clone()) {
+        return fail(&e);
+    }
+    if !settle_shared(&mut fab, Duration::from_secs(20), 1, 2) {
+        return fail("gen1 readers settle");
+    }
+    // Generation 2 through the same writer; both readers re-verify.
+    fab.host_send(setup.ctrl_host_side, 779, b"GEN2".to_vec());
+    let hash2 = match fab.wait_ctrl_raw(Duration::from_secs(30), |p| p.len() == 8) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    if let Err(e) = fab.region_derive_grant(
+        rid,
+        setup.svc,
+        setup.root_service_side,
+        Rights::ReadOnly,
+        hash2.clone(),
+    ) {
+        return fail(&e);
+    }
+    if let Err(e) = fab.region_derive_grant(rid, pid_b, cc_b, Rights::ReadOnly, hash2) {
+        return fail(&e);
+    }
+    if !settle_shared(&mut fab, Duration::from_secs(20), 1, 2) {
+        return fail("gen2 readers settle");
+    }
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(10));
+    let _ = fab.wait_exit(pid_b, Duration::from_secs(10));
+    let _ = fab.wait_exit(setup.svc, Duration::from_secs(10));
+    fab.shutdown_orderly();
+    if let Some(m) = leak_check(&fab) {
+        return fail(&m);
+    }
+    println!("SHARED_MULTI_READER_OK");
+    0
+}
+
 ///
 /// Host creates a 4 MiB region -> Producer (client) receives RW through the
 /// generic transaction, maps writable, fills a deterministic 4 MiB payload and

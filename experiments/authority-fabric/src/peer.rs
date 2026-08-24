@@ -1008,6 +1008,9 @@ impl RuntimeInner {
                 {
                     let _ = (&tid, &handle_value); // fd arrives via lane RESTORE
                 }
+                // Sender observed the terminal outcome: acknowledge so the
+                // Host can retire the retained result (idempotent).
+                let _ = self.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
                 true
             }
         }
@@ -1016,6 +1019,14 @@ impl RuntimeInner {
     fn process_data(self: &Arc<Self>, d: DataInner) {
         // Shared-region OFFER: accept, park metadata until commit+backing join.
         if let Some(s) = d.shared.clone() {
+            // Hostile/capacity drill: reject instead of accept.
+            let reject_shared = std::env::var("SEAM_CLI_REJECT_SHARED")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if reject_shared {
+                let _ = self.push_out(Frame::Xfer(XferMsg::Reject { tid: s.tid }));
+                return;
+            }
             let _ = self.push_out(Frame::Xfer(XferMsg::Accept { tid: s.tid }));
             let mut st = self.st.lock().unwrap();
             st.shared_parked.insert(
