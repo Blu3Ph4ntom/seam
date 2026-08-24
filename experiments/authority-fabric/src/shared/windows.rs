@@ -11,7 +11,9 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::slice;
 
 use winapi::um::handleapi::{DuplicateHandle, INVALID_HANDLE_VALUE};
-use winapi::um::memoryapi::{CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE};
+use winapi::um::memoryapi::{
+    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE,
+};
 use winapi::um::processthreadsapi::GetCurrentProcess;
 use winapi::um::winnt::{PAGE_READWRITE, SECTION_MAP_READ, SECTION_MAP_WRITE};
 
@@ -36,7 +38,9 @@ pub fn create_backing(size: u64) -> std::io::Result<File> {
         if h.is_null() {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(File::from(OwnedHandle::from_raw_handle(h as *mut std::ffi::c_void)))
+        Ok(File::from(OwnedHandle::from_raw_handle(
+            h as *mut std::ffi::c_void,
+        )))
     }
 }
 

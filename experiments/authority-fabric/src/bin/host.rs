@@ -412,7 +412,7 @@ impl Fabric {
             // (Offer-time Data keeps escrow intact; only NativeCommit spends it.)
             if let Frame::Xfer(XferMsg::NativeCommit {
                 tid,
-                rid,
+                rid: _,
                 handle_value,
             }) = &mut frame
             {

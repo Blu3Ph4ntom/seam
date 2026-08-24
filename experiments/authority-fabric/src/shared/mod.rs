@@ -15,20 +15,20 @@ use getrandom::fill;
 use crate::limits::Limits;
 use crate::router::PeerId;
 
-#[cfg(windows)]
-mod windows;
 #[cfg(unix)]
 mod unix;
-
 #[cfg(windows)]
-pub use windows::{
-    create_backing, duplicate_backing, map_read_only, map_read_write, MappedReadOnly,
-    MappedReadWrite, SECTION_RO_ACCESS, SECTION_RW_ACCESS,
-};
+mod windows;
+
 #[cfg(unix)]
 pub use unix::{
     create_backing, duplicate_backing, map_read_only, map_read_write, MappedReadOnly,
     MappedReadWrite,
+};
+#[cfg(windows)]
+pub use windows::{
+    create_backing, duplicate_backing, map_read_only, map_read_write, MappedReadOnly,
+    MappedReadWrite, SECTION_RO_ACCESS, SECTION_RW_ACCESS,
 };
 
 // ---------------------------------------------------------------- identity --
@@ -234,6 +234,65 @@ impl RegionTable {
         Ok(())
     }
 
+    /// Mint a read-only authority for `to` (Host-authoritative derivation).
+    /// Unlike `derive_read_only` this does not require `to` to already hold
+    /// the region: the Host is the rights authority and validates the
+    /// requesting peer separately before calling this.
+    pub fn grant_read_only(
+        &mut self,
+        rid: RegionId,
+        to: PeerId,
+        lim: &Limits,
+    ) -> Result<(), RegionErr> {
+        let rec = self.regions.get_mut(&rid).ok_or(RegionErr::UnknownRegion)?;
+        if rec.authority_count() >= lim.max_region_capabilities {
+            return Err(RegionErr::CapacityExceeded);
+        }
+        // A read-only authority must never silently overwrite or mask a live
+        // writable authority held by the same peer.
+        if rec.writable == Some(to) {
+            return Err(RegionErr::SecondWriterDenied);
+        }
+        rec.readonly.insert(to);
+        Ok(())
+    }
+
+    pub fn region_exists(&self, rid: RegionId) -> bool {
+        self.regions.contains_key(&rid)
+    }
+
+    pub fn writable_holder(&self, rid: RegionId) -> Option<PeerId> {
+        self.regions.get(&rid).and_then(|r| r.writable)
+    }
+
+    pub fn is_readonly_holder(&self, rid: RegionId, p: PeerId) -> bool {
+        self.regions
+            .get(&rid)
+            .map(|r| r.readonly.contains(&p))
+            .unwrap_or(false)
+    }
+
+    /// Peer death: purge every authority held by `p`. The writer slot is
+    /// simply vacated (no auto re-mint); regions left with no authorities are
+    /// freed and their backing bytes reclaimed from accounting.
+    pub fn peer_gone(&mut self, p: PeerId) {
+        let rids: Vec<RegionId> = self.regions.keys().copied().collect();
+        for rid in rids {
+            // A peer can hold at most two authority kinds over one region
+            // (writable + a derived read-only view).
+            for _ in 0..2 {
+                let holds = match self.regions.get(&rid) {
+                    Some(r) => r.writable == Some(p) || r.readonly.contains(&p),
+                    None => false,
+                };
+                if !holds {
+                    break;
+                }
+                self.drop_authority(rid, p);
+            }
+        }
+    }
+
     /// Move the writable authority from `from` to `to`. One writer maximum.
     pub fn transfer_writable(
         &mut self,
@@ -427,9 +486,10 @@ impl SharedRegion {
         offset: usize,
         len: usize,
     ) -> std::io::Result<&'a [u8]> {
-        let end = offset
-            .checked_add(len)
-            .ok_or(std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset+len overflow"))?;
+        let end = offset.checked_add(len).ok_or(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "offset+len overflow",
+        ))?;
         if end > self.size as usize {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

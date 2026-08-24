@@ -11,6 +11,7 @@ use authority_fabric::marker;
 use authority_fabric::native::NativeFile;
 use authority_fabric::peer::{Endpoint, Inbound, Runtime, TransferOutcome};
 use authority_fabric::proto::{self, CounterRequest, RootRequest, RootResponse};
+use authority_fabric::shared::SharedRegion;
 use authority_fabric::Limits;
 
 fn main() {
@@ -47,6 +48,7 @@ fn main() {
     let mut held: Vec<Endpoint> = Vec::new();
     let mut restored_q: Vec<Endpoint> = Vec::new();
     let mut restored_q_native: Vec<NativeFile> = Vec::new();
+    let mut restored_q_shared: Vec<SharedRegion> = Vec::new();
 
     loop {
         let req: Inbound = match rt.wait_inbound(Duration::from_secs(600)) {
@@ -139,6 +141,10 @@ fn main() {
                         Ok(TransferOutcome::NativeAborted(back)) => {
                             marker!("SVC_NATIVE_RESTORED n={}", back.len());
                             restored_q_native.extend(back);
+                        }
+                        Ok(TransferOutcome::SharedAborted(back)) => {
+                            marker!("SVC_SHARED_RESTORED n={}", back.len());
+                            restored_q_shared.extend(back);
                         }
                         Ok(TransferOutcome::Aborted(back)) => {
                             marker!("SVC_AUTHORITY_RESTORED n={}", back.len());

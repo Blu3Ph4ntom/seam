@@ -21,10 +21,7 @@ pub fn create_backing(size: u64) -> std::io::Result<File> {
     ftruncate(&fd, size)?;
     // Seal size immutability: cannot shrink/grow after this point. SEAL itself
     // prevents further seal changes, locking the size contract.
-    let _ = fcntl_add_seals(
-        &fd,
-        SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL,
-    );
+    let _ = fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL);
     Ok(File::from(fd))
 }
 

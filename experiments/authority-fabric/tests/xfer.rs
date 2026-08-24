@@ -56,6 +56,7 @@ fn data(target: EpId, atts: Vec<Attachment>) -> DataInner {
         attachments: atts,
         payload: b"x".to_vec(),
         native: None,
+        shared: None,
     }
 }
 

@@ -14,12 +14,13 @@ use std::time::{Duration, Instant};
 
 use crate::fabric_error::{Cause, FabError};
 use crate::frame::{
-    self, Attachment, DataInner, Frame, FrameError, NativeAttachment, XferMsg, ERR_CAPACITY,
+    self, Attachment, DataInner, Frame, FrameError, SharedAttachment, XferMsg, ERR_CAPACITY,
 };
 use crate::id::{fresh_transfer_id, EpId, TransferId, TransferSpace};
 use crate::limits::Limits;
 use crate::native::NativeFile;
 use crate::queue::{BoundedQueue, PopError};
+use crate::shared::{RegionId, Rights, SharedRegion};
 
 /// A message delivered to a locally-implemented endpoint.
 #[derive(Debug)]
@@ -35,6 +36,8 @@ pub struct Inbound {
     /// authority; they arrived only because someone transferred them.
     pub received: Vec<Endpoint>,
     pub received_native: Option<NativeFile>,
+    /// Shared-memory capability materialized from a committed shared transfer.
+    pub received_shared: Option<SharedRegion>,
 }
 
 /// Successful call result: response payload plus capabilities transferred
@@ -44,6 +47,7 @@ pub struct CallResult {
     pub payload: Vec<u8>,
     pub received: Vec<Endpoint>,
     pub received_native: Option<NativeFile>,
+    pub received_shared: Option<SharedRegion>,
 }
 
 pub(crate) struct WaitSlot {
@@ -89,6 +93,9 @@ pub enum TransferOutcome {
     Aborted(Vec<Endpoint>),
     /// Pre-commit abort of a NATIVE resource: restored, returned armed.
     NativeAborted(Vec<NativeFile>),
+    /// Pre-commit abort of a SHARED region: same logical authority restored
+    /// with exactly the rights it held before staging.
+    SharedAborted(Vec<SharedRegion>),
     /// Restoration impossible (peer/runtime gone).
     AuthorityLost(Cause),
 }
@@ -124,6 +131,14 @@ struct NativeParked {
     rid: crate::native::ResourceId,
 }
 
+/// Recipient-side shared-region offer parked until COMMIT + backing join.
+struct SharedParked {
+    target: EpId,
+    corr: u32,
+    payload: Vec<u8>,
+    rid: RegionId,
+}
+
 struct State {
     handles: HashMap<EpId, HState>,
     /// their-side id -> our-side handle (receive demux).
@@ -151,6 +166,16 @@ struct State {
     native_recv: HashMap<TransferId, NativeFile>,
     /// Commit observed but object not yet arrived.
     native_commit_seen: std::collections::HashSet<TransferId>,
+    /// Shared-region join state (mirrors the native triple):
+    /// parked offer metadata / received backing / observed commit metadata.
+    shared_parked: HashMap<TransferId, SharedParked>,
+    shared_recv: HashMap<TransferId, std::fs::File>,
+    /// Host-authoritative commit metadata: rid/rights/size from SharedCommit.
+    shared_commit_meta: HashMap<TransferId, (RegionId, Rights, u64)>,
+    /// Sender-side hold + wait slot. Slot value: None => committed;
+    /// Some(region) => abort-restored capability.
+    shared_hold: HashMap<TransferId, SharedRegion>,
+    shared_wait: HashMap<TransferId, Arc<(Mutex<Option<Option<SharedRegion>>>, Condvar)>>,
     parked: Vec<Parked>,
 }
 
@@ -235,6 +260,14 @@ fn resolve_slot(sl: &XferSlot, v: XferLocal) {
     sl.cv.notify_all();
 }
 
+fn decode_rights_byte(b: u8) -> Option<Rights> {
+    match b {
+        0 => Some(Rights::ReadOnly),
+        1 => Some(Rights::ReadWrite),
+        _ => None,
+    }
+}
+
 fn barrier_wait(name: &str) {
     let Ok(dir) = std::env::var("SEAM_BARRIER_DIR") else {
         return;
@@ -296,6 +329,11 @@ impl RuntimeInner {
                 native_parked: HashMap::new(),
                 native_recv: HashMap::new(),
                 native_commit_seen: std::collections::HashSet::new(),
+                shared_parked: HashMap::new(),
+                shared_recv: HashMap::new(),
+                shared_commit_meta: HashMap::new(),
+                shared_hold: HashMap::new(),
+                shared_wait: HashMap::new(),
                 parked: Vec::new(),
             }),
             out: BoundedQueue::new(lim.queue_max_msgs, lim.queue_max_bytes),
@@ -348,6 +386,7 @@ impl RuntimeInner {
                 payload: p.payload,
                 received: p.got,
                 received_native: None,
+                received_shared: None,
             });
             if let Some(inner) = inner {
                 let (m, cv) = &*inner;
@@ -364,6 +403,7 @@ impl RuntimeInner {
             payload: p.payload,
             received: p.got,
             received_native: None,
+            received_shared: None,
         };
         loop {
             match self.inbound.try_push(item, cost) {
@@ -408,6 +448,7 @@ impl RuntimeInner {
                     payload: p.payload,
                     received: vec![],
                     received_native: Some(file),
+                    received_shared: None,
                 }));
                 return;
             }
@@ -420,6 +461,76 @@ impl RuntimeInner {
             payload: p.payload,
             received: vec![],
             received_native: Some(file),
+            received_shared: None,
+        };
+        loop {
+            match self.inbound.try_push(item, cost) {
+                Ok(()) => return,
+                Err((back, _)) => {
+                    item = back;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    /// Join a parked shared-region offer with its arrived backing and the
+    /// Host-authoritative commit metadata, then deliver the materialized
+    /// `SharedRegion` to the waiting caller or the inbound queue.
+    fn complete_shared(
+        &self,
+        p: SharedParked,
+        meta_rid: RegionId,
+        rights: Rights,
+        size: u64,
+        file: std::fs::File,
+    ) {
+        // Correlation guard: parked offer and commit metadata must agree on
+        // the region identity (no "next backing belongs to next commit").
+        if meta_rid != p.rid {
+            return; // mismatched: backing closes via Drop
+        }
+        let local = {
+            let st = self.st.lock().unwrap();
+            st.partner_of_theirs
+                .get(&p.target)
+                .copied()
+                .unwrap_or(p.target)
+        };
+        let region = SharedRegion::from_backing(meta_rid, rights, size, file);
+        if p.corr != 0 {
+            let slot = {
+                let mut st = self.st.lock().unwrap();
+                let matches = st
+                    .waiters
+                    .get(&p.corr)
+                    .map(|s| s.ep == local)
+                    .unwrap_or(false);
+                if matches {
+                    st.waiters.remove(&p.corr)
+                } else {
+                    None
+                }
+            };
+            if let Some(slot) = slot {
+                slot.resolve(Ok(CallResult {
+                    payload: p.payload,
+                    received: vec![],
+                    received_native: None,
+                    received_shared: Some(region),
+                }));
+                return;
+            }
+        }
+        let cost = p.payload.len() + INBOUND_COST_OVERHEAD;
+        let mut item = Inbound {
+            from: EpId([0; 16]),
+            local,
+            corr: p.corr,
+            payload: p.payload,
+            received: vec![],
+            received_native: None,
+            received_shared: Some(region),
         };
         loop {
             match self.inbound.try_push(item, cost) {
@@ -451,6 +562,54 @@ impl RuntimeInner {
                     Err(_) => return, // host death or lane close: EOF
                 };
                 let Some(fd) = msg.fd else { continue }; // malformed: closed inside recv
+                                                         // ---- shared-region branch (checked before native) ----
+                                                         // LaneMsg.rid is typed ResourceId but carries RegionId bytes
+                                                         // for shared transfers ([u8;16] both; tid namespaces disjoint).
+                let is_shared_restore = msg.kind == LANE_KIND_RESTORE;
+                let mut st0 = sh.st.lock().unwrap();
+                let shared_target_restore =
+                    is_shared_restore && st0.shared_wait.contains_key(&msg.tid);
+                let shared_target_deliver = !is_shared_restore
+                    && (st0.shared_parked.contains_key(&msg.tid)
+                        || st0.shared_commit_meta.contains_key(&msg.tid));
+                if shared_target_restore {
+                    let held = st0.shared_hold.remove(&msg.tid);
+                    if let Some(held) = held {
+                        let region = SharedRegion::from_backing(
+                            held.id(),
+                            held.rights(),
+                            held.size(),
+                            std::fs::File::from(fd),
+                        );
+                        if let Some(slot) = st0.shared_wait.remove(&msg.tid) {
+                            let (m, cv) = &*slot;
+                            *m.lock().unwrap() = Some(Some(region));
+                            cv.notify_all();
+                        }
+                    }
+                    drop(st0);
+                    continue;
+                }
+                if shared_target_deliver {
+                    if st0.shared_recv.len() >= sh.lim.max_native_resources {
+                        drop(st0); // over capacity: backing closes via Drop
+                        continue;
+                    }
+                    st0.shared_recv.insert(msg.tid, std::fs::File::from(fd));
+                    if let Some(p) = st0.shared_parked.remove(&msg.tid) {
+                        if let Some((rid, rights, size)) = st0.shared_commit_meta.remove(&msg.tid) {
+                            if let Some(file) = st0.shared_recv.remove(&msg.tid) {
+                                drop(st0);
+                                sh.complete_shared(p, rid, rights, size, file);
+                                continue;
+                            }
+                        }
+                    }
+                    drop(st0);
+                    continue;
+                }
+                drop(st0);
+                // ---- native branch (unchanged) ----
                 let file = NF::restore(msg.rid, std::fs::File::from(fd));
                 if msg.kind == LANE_KIND_RESTORE {
                     // Abort restoration: resolve sender wait slot.
@@ -654,6 +813,16 @@ impl RuntimeInner {
                         let _ = self.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
                         return true;
                     }
+                    // Shared: same release semantics for the staged source.
+                    st.shared_hold.remove(&tid);
+                    if let Some(slot) = st.shared_wait.remove(&tid) {
+                        let (m, cv) = &*slot;
+                        *m.lock().unwrap() = Some(None);
+                        cv.notify_all();
+                        drop(st);
+                        let _ = self.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
+                        return true;
+                    }
                 }
                 if ack {
                     let _ = self.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
@@ -737,7 +906,11 @@ impl RuntimeInner {
                 if let Some(file) = st.native_recv.remove(&tid) {
                     if let Some(p) = st.native_parked.remove(&tid) {
                         drop(st);
-                        self.complete_native(p, file);
+                        // Correlation guard: parked offer and commit must
+                        // agree on the resource identity.
+                        if p.rid == rid {
+                            self.complete_native(p, file);
+                        }
                         return true;
                     }
                 }
@@ -769,10 +942,92 @@ impl RuntimeInner {
             }
             XferMsg::ResultAck { .. } => true,
             XferMsg::Accept { .. } | XferMsg::Reject { .. } | XferMsg::Status { .. } => true,
+            XferMsg::SharedCommit {
+                tid,
+                rid,
+                rights,
+                size,
+                handle_value,
+            } => {
+                // Commit observed. Host-authoritative rights/size arrive here;
+                // the kernel object arrives inline (Windows) or via the lane
+                // (Linux). Join order-independently with the parked offer.
+                let Some(rights) = decode_rights_byte(rights) else {
+                    return true; // malformed: no authority is minted
+                };
+                let mut st = self.st.lock().unwrap();
+                st.shared_commit_meta.insert(tid, (rid, rights, size));
+                #[cfg(windows)]
+                {
+                    if handle_value != 0 {
+                        // SAFETY boundary lives in native::windows::handle_to_file:
+                        // sole ownership of a just-delivered target-valid HANDLE.
+                        let file = crate::native::windows::handle_to_file(handle_value);
+                        st.shared_recv.insert(tid, file);
+                    }
+                }
+                if let Some(file) = st.shared_recv.remove(&tid) {
+                    if let Some(p) = st.shared_parked.remove(&tid) {
+                        drop(st);
+                        self.complete_shared(p, rid, rights, size, file);
+                        // Host committed to us: acknowledge so it can retire
+                        // the retained result.
+                        let _ = self.push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
+                        return true;
+                    }
+                }
+                true
+            }
+            XferMsg::SharedAbort {
+                tid,
+                rid: _,
+                handle_value,
+            } => {
+                // Restoration to sender. Rights/size come from the held
+                // original (abort must never change rights).
+                #[cfg(windows)]
+                {
+                    let mut st = self.st.lock().unwrap();
+                    let held = st.shared_hold.remove(&tid);
+                    if let Some(held) = held {
+                        let (rid0, rights0, size0) = (held.id(), held.rights(), held.size());
+                        let _ = held.into_backing(); // old wrapper closes
+                        let file = crate::native::windows::handle_to_file(handle_value);
+                        let restored = SharedRegion::from_backing(rid0, rights0, size0, file);
+                        if let Some(slot) = st.shared_wait.remove(&tid) {
+                            let (m, cv) = &*slot;
+                            *m.lock().unwrap() = Some(Some(restored));
+                            cv.notify_all();
+                        } else {
+                            drop(restored); // nobody waiting: capability closes
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (&tid, &handle_value); // fd arrives via lane RESTORE
+                }
+                true
+            }
         }
     }
 
     fn process_data(self: &Arc<Self>, d: DataInner) {
+        // Shared-region OFFER: accept, park metadata until commit+backing join.
+        if let Some(s) = d.shared.clone() {
+            let _ = self.push_out(Frame::Xfer(XferMsg::Accept { tid: s.tid }));
+            let mut st = self.st.lock().unwrap();
+            st.shared_parked.insert(
+                s.tid,
+                SharedParked {
+                    target: d.target,
+                    corr: d.corr,
+                    payload: d.payload,
+                    rid: s.rid,
+                },
+            );
+            return;
+        }
         // Native OFFER: accept, park metadata until commit+kernel-object join.
         if let Some(n) = d.native.clone() {
             // Hostile/capacity drill: reject instead of accept.
@@ -954,6 +1209,7 @@ impl RuntimeInner {
                     payload: d.payload,
                     received,
                     received_native,
+                    received_shared: None,
                 });
                 match inner {
                     Some(inner) => {
@@ -1009,6 +1265,7 @@ impl RuntimeInner {
                     payload: d.payload,
                     received,
                     received_native,
+                    received_shared: None,
                 };
                 // Backpressure: retry WITHOUT holding the state lock; bounded
                 // forever because the fabric eventually goes terminal.
@@ -1101,6 +1358,7 @@ impl Endpoint {
                 attachments: vec![],
                 payload,
                 native: None,
+                shared: None,
             }))
             .map_err(|e| {
                 let mut st = self.shared.st.lock().unwrap();
@@ -1307,6 +1565,7 @@ impl Runtime {
                 attachments: vec![],
                 payload,
                 native: None,
+                shared: None,
             }))?;
             return Ok(TransferOutcome::Committed);
         }
@@ -1344,6 +1603,7 @@ impl Runtime {
             attachments,
             payload,
             native: None,
+            shared: None,
         }))?;
         xfer_trace("sender_reply_emitted");
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1482,6 +1742,7 @@ impl Runtime {
                 attachments: vec![],
                 payload,
                 native: Some(att),
+                shared: None,
             }));
             if let Err(e) = pushed {
                 let mut st = self.shared.st.lock().unwrap();
@@ -1512,6 +1773,110 @@ impl Runtime {
             }
         } else {
             self.reply(req, payload, vec![])
+        }
+    }
+
+    /// Reply with a shared-memory region attached (sender side). Stages the
+    /// backing through the native escrow path (Windows: raw handle value in
+    /// the frame; Linux: SCM_RIGHTS over the lane), holds the source until
+    /// commit, and returns the restored capability on pre-commit abort.
+    pub fn reply_with_shared(
+        &self,
+        req: &Inbound,
+        payload: Vec<u8>,
+        region: Option<SharedRegion>,
+    ) -> Result<TransferOutcome, FabError> {
+        let Some(reg) = region else {
+            return self.reply(req, payload, vec![]);
+        };
+        struct Empty;
+        impl TransferSpace for Empty {
+            fn contains(&self, _: TransferId) -> bool {
+                false
+            }
+        }
+        let tid = fresh_transfer_id(&Empty);
+        let rid = reg.id();
+        #[cfg(windows)]
+        let handle_value = {
+            use std::os::windows::io::AsRawHandle;
+            reg.backing_ref().as_raw_handle() as u64
+        };
+        #[cfg(not(windows))]
+        let handle_value = 0u64;
+        // Unix: stage the descriptor BEFORE the control frame so the Host's
+        // blocking stage read is deterministic. Sender source stays open.
+        #[cfg(unix)]
+        {
+            let lane_opt = self.shared.native_lane.lock().unwrap();
+            if let Some(lane) = lane_opt.as_ref() {
+                // ponytail: RegionId reinterpreted as ResourceId bytes — same
+                // [u8;16] layout; shared/native tables are tid-disjoint.
+                let rid_native = crate::native::ResourceId(rid.0);
+                if let Err(e) = crate::native::unix::send_lane_msg(
+                    lane,
+                    crate::native::LANE_KIND_STAGE,
+                    tid,
+                    rid_native,
+                    reg.backing_ref(),
+                ) {
+                    eprintln!("SEAM lane stage failed: {e}");
+                    return Err(FabError::TransferUnknown);
+                }
+            } else {
+                eprintln!("SEAM no native lane installed");
+                return Err(FabError::TransferUnknown);
+            }
+        }
+        let slot = Arc::new((Mutex::new(None::<Option<SharedRegion>>), Condvar::new()));
+        {
+            let mut st = self.shared.st.lock().unwrap();
+            if st.terminal.is_some() {
+                return Err(FabError::FabricLost);
+            }
+            st.shared_hold.insert(tid, reg);
+            st.shared_wait.insert(tid, slot.clone());
+        }
+        let att = SharedAttachment {
+            tid,
+            rid,
+            rights: Rights::ReadWrite.wire_byte(),
+            handle_value,
+        };
+        let pushed = self.shared.push_out(Frame::Data(DataInner {
+            target: req.local,
+            corr: req.corr,
+            attachments: vec![],
+            payload,
+            native: None,
+            shared: Some(att),
+        }));
+        if let Err(e) = pushed {
+            let mut st = self.shared.st.lock().unwrap();
+            st.shared_hold.remove(&tid);
+            st.shared_wait.remove(&tid);
+            return Err(e);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (m, cv) = &*slot;
+        let mut g = m.lock().unwrap();
+        let outcome = loop {
+            if let Some(v) = g.take() {
+                break v;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                match self.transfer_status(tid, Duration::from_secs(2)) {
+                    Ok(frame::XFER_ST_COMMITTED) => break None,
+                    _ => break None,
+                }
+            }
+            let (ng, _) = cv.wait_timeout(g, deadline - now).unwrap();
+            g = ng;
+        };
+        match outcome {
+            None => Ok(TransferOutcome::Committed),
+            Some(restored) => Ok(TransferOutcome::SharedAborted(vec![restored])),
         }
     }
 

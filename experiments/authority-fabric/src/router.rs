@@ -25,6 +25,7 @@ use crate::id::{
 };
 use crate::limits::Limits;
 use crate::native::{ResourceId, ResourceSpace};
+use crate::shared::{RegionId, RegionTable, Rights};
 
 fn barrier_wait(name: &str) {
     if let Ok(dir) = std::env::var("SEAM_BARRIER_DIR") {
@@ -122,6 +123,35 @@ pub struct NativeRec {
     pub state: NativeState,
 }
 
+/// Shared-region capability in Host escrow (same lifecycle as `NativeRec`).
+/// Rights/size live in the authoritative `RegionTable`; this record only
+/// tracks the transaction.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedRec {
+    pub tid: TransferId,
+    pub rid: RegionId,
+    pub rights: Rights,
+    pub sender: PeerId,
+    pub dest: PeerId,
+    pub state: NativeState,
+}
+
+/// The Host itself as an authority holder. Router-assigned peer ids are small
+/// sequential u32s, so this sentinel can never collide with a real peer.
+pub const HOST_PEER: PeerId = PeerId(u32::MAX);
+
+fn decode_rights(b: u8) -> Option<Rights> {
+    match b {
+        0 => Some(Rights::ReadOnly),
+        1 => Some(Rights::ReadWrite),
+        _ => None,
+    }
+}
+
+pub fn encode_rights(r: Rights) -> u8 {
+    r.wire_byte()
+}
+
 /// Test-only delivery faults. Never used on the production path unless set.
 #[derive(Clone, Debug, Default)]
 pub struct Inject {
@@ -145,6 +175,14 @@ pub struct Router {
     native_results: HashMap<TransferId, (PeerId, Cause, ResourceId)>,
     native_live: HashMap<ResourceId, PeerId>,
     native_retired: BoundedTombstones<ResourceId>,
+    // Shared-memory region tracking. `regions` is the authoritative rights
+    // table; shared_pending/results mirror the native transaction lifecycle.
+    regions: RegionTable,
+    shared_pending: HashMap<TransferId, SharedRec>,
+    shared_results: HashMap<TransferId, (PeerId, Cause, RegionId)>,
+    /// Committed region ids still referenced by an un-ResultAck'd transfer.
+    shared_live: std::collections::HashSet<RegionId>,
+    shared_retired: BoundedTombstones<RegionId>,
     host_events: Vec<HostEvent>,
     pub inject: Inject,
     collisions: u64,
@@ -163,6 +201,8 @@ pub struct Accounting {
     pub native_live: usize,
     pub native_pending: usize,
     pub native_unacked: usize,
+    pub shared_pending: usize,
+    pub shared_unacked: usize,
 }
 
 impl Router {
@@ -179,6 +219,11 @@ impl Router {
             native_results: HashMap::new(),
             native_live: HashMap::new(),
             native_retired: BoundedTombstones::new(lim.max_retired),
+            regions: RegionTable::new(),
+            shared_pending: HashMap::new(),
+            shared_results: HashMap::new(),
+            shared_live: std::collections::HashSet::new(),
+            shared_retired: BoundedTombstones::new(lim.max_retired),
             host_events: Vec::new(),
             inject: Inject::default(),
             collisions: 0,
@@ -222,7 +267,14 @@ impl Router {
             native_live: self.native_live.len(),
             native_pending: self.native_pending.len(),
             native_unacked: self.native_results.len(),
+            shared_pending: self.shared_pending.len(),
+            shared_unacked: self.shared_results.len(),
         }
+    }
+
+    /// Authoritative shared-region accounting (holders, backing bytes).
+    pub fn region_accounting(&self) -> crate::shared::RegionAccounting {
+        self.regions.accounting()
     }
 
     pub fn collisions(&self) -> u64 {
@@ -245,6 +297,8 @@ impl Router {
             &'a HashMap<TransferId, (PeerId, Cause)>,
             &'a HashMap<TransferId, NativeRec>,
             &'a HashMap<TransferId, (PeerId, Cause, ResourceId)>,
+            &'a HashMap<TransferId, SharedRec>,
+            &'a HashMap<TransferId, (PeerId, Cause, RegionId)>,
         );
         impl TransferSpace for T<'_> {
             fn contains(&self, id: TransferId) -> bool {
@@ -252,6 +306,8 @@ impl Router {
                     || self.1.contains_key(&id)
                     || self.2.contains_key(&id)
                     || self.3.contains_key(&id)
+                    || self.4.contains_key(&id)
+                    || self.5.contains_key(&id)
             }
         }
         T(
@@ -259,6 +315,8 @@ impl Router {
             &self.results,
             &self.native_pending,
             &self.native_results,
+            &self.shared_pending,
+            &self.shared_results,
         )
     }
 
@@ -557,6 +615,60 @@ impl Router {
             f.native = None;
         }
 
+        // Shared-region capability offer (0 or 1 per transfer). Peer-provided
+        // rights are CLAIMS validated against the authoritative RegionTable;
+        // size is never accepted from the wire (Host resolves it by rid).
+        if let Some(s) = f.shared.take() {
+            let Some(rights) = decode_rights(s.rights) else {
+                return Err(Poison("unknown shared rights byte"));
+            };
+            if self.taken_tids().contains(s.tid) {
+                return Err(Poison("duplicate or reused shared transfer id"));
+            }
+            if s.rid.is_zero() || s.tid.is_zero() {
+                return Err(Poison("zero shared id"));
+            }
+            if !self.regions.region_exists(s.rid) {
+                return Err(Poison("unknown region id"));
+            }
+            // Claim validation: only the current authority holder may offer
+            // that authority onward. RO may also be offered by the writer
+            // (direct attenuation).
+            let authorized = match rights {
+                Rights::ReadWrite => self.regions.writable_holder(s.rid) == Some(from),
+                Rights::ReadOnly => {
+                    self.regions.writable_holder(s.rid) == Some(from)
+                        || self.regions.is_readonly_holder(s.rid, from)
+                }
+            };
+            if !authorized {
+                return Err(Poison("shared rights claim denied"));
+            }
+            if self.shared_pending.len() + self.shared_results.len()
+                >= self.lim.max_native_resources
+                || self.shared_pending.len() >= self.lim.max_resources_in_escrow
+            {
+                let mut out = RouteOutcome::default();
+                out.send
+                    .push((from, Frame::Error(crate::frame::ERR_CAPACITY)));
+                return Ok(out);
+            }
+            self.shared_pending.insert(
+                s.tid,
+                SharedRec {
+                    tid: s.tid,
+                    rid: s.rid,
+                    rights,
+                    sender: from,
+                    dest: dest_peer,
+                    state: NativeState::Escrowed,
+                },
+            );
+            f.shared = Some(s);
+        } else {
+            f.shared = None;
+        }
+
         if std::env::var("SEAM_PAUSE_AFTER_ESCROW")
             .map(|v| v == "1")
             .unwrap_or(false)
@@ -576,8 +688,168 @@ impl Router {
                 attachments,
                 payload: f.payload,
                 native: f.native,
+                shared: f.shared,
             }),
         ));
+        Ok(out)
+    }
+
+    /// Register a newly created region (Host is the initial writer).
+    pub fn region_create(
+        &mut self,
+        rid: RegionId,
+        size: u64,
+        lim: &Limits,
+    ) -> Result<(), crate::shared::RegionErr> {
+        self.regions.create_region(rid, size, HOST_PEER, lim)
+    }
+
+    /// Region size by authoritative table.
+    pub fn region_size(&self, rid: RegionId) -> Option<u64> {
+        self.regions.size_of(rid)
+    }
+
+    /// Host-initiated grant of a region capability to `dest`. The offer Data
+    /// rides the generic transaction; on Accept it commits exactly like a
+    /// peer-to-peer transfer. `rights` must be authorized against the
+    /// RegionTable before this is called (the caller owns choreography).
+    pub fn host_grant_region(
+        &mut self,
+        dest: PeerId,
+        target: EpId,
+        corr: u32,
+        rid: RegionId,
+        rights: Rights,
+    ) -> Result<(TransferId, RouteOutcome), Poison> {
+        if !self.regions.region_exists(rid) {
+            return Err(Poison("unknown region id"));
+        }
+        // One writer ever: granting RW requires the Host to currently hold it.
+        if rights == Rights::ReadWrite && self.regions.writable_holder(rid) != Some(HOST_PEER) {
+            return Err(Poison("second writer denied"));
+        }
+        if self.shared_pending.len() >= self.lim.max_resources_in_escrow {
+            return Err(Poison("shared escrow capacity"));
+        }
+        let tid = fresh_transfer_id(&self.taken_tids());
+        self.shared_pending.insert(
+            tid,
+            SharedRec {
+                tid,
+                rid,
+                rights,
+                sender: HOST_PEER,
+                dest,
+                state: NativeState::Escrowed,
+            },
+        );
+        let mut out = RouteOutcome::default();
+        out.send.push((
+            dest,
+            Frame::Data(DataInner {
+                target,
+                corr,
+                attachments: vec![],
+                payload: vec![],
+                native: None,
+                shared: Some(crate::frame::SharedAttachment {
+                    tid,
+                    rid,
+                    rights: encode_rights(rights),
+                    handle_value: 0,
+                }),
+            }),
+        ));
+        Ok((tid, out))
+    }
+
+    fn shared_commit_inner(&mut self, tid: TransferId) -> Result<RouteOutcome, Poison> {
+        let rec = *self
+            .shared_pending
+            .get(&tid)
+            .ok_or(Poison("unknown shared transfer"))?;
+        if rec.state != NativeState::Escrowed {
+            return Ok(RouteOutcome::default());
+        }
+        // Move authority in the RegionTable FIRST (reject-before-mutate rule):
+        // a failed bookkeeping transition aborts before any frame is emitted.
+        match rec.rights {
+            Rights::ReadWrite => {
+                if rec.sender == HOST_PEER {
+                    self.regions
+                        .transfer_writable(rec.rid, HOST_PEER, rec.dest)
+                        .map_err(|_| Poison("second writer denied"))?;
+                } else {
+                    self.regions
+                        .transfer_writable(rec.rid, rec.sender, rec.dest)
+                        .map_err(|_| Poison("writer transfer denied"))?;
+                }
+            }
+            Rights::ReadOnly => {
+                if rec.sender == HOST_PEER {
+                    self.regions
+                        .grant_read_only(rec.rid, rec.dest, &self.lim)
+                        .map_err(|_| Poison("readonly grant denied"))?;
+                } else {
+                    self.regions
+                        .transfer_read_only(rec.rid, rec.sender, rec.dest)
+                        .map_err(|_| Poison("readonly transfer denied"))?;
+                }
+            }
+        }
+        self.shared_pending.remove(&tid);
+        self.shared_results
+            .insert(tid, (rec.sender, Cause::PeerLost, rec.rid));
+        self.shared_live.insert(rec.rid);
+        let mut out = RouteOutcome::default();
+        let size = self.regions.size_of(rec.rid).unwrap_or(0);
+        if !self.inject.drop_commit {
+            out.send.push((
+                rec.dest,
+                Frame::Xfer(XferMsg::SharedCommit {
+                    tid,
+                    rid: rec.rid,
+                    rights: encode_rights(rec.rights),
+                    size,
+                    handle_value: 0, // Host bin fills with recipient-valid object
+                }),
+            ));
+        }
+        if !self.inject.drop_committed && rec.sender != HOST_PEER {
+            out.send
+                .push((rec.sender, Frame::Xfer(XferMsg::Committed { tid })));
+        }
+        Ok(out)
+    }
+
+    fn shared_abort_inner(
+        &mut self,
+        tid: TransferId,
+        _why: &'static str,
+    ) -> Result<RouteOutcome, Poison> {
+        let rec = *self
+            .shared_pending
+            .get(&tid)
+            .ok_or(Poison("unknown shared transfer"))?;
+        if rec.state != NativeState::Escrowed {
+            return Ok(RouteOutcome::default());
+        }
+        // Pre-commit abort: authority never left the sender; RegionTable is
+        // untouched and exact rights are restored implicitly (G12).
+        self.shared_pending.remove(&tid);
+        self.shared_results
+            .insert(tid, (rec.sender, Cause::Graceful, rec.rid));
+        let mut out = RouteOutcome::default();
+        if !self.inject.drop_abort {
+            if rec.sender != HOST_PEER && self.peers.contains_key(&rec.sender) {
+                out.send
+                    .push((rec.sender, Frame::Xfer(XferMsg::Abort { tid })));
+            }
+            if self.peers.contains_key(&rec.dest) {
+                out.send
+                    .push((rec.dest, Frame::Xfer(XferMsg::Abort { tid })));
+            }
+        }
         Ok(out)
     }
 
@@ -611,6 +883,7 @@ impl Router {
                     attachments: vec![],
                     payload,
                     native: None,
+                    shared: None,
                 }),
             ));
         }
@@ -761,6 +1034,32 @@ impl Router {
                 }
             }
         }
+        // Shared-region pending handling. Pre-commit the RegionTable never
+        // moved authority, so cleanup is transactional bookkeeping only.
+        let shared_pending_tids: Vec<TransferId> = self
+            .shared_pending
+            .values()
+            .filter(|s| s.state == NativeState::Escrowed && (s.sender == p || s.dest == p))
+            .map(|s| s.tid)
+            .collect();
+        for tid in shared_pending_tids {
+            if let Some(s) = self.shared_pending.get(&tid).copied() {
+                if s.sender == p {
+                    // Sender died: escrowed backing closes in the Host bin;
+                    // record terminal result so status queries fail closed.
+                    self.shared_pending.remove(&tid);
+                    self.shared_results
+                        .insert(tid, (s.sender, Cause::Graceful, s.rid));
+                } else {
+                    let _ = self.shared_abort_inner(tid, "recipient lost");
+                }
+            }
+        }
+        // Post-commit death: vacate the dead peer's authorities (writer slot
+        // empties; readers shrink). No auto re-mint of a writer.
+        if p != HOST_PEER {
+            self.regions.peer_gone(p);
+        }
         for side in touched {
             if let Some((surviving, pe)) = self.close_conversation(side, cause) {
                 match pe.holder {
@@ -836,11 +1135,19 @@ impl Router {
                 NativeState::Aborted => XFER_ST_ABORTED,
             };
         }
+        if let Some(s) = self.shared_pending.get(&tid) {
+            return match s.state {
+                NativeState::Escrowed => XFER_ST_PENDING,
+                NativeState::Committed => XFER_ST_COMMITTED,
+                NativeState::Aborted => XFER_ST_ABORTED,
+            };
+        }
         let cause = self
             .results
             .get(&tid)
             .map(|(_, c)| *c)
-            .or_else(|| self.native_results.get(&tid).map(|(_, c, _)| *c));
+            .or_else(|| self.native_results.get(&tid).map(|(_, c, _)| *c))
+            .or_else(|| self.shared_results.get(&tid).map(|(_, c, _)| *c));
         if let Some(c) = cause {
             return match c {
                 Cause::PeerLost => XFER_ST_COMMITTED,
@@ -928,6 +1235,16 @@ impl Router {
                         self.native_retired.insert(rid, Cause::Graceful);
                     }
                 }
+                if let Some((sender, _, rid)) = self.shared_results.get(&tid).copied() {
+                    // Host-originated grants are retired by the RECIPIENT's
+                    // ack (the Host is not a wire peer); peer transfers retire
+                    // only on the recorded sender's own ack (idempotent).
+                    if sender == from || sender == HOST_PEER {
+                        self.shared_results.remove(&tid);
+                        self.shared_live.remove(&rid);
+                        self.shared_retired.insert(rid, Cause::Graceful);
+                    }
+                }
                 Ok(RouteOutcome::default())
             }
             XferMsg::Commit { .. }
@@ -935,7 +1252,9 @@ impl Router {
             | XferMsg::Abort { .. }
             | XferMsg::StatusAck { .. }
             | XferMsg::NativeCommit { .. }
-            | XferMsg::NativeAbort { .. } => Err(Poison("peer sent host-only xfer")),
+            | XferMsg::NativeAbort { .. }
+            | XferMsg::SharedCommit { .. }
+            | XferMsg::SharedAbort { .. } => Err(Poison("peer sent host-only xfer")),
         }
     }
 
@@ -976,6 +1295,21 @@ impl Router {
             }
             return self.native_commit_inner(tid);
         }
+        if let Some(n) = self.shared_pending.get(&tid).copied() {
+            if n.dest != from {
+                return Err(Poison("accept from wrong recipient"));
+            }
+            if n.state != NativeState::Escrowed {
+                return Ok(RouteOutcome::default());
+            }
+            if std::env::var("SEAM_PAUSE_BEFORE_COMMIT")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                barrier_wait("host_before_commit");
+            }
+            return self.shared_commit_inner(tid);
+        }
         match self.xfer_status(tid) {
             XFER_ST_COMMITTED | XFER_ST_ABORTED => Ok(RouteOutcome::default()),
             _ => Err(Poison("unknown transfer id")),
@@ -1005,6 +1339,15 @@ impl Router {
                 return Ok(RouteOutcome::default());
             }
             return self.native_abort_inner(tid, why);
+        }
+        if let Some(n) = self.shared_pending.get(&tid).copied() {
+            if n.dest != from && n.sender != from && n.sender != HOST_PEER {
+                return Err(Poison("abort from unrelated peer"));
+            }
+            if n.state != NativeState::Escrowed {
+                return Ok(RouteOutcome::default());
+            }
+            return self.shared_abort_inner(tid, why);
         }
         match self.xfer_status(tid) {
             XFER_ST_COMMITTED | XFER_ST_ABORTED => Ok(RouteOutcome::default()),
@@ -1215,7 +1558,260 @@ mod tests {
             attachments: atts,
             payload: b"x".to_vec(),
             native: None,
+            shared: None,
         }
+    }
+
+    struct AnyTid;
+    impl crate::id::TransferSpace for AnyTid {
+        fn contains(&self, _id: TransferId) -> bool {
+            false
+        }
+    }
+
+    fn shared_data(target: EpId, rid: RegionId, rights: u8) -> DataInner {
+        DataInner {
+            target,
+            corr: 1,
+            attachments: vec![],
+            payload: b"meta".to_vec(),
+            native: None,
+            shared: Some(crate::frame::SharedAttachment {
+                tid: crate::id::fresh_transfer_id(&AnyTid),
+                rid,
+                rights,
+                handle_value: 777,
+            }),
+        }
+    }
+
+    // ---- shared-region authority (RUN 005 / 005B) ----
+
+    fn region() -> RegionId {
+        RegionId([9; 16])
+    }
+
+    #[test]
+    fn host_grant_rw_commits_and_moves_writer_authority() {
+        let lim = Limits::default();
+        let (mut r, a, b, x, y) = primed();
+        let rid = region();
+        r.region_create(rid, 4096, &lim).unwrap();
+        let ra = r.region_accounting();
+        assert_eq!(ra.writable_authorities, 1);
+        assert_eq!(ra.readonly_authorities, 0);
+
+        // Grant RW to peer a.
+        let (_tid, oc) = r
+            .host_grant_region(a, x, 1, rid, Rights::ReadWrite)
+            .unwrap();
+        assert!(matches!(
+            oc.send.as_slice(),
+            [(_, Frame::Data(d))] if d.shared.is_some()
+        ));
+        r.on_xfer(a, XferMsg::Accept { tid: _tid }).unwrap();
+        let out = r.xfer_accept(a, _tid).unwrap(); // idempotent re-accept
+        assert!(out.send.is_empty());
+
+        // Writer moved off the Host sentinel onto the peer.
+        assert_eq!(r.region_accounting().writable_authorities, 1);
+        assert_eq!(r.region_size(rid), Some(4096));
+
+        // Second writer grant is rejected (write_authority_count <= 1).
+        assert!(r
+            .host_grant_region(b, y, 2, rid, Rights::ReadWrite)
+            .is_err());
+    }
+
+    #[test]
+    fn host_grant_ro_adds_reader_without_touching_writer() {
+        let lim = Limits::default();
+        let (mut r, a, b, x, y) = primed();
+        let rid = region();
+        r.region_create(rid, 4096, &lim).unwrap();
+        let (t1, _) = r
+            .host_grant_region(a, x, 1, rid, Rights::ReadWrite)
+            .unwrap();
+        r.on_xfer(a, XferMsg::Accept { tid: t1 }).unwrap();
+
+        let before = r.region_accounting();
+        let (t2, _) = r.host_grant_region(b, y, 2, rid, Rights::ReadOnly).unwrap();
+        r.on_xfer(b, XferMsg::Accept { tid: t2 }).unwrap();
+        let after = r.region_accounting();
+        assert_eq!(after.writable_authorities, before.writable_authorities);
+        assert_eq!(after.readonly_authorities, before.readonly_authorities + 1);
+    }
+
+    #[test]
+    fn unknown_region_offer_poisons() {
+        let (mut r, a, _, x, _) = primed();
+        let err = r
+            .on_data(a, shared_data(x, RegionId([1; 16]), 1))
+            .unwrap_err();
+        assert_eq!(err.0, "unknown region id");
+    }
+
+    #[test]
+    fn rights_claim_from_non_holder_poisons() {
+        let lim = Limits::default();
+        let (mut r, a, b, _x, y) = primed();
+        let rid = region();
+        r.region_create(rid, 4096, &lim).unwrap();
+        // Host holds RW; peer b claims it -> denied.
+        let err = r.on_data(b, shared_data(y, rid, 1)).unwrap_err();
+        assert_eq!(err.0, "shared rights claim denied");
+        // Unknown rights byte -> poison.
+        let err = r.on_data(a, shared_data(_x, rid, 9)).unwrap_err();
+        assert_eq!(err.0, "unknown shared rights byte");
+    }
+
+    #[test]
+    fn rw_transfer_commit_moves_writer_between_peers() {
+        let lim = Limits::default();
+        let (mut r, a, b, x, _y) = primed();
+        let rid = region();
+        r.region_create(rid, 4096, &lim).unwrap();
+        let (t0, _) = r
+            .host_grant_region(a, x, 1, rid, Rights::ReadWrite)
+            .unwrap();
+        r.on_xfer(a, XferMsg::Accept { tid: t0 }).unwrap();
+        r.on_xfer(a, XferMsg::ResultAck { tid: t0 }).unwrap();
+
+        // a stages RW toward b (dest resolved by target ep ownership).
+        let oc = r.on_data(a, shared_data(x, rid, 1)).unwrap();
+        assert!(oc
+            .send
+            .iter()
+            .all(|(_, f)| matches!(f, Frame::Data(d) if d.shared.is_some()))); // offer forwarded to dest
+        let tid = r
+            .shared_pending
+            .keys()
+            .copied()
+            .next()
+            .expect("staged pending");
+        let out = r.on_xfer(b, XferMsg::Accept { tid }).unwrap();
+        // Commit frame carries Host-authoritative rights+size.
+        assert!(out.send.iter().any(|(_, f)| matches!(
+            f,
+            Frame::Xfer(XferMsg::SharedCommit {
+                rights: 1,
+                size: 4096,
+                ..
+            })
+        )));
+        assert_eq!(r.accounting().shared_pending, 0);
+        assert_eq!(r.accounting().shared_unacked, 1);
+
+        // Sender ack retires result + live rid slot.
+        r.on_xfer(a, XferMsg::ResultAck { tid }).unwrap();
+        let acct = r.accounting();
+        assert_eq!(acct.shared_unacked, 0);
+        assert_eq!(acct.shared_pending, 0);
+    }
+
+    #[test]
+    fn rw_transfer_abort_restores_sender_authority_unchanged() {
+        let lim = Limits::default();
+        let (mut r, a, b, x, _y) = primed();
+        let rid = region();
+        r.region_create(rid, 4096, &lim).unwrap();
+        let (t0, _) = r
+            .host_grant_region(a, x, 1, rid, Rights::ReadWrite)
+            .unwrap();
+        r.on_xfer(a, XferMsg::Accept { tid: t0 }).unwrap();
+        r.on_xfer(a, XferMsg::ResultAck { tid: t0 }).unwrap();
+
+        let _oc = r.on_data(a, shared_data(x, rid, 1)).unwrap();
+        let tid = r
+            .shared_pending
+            .keys()
+            .copied()
+            .next()
+            .expect("staged pending");
+        // Recipient rejects pre-commit.
+        let out = r.on_xfer(b, XferMsg::Reject { tid }).unwrap();
+        assert!(out
+            .send
+            .iter()
+            .any(|(_, f)| matches!(f, Frame::Xfer(XferMsg::Abort { .. }))));
+        // Authority never moved: writer is still peer a. Result retained
+        // until the sender acknowledges.
+        assert_eq!(r.accounting().shared_unacked, 1);
+        r.on_xfer(a, XferMsg::ResultAck { tid }).unwrap();
+        assert_eq!(r.accounting().shared_unacked, 0);
+    }
+
+    #[test]
+    fn ro_holder_cannot_stage_rw_claim() {
+        let lim = Limits::default();
+        let (mut r, a, b, x, y) = primed();
+        let rid = region();
+        r.region_create(rid, 4096, &lim).unwrap();
+        let (t0, _) = r
+            .host_grant_region(a, x, 1, rid, Rights::ReadWrite)
+            .unwrap();
+        r.on_xfer(a, XferMsg::Accept { tid: t0 }).unwrap();
+        r.on_xfer(a, XferMsg::ResultAck { tid: t0 }).unwrap();
+        let (t1, _) = r.host_grant_region(b, y, 2, rid, Rights::ReadOnly).unwrap();
+        r.on_xfer(b, XferMsg::Accept { tid: t1 }).unwrap();
+
+        // Reader attempts escalation to RW -> fail closed.
+        let err = r.on_data(b, shared_data(y, rid, 1)).unwrap_err();
+        assert_eq!(err.0, "shared rights claim denied");
+    }
+
+    #[test]
+    fn ro_transfer_moves_reader_authority() {
+        let lim = Limits::default();
+        let (mut r, a, b, x, y) = primed();
+        let rid = region();
+        r.region_create(rid, 4096, &lim).unwrap();
+        let (t0, _) = r
+            .host_grant_region(a, x, 1, rid, Rights::ReadWrite)
+            .unwrap();
+        r.on_xfer(a, XferMsg::Accept { tid: t0 }).unwrap();
+        r.on_xfer(a, XferMsg::ResultAck { tid: t0 }).unwrap();
+        let (t1, _) = r.host_grant_region(b, y, 2, rid, Rights::ReadOnly).unwrap();
+        r.on_xfer(b, XferMsg::Accept { tid: t1 }).unwrap();
+        assert_eq!(r.region_accounting().readonly_authorities, 1);
+
+        // b hands its RO view onward to a (pair-routing: target y, partner x
+        // resolves dest=a). Rights byte 0 = ReadOnly claim, validated against
+        // b's recorded RO authority.
+        let oc = r.on_data(b, shared_data(y, rid, 0)).unwrap();
+        assert!(oc
+            .send
+            .iter()
+            .all(|(_, f)| matches!(f, Frame::Data(d) if d.shared.is_some())));
+        let tid = r
+            .shared_pending
+            .keys()
+            .copied()
+            .next()
+            .expect("staged RO pending");
+        r.on_xfer(a, XferMsg::Accept { tid }).unwrap();
+        // Reader count unchanged by a move (b lost it, a gained it).
+        assert_eq!(r.region_accounting().readonly_authorities, 1);
+        r.on_xfer(b, XferMsg::ResultAck { tid }).unwrap();
+    }
+
+    #[test]
+    fn sender_death_drops_staged_shared_and_keeps_table_consistent() {
+        let lim = Limits::default();
+        let (mut r, a, _b, x, _y) = primed();
+        let rid = region();
+        r.region_create(rid, 4096, &lim).unwrap();
+        let (t0, _) = r
+            .host_grant_region(a, x, 1, rid, Rights::ReadWrite)
+            .unwrap();
+        r.on_xfer(a, XferMsg::Accept { tid: t0 }).unwrap();
+        let _ = r.on_data(a, shared_data(x, rid, 1)).unwrap();
+        assert_eq!(r.accounting().shared_pending, 1);
+        // Sender dies pre-commit: escrow bookkeeping aborts, writer stays a.
+        r.on_eof(a);
+        assert_eq!(r.accounting().shared_pending, 0);
+        // Writer died too: slot vacated, no auto re-mint.
+        assert_eq!(r.region_accounting().writable_authorities, 0);
     }
 
     #[test]
@@ -1782,6 +2378,7 @@ mod tests {
             attachments: vec![],
             payload: b"x".to_vec(),
             native: Some(native),
+            shared: None,
         };
         let out = r.on_data(a, f).unwrap();
         assert!(out

@@ -28,6 +28,7 @@ use crate::fabric_error::Cause;
 use crate::id::{EpId, TransferId};
 use crate::limits::Limits;
 use crate::native::ResourceId;
+use crate::shared::RegionId;
 
 pub const KIND_HELLO: u8 = 1;
 pub const KIND_DATA: u8 = 2;
@@ -50,6 +51,8 @@ pub const XFER_STATUS_ACK: u8 = 7;
 pub const XFER_RESULT_ACK: u8 = 8;
 pub const XFER_NATIVE_COMMIT: u8 = 9;
 pub const XFER_NATIVE_ABORT: u8 = 10;
+pub const XFER_SHARED_COMMIT: u8 = 11;
+pub const XFER_SHARED_ABORT: u8 = 12;
 
 pub const XFER_ST_PENDING: u8 = 0;
 pub const XFER_ST_COMMITTED: u8 = 1;
@@ -80,7 +83,7 @@ pub fn is_control_frame(f: &Frame) -> bool {
             | Frame::Xfer(_)
             | Frame::Close { .. }
             | Frame::Create
-    ) || matches!(f, Frame::Data(d) if d.native.is_some() || !d.attachments.is_empty())
+    ) || matches!(f, Frame::Data(d) if d.native.is_some() || d.shared.is_some() || !d.attachments.is_empty())
 }
 
 /// Payload-bearing routed message body (kept separate so the router can take
@@ -92,6 +95,7 @@ pub struct DataInner {
     pub attachments: Vec<Attachment>,
     pub payload: Vec<u8>,
     pub native: Option<NativeAttachment>,
+    pub shared: Option<SharedAttachment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +109,18 @@ pub struct Attachment {
 pub struct NativeAttachment {
     pub tid: TransferId,
     pub rid: ResourceId,
+    pub handle_value: u64,
+}
+
+/// Shared-region capability offer (sender -> Host). Rights/size are CLAIMS
+/// here; the Host validates them against its RegionTable and re-authoritative
+/// values travel only in `SharedCommit`. No region size on the wire from the
+/// sender: the Host resolves size by `RegionId` (G38).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAttachment {
+    pub tid: TransferId,
+    pub rid: RegionId,
+    pub rights: u8,
     pub handle_value: u64,
 }
 
@@ -145,6 +161,25 @@ pub enum XferMsg {
     NativeAbort {
         tid: TransferId,
         rid: ResourceId,
+        handle_value: u64,
+    },
+    /// Host -> recipient: commit delivery of a shared-region capability.
+    /// `rights`/`size` are Host-authoritative (recipient never trusts the
+    /// sender's claim); `handle_value` is a kernel object valid in the
+    /// recipient's process (Windows inline; Linux arrives via lane).
+    SharedCommit {
+        tid: TransferId,
+        rid: RegionId,
+        rights: u8,
+        size: u64,
+        handle_value: u64,
+    },
+    /// Host -> sender: pre-commit abort restoration. Rights are implicit —
+    /// the sender rebuilds its capability with exactly the rights it held
+    /// before staging (abort must never change rights).
+    SharedAbort {
+        tid: TransferId,
+        rid: RegionId,
         handle_value: u64,
     },
 }
@@ -199,7 +234,12 @@ impl Frame {
             Frame::Hello { .. } => 5,
             Frame::Data(d) => {
                 let native_len = if d.native.is_some() { 1 + 40 } else { 1 };
-                16 + 4 + 1 + d.attachments.len() * 48 + native_len + d.payload.len()
+                let shared_len = if d.shared.is_some() {
+                    1 + 16 + 16 + 1 + 8
+                } else {
+                    1
+                };
+                16 + 4 + 1 + d.attachments.len() * 48 + native_len + shared_len + d.payload.len()
             }
             Frame::Close { .. } => 16,
             Frame::ClosedNotify { entries } => 2 + entries.len() * 17,
@@ -212,6 +252,8 @@ impl Frame {
             Frame::Xfer(XferMsg::StatusAck { .. }) => 1 + 16 + 1,
             Frame::Xfer(XferMsg::NativeCommit { .. }) => 1 + 16 + 16 + 8,
             Frame::Xfer(XferMsg::NativeAbort { .. }) => 1 + 16 + 16 + 8,
+            Frame::Xfer(XferMsg::SharedCommit { .. }) => 1 + 16 + 16 + 1 + 8 + 8,
+            Frame::Xfer(XferMsg::SharedAbort { .. }) => 1 + 16 + 16 + 8,
             Frame::Xfer(_) => 1 + 16,
         };
         4 + 1 + body // length prefix + kind byte + body
@@ -311,6 +353,12 @@ impl<'a> Cursor<'a> {
         b.copy_from_slice(s);
         Ok(ResourceId(b))
     }
+    fn region(&mut self) -> Result<RegionId, FrameError> {
+        let s = self.take(16)?;
+        let mut b = [0u8; 16];
+        b.copy_from_slice(s);
+        Ok(RegionId(b))
+    }
     fn u64v(&mut self) -> Result<u64, FrameError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
@@ -352,6 +400,15 @@ pub fn encode_into(frame: &Frame, out: &mut Vec<u8>) {
                 put_tid(out, n.tid);
                 put_rid(out, n.rid);
                 put_u64(out, n.handle_value);
+            } else {
+                out.push(0);
+            }
+            if let Some(s) = &d.shared {
+                out.push(1);
+                put_tid(out, s.tid);
+                out.extend_from_slice(&s.rid.0);
+                out.push(s.rights);
+                put_u64(out, s.handle_value);
             } else {
                 out.push(0);
             }
@@ -441,6 +498,30 @@ pub fn encode_into(frame: &Frame, out: &mut Vec<u8>) {
                 put_rid(out, *rid);
                 put_u64(out, *handle_value);
             }
+            XferMsg::SharedCommit {
+                tid,
+                rid,
+                rights,
+                size,
+                handle_value,
+            } => {
+                out.push(XFER_SHARED_COMMIT);
+                put_tid(out, *tid);
+                out.extend_from_slice(&rid.0);
+                out.push(*rights);
+                put_u64(out, *size);
+                put_u64(out, *handle_value);
+            }
+            XferMsg::SharedAbort {
+                tid,
+                rid,
+                handle_value,
+            } => {
+                out.push(XFER_SHARED_ABORT);
+                put_tid(out, *tid);
+                out.extend_from_slice(&rid.0);
+                put_u64(out, *handle_value);
+            }
         },
     }
     let len = (out.len() - start - 4) as u32;
@@ -493,6 +574,23 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
             } else {
                 return Err(FrameError::UnknownKind(KIND_DATA));
             };
+            let has_shared = c.u8v()?;
+            let shared = if has_shared == 1 {
+                let tid = c.tid()?;
+                let rid = c.region()?;
+                let rights = c.u8v()?;
+                let handle_value = c.u64v()?;
+                Some(SharedAttachment {
+                    tid,
+                    rid,
+                    rights,
+                    handle_value,
+                })
+            } else if has_shared == 0 {
+                None
+            } else {
+                return Err(FrameError::UnknownKind(KIND_DATA));
+            };
             let payload = c.rest().to_vec();
             Ok(Frame::Data(DataInner {
                 target,
@@ -500,6 +598,7 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
                 attachments,
                 payload,
                 native,
+                shared,
             }))
         }
         KIND_CLOSE => Ok(Frame::Close { target: c.epid()? }),
@@ -566,6 +665,18 @@ pub fn decode_body(kind: u8, body: &[u8], lim: &Limits) -> Result<Frame, FrameEr
                 XFER_NATIVE_ABORT => XferMsg::NativeAbort {
                     tid,
                     rid: c.rid()?,
+                    handle_value: c.u64v()?,
+                },
+                XFER_SHARED_COMMIT => XferMsg::SharedCommit {
+                    tid,
+                    rid: c.region()?,
+                    rights: c.u8v()?,
+                    size: c.u64v()?,
+                    handle_value: c.u64v()?,
+                },
+                XFER_SHARED_ABORT => XferMsg::SharedAbort {
+                    tid,
+                    rid: c.region()?,
                     handle_value: c.u64v()?,
                 },
                 _ => return Err(FrameError::UnknownKind(KIND_XFER)),
@@ -662,6 +773,7 @@ mod tests {
                 }],
                 payload: vec![1, 2, 3],
                 native: None,
+                shared: None,
             }),
             Frame::Close { target: ep(7) },
             Frame::ClosedNotify {
@@ -688,6 +800,31 @@ mod tests {
             Frame::Xfer(XferMsg::StatusAck {
                 tid: tid(8),
                 status: XFER_ST_COMMITTED,
+            }),
+            Frame::Xfer(XferMsg::SharedCommit {
+                tid: tid(9),
+                rid: crate::shared::RegionId([5; 16]),
+                rights: 0,
+                size: 4096,
+                handle_value: 7,
+            }),
+            Frame::Xfer(XferMsg::SharedAbort {
+                tid: tid(10),
+                rid: crate::shared::RegionId([6; 16]),
+                handle_value: 9,
+            }),
+            Frame::Data(DataInner {
+                target: ep(3),
+                corr: 4,
+                attachments: vec![],
+                payload: b"meta-only".to_vec(),
+                native: None,
+                shared: Some(crate::frame::SharedAttachment {
+                    tid: tid(11),
+                    rid: crate::shared::RegionId([7; 16]),
+                    rights: 1,
+                    handle_value: 0xdead_beef,
+                }),
             }),
         ];
         for f in frames {
