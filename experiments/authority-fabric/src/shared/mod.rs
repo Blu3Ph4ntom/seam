@@ -445,7 +445,9 @@ impl SharedRegion {
     }
 
     /// Map a writable view. Fails if this capability is not writable.
-    pub fn map_read_write(&mut self) -> std::io::Result<MappedReadWrite> {
+    /// Map a writable view. The returned view borrows this capability:
+    /// while mapped, the region cannot move, drop or transfer (G-A7).
+    pub fn map_read_write(&mut self) -> std::io::Result<MappedReadWrite<'_>> {
         if !self.rights.is_writable() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -456,7 +458,7 @@ impl SharedRegion {
     }
 
     /// Map a read-only view. Allowed for any capability.
-    pub fn map_read_only(&self) -> std::io::Result<MappedReadOnly> {
+    pub fn map_read_only(&self) -> std::io::Result<MappedReadOnly<'_>> {
         map_read_only(&self.backing, self.size as usize)
     }
 
@@ -502,26 +504,26 @@ impl SharedRegion {
     pub fn duplicate_backing_handle(&self, writable: bool) -> std::io::Result<File> {
         duplicate_backing(&self.backing, writable)
     }
+}
 
-    /// Map `offset..offset+len` with out-of-bounds rejection (checked).
-    /// Returns a sub-slice view over the full mapping (no new unsafe mapping).
-    pub fn read_slice_at<'a>(
-        &'a self,
-        mapping: &'a MappedReadOnly,
-        offset: usize,
-        len: usize,
-    ) -> std::io::Result<&'a [u8]> {
+impl<'a> MappedReadOnly<'a> {
+    /// Bounds-checked sub-slice of this mapping (offset+len overflow and
+    /// beyond-region rejected before any slice construction).
+    pub fn slice_at(&self, offset: usize, len: usize) -> std::io::Result<&'a [u8]> {
         let end = offset.checked_add(len).ok_or(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "offset+len overflow",
         ))?;
-        if end > self.size as usize {
+        let (ptr, mlen) = self.raw_parts();
+        if end > mlen {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "mapping extends beyond region",
             ));
         }
-        Ok(&mapping.as_slice()[offset..end])
+        // SAFETY: the mapping is live for 'a (PhantomData tie) and
+        // offset..end was just bounds-checked against its length.
+        Ok(unsafe { std::slice::from_raw_parts(ptr.add(offset), len) })
     }
 }
 
@@ -578,8 +580,8 @@ mod tests {
         assert_eq!(checksum(r.as_slice()), want);
         // Read-only view exposes no mutable slice (type-level, compiles only
         // via as_slice). OOB rejection:
-        assert!(ro.read_slice_at(&r, 0, 4 * 1024 * 1024 + 1).is_err());
-        assert!(ro.read_slice_at(&r, 1, usize::MAX).is_err());
+        assert!(r.slice_at(0, 4 * 1024 * 1024 + 1).is_err());
+        assert!(r.slice_at(1, usize::MAX).is_err());
     }
 
     #[test]
@@ -657,11 +659,13 @@ mod tests {
                 Ok(r) => r,
                 Err(_) => continue, // resource-limited environment
             };
-            let mut w = reg.map_read_write().unwrap();
-            // Touch a sample of pages.
-            for off in (0..size as usize).step_by(1 << 16) {
-                w.as_mut_slice()[off] = (off & 0xff) as u8;
-            }
+            {
+                let mut w = reg.map_read_write().unwrap();
+                // Touch a sample of pages.
+                for off in (0..size as usize).step_by(1 << 16) {
+                    w.as_mut_slice()[off] = (off & 0xff) as u8;
+                }
+            } // writable session ends before attenuation
             let ro = reg.derive_read_only().unwrap();
             let r = ro.map_read_only().unwrap();
             for off in (0..size as usize).step_by(1 << 16) {
@@ -670,8 +674,40 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Native rights enforcement: prove a compromised recipient cannot obtain
+    // -------------------------------------------------------------------
+    // Capability vs mapping lifetime (RUN 005D §5): executable answers.
+    // -------------------------------------------------------------------
+
+    /// Mapping drop removes NO authority; the capability stays fully usable
+    /// and remappable. Views never outlive their capability borrow (the
+    /// compiler enforces it), so "mapping outlives wrapper" cannot occur in
+    /// safe Rust, and dropping the capability while a view exists is a
+    /// compile error (see compile-fail/shared_transfer_while_mapped).
+    #[test]
+    fn mapping_and_authority_lifetimes_are_independent() {
+        let mut reg = SharedRegion::create(4096, &lim()).unwrap();
+        let rid0 = reg.id();
+        {
+            // A live read-only view does NOT block attenuation (& borrows).
+            let v = reg.map_read_only().unwrap();
+            assert_eq!(v.as_slice()[..4], [0; 4]);
+            let ro = reg.derive_read_only().unwrap();
+            assert_eq!(ro.rights(), Rights::ReadOnly);
+            assert_eq!(reg.id(), ro.id());
+        }
+        // Remapping after unmap works: mapping lifetime != capability life.
+        {
+            let mut w = reg.map_read_write().unwrap();
+            w.as_mut_slice()[7] = 42;
+        }
+        {
+            let v = reg.map_read_only().unwrap();
+            assert_eq!(v.as_slice()[7], 42);
+        }
+        assert_eq!(reg.id(), rid0);
+        assert!(reg.map_read_write().is_ok());
+    }
+
     // writable kernel access from a read-only transferred backing. This is the
     // RUN 005B hard gate (G1-G6); Rust typing alone is insufficient evidence.
     // ---------------------------------------------------------------------

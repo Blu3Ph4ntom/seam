@@ -1,0 +1,12 @@
+error[E0505]: cannot move out of `reg` because it is borrowed
+  --> tests/compile-fail/shared_transfer_while_mapped.rs:9:42
+   |
+ 5 |     let mut reg = SharedRegion::create(4096, &Limits::default()).unwrap();
+   |         ------- binding `reg` declared here
+ 6 |     let mut view = reg.map_read_write().unwrap();
+   |                    --- borrow of `reg` occurs here
+...
+ 9 |     let (_id, _rights, _size, backing) = reg.into_backing(); //~ ERROR E0505
+   |                                          ^^^ move out of `reg` occurs here
+10 |     view.as_mut_slice()[0] = 1;
+   |     ---- borrow later used here

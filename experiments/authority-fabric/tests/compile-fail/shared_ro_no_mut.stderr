@@ -1,4 +1,4 @@
-error[E0599]: no method named `as_mut_slice` found for struct `MappedReadOnly` in the current scope
+error[E0599]: no method named `as_mut_slice` found for struct `MappedReadOnly<'a>` in the current scope
   --> tests/compile-fail/shared_ro_no_mut.rs:10:33
    |
 10 |     let bytes: &mut [u8] = view.as_mut_slice(); //~ ERROR no method named `as_mut_slice`

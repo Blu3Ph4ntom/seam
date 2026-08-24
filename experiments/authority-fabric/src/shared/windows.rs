@@ -78,18 +78,24 @@ pub fn duplicate_backing(file: &File, writable: bool) -> std::io::Result<File> {
 
 /// A live writable view of a region. Dropping unmaps; does NOT drop the
 /// backing capability.
-pub struct MappedReadWrite {
+/// A live writable view, lifetime-tied to the capability it was mapped
+/// from: while it exists the region cannot be moved, dropped or have its
+/// authority transferred (enforced by the borrow checker).
+pub struct MappedReadWrite<'a> {
     ptr: *mut u8,
     len: usize,
+    _owner: std::marker::PhantomData<&'a mut crate::shared::SharedRegion>,
 }
 
 /// A live read-only view of a region. Exposes only an immutable slice.
-pub struct MappedReadOnly {
+/// A live read-only view tied to its capability borrow.
+pub struct MappedReadOnly<'a> {
     ptr: *mut u8,
     len: usize,
+    _owner: std::marker::PhantomData<&'a crate::shared::SharedRegion>,
 }
 
-impl MappedReadWrite {
+impl<'a> MappedReadWrite<'a> {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: ptr is a valid mapped region of `len` bytes owned by this
         // struct; the slice lifetime is bounded by `&mut self`. Mapping Drop
@@ -98,14 +104,20 @@ impl MappedReadWrite {
     }
 }
 
-impl MappedReadOnly {
+impl<'a> MappedReadOnly<'a> {
+    /// Immutable bytes of this live mapping.
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: see MappedReadWrite. Immutable view; no mutable aliasing.
+        // SAFETY: immutable view of a live mapping; no mutable aliasing.
         unsafe { slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// Raw parts for lifetime-preserving slice construction in mod.rs.
+    pub(crate) fn raw_parts(&self) -> (*const u8, usize) {
+        (self.ptr, self.len)
     }
 }
 
-impl Drop for MappedReadWrite {
+impl Drop for MappedReadWrite<'_> {
     fn drop(&mut self) {
         // SAFETY: ptr came from MapViewOfFile for this mapping.
         unsafe {
@@ -114,7 +126,7 @@ impl Drop for MappedReadWrite {
     }
 }
 
-impl Drop for MappedReadOnly {
+impl Drop for MappedReadOnly<'_> {
     fn drop(&mut self) {
         unsafe {
             UnmapViewOfFile(self.ptr as *mut winapi::ctypes::c_void);
@@ -122,7 +134,7 @@ impl Drop for MappedReadOnly {
     }
 }
 
-pub fn map_read_write(file: &File, len: usize) -> std::io::Result<MappedReadWrite> {
+pub fn map_read_write<'a>(file: &File, len: usize) -> std::io::Result<MappedReadWrite<'a>> {
     // SAFETY: mapping a caller-owned section; view is wrapped and unmapped on
     // Drop. Length is validated by the caller against the region size.
     unsafe {
@@ -139,11 +151,12 @@ pub fn map_read_write(file: &File, len: usize) -> std::io::Result<MappedReadWrit
         Ok(MappedReadWrite {
             ptr: p as *mut u8,
             len,
+            _owner: std::marker::PhantomData,
         })
     }
 }
 
-pub fn map_read_only(file: &File, len: usize) -> std::io::Result<MappedReadOnly> {
+pub fn map_read_only<'a>(file: &File, len: usize) -> std::io::Result<MappedReadOnly<'a>> {
     unsafe {
         let p = MapViewOfFile(
             file.as_raw_handle() as *mut winapi::ctypes::c_void,
@@ -158,6 +171,7 @@ pub fn map_read_only(file: &File, len: usize) -> std::io::Result<MappedReadOnly>
         Ok(MappedReadOnly {
             ptr: p as *mut u8,
             len,
+            _owner: std::marker::PhantomData,
         })
     }
 }

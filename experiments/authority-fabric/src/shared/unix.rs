@@ -65,18 +65,22 @@ pub fn duplicate_backing(file: &File, writable: bool) -> std::io::Result<File> {
 
 /// A live writable view of a region. Dropping unmaps; does NOT drop the
 /// backing capability.
-pub struct MappedReadWrite {
+/// Lifetime-tied writable view (see windows module for the invariant).
+pub struct MappedReadWrite<'a> {
     ptr: *mut u8,
     len: usize,
+    _owner: std::marker::PhantomData<&'a mut crate::shared::SharedRegion>,
 }
 
 /// A live read-only view of a region. Exposes only an immutable slice.
-pub struct MappedReadOnly {
+/// Lifetime-tied read-only view.
+pub struct MappedReadOnly<'a> {
     ptr: *mut u8,
     len: usize,
+    _owner: std::marker::PhantomData<&'a crate::shared::SharedRegion>,
 }
 
-impl MappedReadWrite {
+impl<'a> MappedReadWrite<'a> {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: ptr is a valid mapped region of `len` bytes owned by this
         // struct; slice lifetime bounded by `&mut self`; Drop unmaps first.
@@ -84,26 +88,27 @@ impl MappedReadWrite {
     }
 }
 
-impl MappedReadOnly {
+impl<'a> MappedReadOnly<'a> {
+    /// Immutable bytes of this live mapping.
     pub fn as_slice(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
-impl Drop for MappedReadWrite {
+impl Drop for MappedReadWrite<'_> {
     fn drop(&mut self) {
         // SAFETY: ptr came from mmap for this mapping.
         let _ = unsafe { munmap(self.ptr as *mut _, self.len) };
     }
 }
 
-impl Drop for MappedReadOnly {
+impl Drop for MappedReadOnly<'_> {
     fn drop(&mut self) {
         let _ = unsafe { munmap(self.ptr as *mut _, self.len) };
     }
 }
 
-pub fn map_read_write(file: &File, len: usize) -> std::io::Result<MappedReadWrite> {
+pub fn map_read_write<'a>(file: &File, len: usize) -> std::io::Result<MappedReadWrite<'a>> {
     let borrowed: BorrowedFd<'_> = file.as_fd();
     // SAFETY: MAP_SHARED view of a caller-owned memfd; wrapped + unmapped on
     // Drop. Length validated by caller.
@@ -119,11 +124,12 @@ pub fn map_read_write(file: &File, len: usize) -> std::io::Result<MappedReadWrit
         Ok(MappedReadWrite {
             ptr: p as *mut u8,
             len,
+            _owner: std::marker::PhantomData,
         })
     }
 }
 
-pub fn map_read_only(file: &File, len: usize) -> std::io::Result<MappedReadOnly> {
+pub fn map_read_only<'a>(file: &File, len: usize) -> std::io::Result<MappedReadOnly<'a>> {
     let borrowed: BorrowedFd<'_> = file.as_fd();
     unsafe {
         let p = mmap(
@@ -137,6 +143,7 @@ pub fn map_read_only(file: &File, len: usize) -> std::io::Result<MappedReadOnly>
         Ok(MappedReadOnly {
             ptr: p as *mut u8,
             len,
+            _owner: std::marker::PhantomData,
         })
     }
 }
