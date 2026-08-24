@@ -157,7 +157,9 @@ fn peer() {
                 // exhaust address space or descriptors (bench hygiene).
                 PEER_PTR.with(|c| {
                     let parts = c.borrow_mut().take();
-                    if let Some((ptr, len)) = parts {
+                    #[cfg(unix)]
+                    let len = len;
+                    if let Some((ptr, _len)) = parts {
                         #[cfg(windows)]
                         authority_fabric::shared::unmap_view(ptr);
                         #[cfg(unix)]
