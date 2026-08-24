@@ -733,12 +733,10 @@ mod tests {
     #[test]
     fn linux_ro_native_fd_rejects_writable_mapping() {
         let mut reg = SharedRegion::create(4096, &lim()).unwrap();
-        let seed: u64 = 0x0dd_ba11_5ead_5eed;
         // Producer writes through its writable session...
         {
             let mut w = reg.map_read_write().unwrap();
             w.as_mut_slice()[0] = 7;
-            authority_fabric::shared::fill_pattern(&mut [0u8; 0], seed);
             w.as_mut_slice()[1] = 9;
         }
         // ...ends the session, then derives RO over the SAME pages.
