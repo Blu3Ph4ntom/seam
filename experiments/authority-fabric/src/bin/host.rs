@@ -20,8 +20,17 @@ use authority_fabric::frame::{self, Frame, FrameError, XferMsg};
 use authority_fabric::id::{EpId, TransferId};
 use authority_fabric::proto::{self, ControlMsg};
 use authority_fabric::queue::DualQueue;
-use authority_fabric::router::{PeerId, Router};
+use authority_fabric::router::{self, PeerId, Router};
+use authority_fabric::shared::{RegionId, Rights, SharedRegion};
 use authority_fabric::{marker, Limits};
+
+fn decode_rights_byte(b: u8) -> Option<Rights> {
+    match b {
+        0 => Some(Rights::ReadOnly),
+        1 => Some(Rights::ReadWrite),
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------- core ----
 
@@ -64,6 +73,21 @@ struct Fabric {
     exit_codes: HashMap<PeerId, i32>,
     native_escrow:
         HashMap<TransferId, (std::fs::File, PeerId, authority_fabric::native::ResourceId)>,
+    /// Shared-region backing in Host escrow: the kernel object plus the
+    /// authoritative rights it must be delivered with.
+    shared_escrow: HashMap<
+        TransferId,
+        (
+            std::fs::File,
+            PeerId,
+            authority_fabric::shared::RegionId,
+            authority_fabric::shared::Rights,
+        ),
+    >,
+    /// Master backing objects per RegionId. The Host retains one kernel
+    /// reference per region so every subsequent grant derives from the SAME
+    /// pages; escrow copies are duplicates, never the master.
+    region_backings: HashMap<authority_fabric::shared::RegionId, std::fs::File>,
 }
 
 /// Duplicate the escrowed kernel object into `dest`'s process and return the
@@ -98,6 +122,8 @@ impl Fabric {
             ctrl_drain: VecDeque::new(),
             exit_codes: HashMap::new(),
             native_escrow: HashMap::new(),
+            shared_escrow: HashMap::new(),
+            region_backings: HashMap::new(),
         }
     }
 
@@ -271,6 +297,10 @@ impl Fabric {
                 let native_tid = d.native.as_ref().map(|n| n.tid);
                 let native_rid = d.native.as_ref().map(|n| n.rid);
                 let native_handle = d.native.as_ref().map(|n| n.handle_value);
+                let sh_tid = d.shared.as_ref().map(|s| s.tid);
+                let sh_rid = d.shared.as_ref().map(|s| s.rid);
+                let sh_rights_raw = d.shared.as_ref().map(|s| s.rights);
+                let sh_hval = d.shared.as_ref().map(|s| s.handle_value);
                 let res = self.router.on_data(pid, d);
                 // After logical escrow, do platform staging for native
                 if let (Ok(_), Some(tid), Some(_rid), Some(hval)) =
@@ -326,6 +356,72 @@ impl Fabric {
                                     }
                                     Err(e) => marker!(
                                         "HOST_NATIVE_STAGE_FAILED tid={} err={}",
+                                        tid.0[0],
+                                        e
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                }
+                // Shared-region staging: escrow the sender's backing object
+                // the moment the router accepts the offer (same instant as
+                // native). Rights come from the offer; the router has already
+                // validated the claim against its RegionTable.
+                if let (Ok(_), Some(tid), Some(rid), Some(rbyte), Some(hval)) =
+                    (&res, sh_tid, sh_rid, sh_rights_raw, sh_hval)
+                {
+                    let Some(rights) = decode_rights_byte(rbyte) else {
+                        return true;
+                    };
+                    #[cfg(windows)]
+                    {
+                        if let Some(conn) = self.conns.get(&pid) {
+                            let proc_handle =
+                                conn.child.as_raw_handle() as *mut winapi::ctypes::c_void;
+                            if hval != 0 {
+                                match authority_fabric::native::windows::stage_from_sender(
+                                    proc_handle,
+                                    hval,
+                                ) {
+                                    Ok(escrow) => {
+                                        let raw = escrow.0.into_raw_handle();
+                                        // SAFETY: sole ownership moved from OwnedHandle into File
+                                        let file = unsafe { std::fs::File::from_raw_handle(raw) };
+                                        self.shared_escrow.insert(tid, (file, pid, rid, rights));
+                                        marker!("HOST_SHARED_ESCROWED tid={}", tid.0[0]);
+                                    }
+                                    Err(e) => marker!(
+                                        "HOST_SHARED_STAGE_FAILED tid={} err={}",
+                                        tid.0[0],
+                                        e
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(unix)]
+                    {
+                        if let Some(conn) = self.conns.get(&pid) {
+                            if let Some(lane) = conn.resource_lane.as_ref() {
+                                match authority_fabric::native::unix::stage_from_sender(lane) {
+                                    Ok(m) => {
+                                        if m.tid == tid && m.rid.0 == rid.0 && m.fd.is_some() {
+                                            let file =
+                                                authority_fabric::native::unix::escrow_to_file(
+                                                    authority_fabric::native::unix::Escrowed(
+                                                        m.fd.unwrap(),
+                                                    ),
+                                                );
+                                            self.shared_escrow
+                                                .insert(tid, (file, pid, rid, rights));
+                                            marker!("HOST_SHARED_ESCROWED tid={}", tid.0[0]);
+                                        } else {
+                                            marker!("HOST_SHARED_STAGE_MISMATCH tid={}", tid.0[0]);
+                                        }
+                                    }
+                                    Err(e) => marker!(
+                                        "HOST_SHARED_STAGE_FAILED tid={} err={}",
                                         tid.0[0],
                                         e
                                     ),
@@ -481,6 +577,95 @@ impl Fabric {
                     marker!("HOST_NATIVE_ESCROW_MISS tid={} had={}", tid.0[0], had);
                 }
             }
+            // Shared-region commit delivery: duplicate the escrowed backing
+            // into the DEST process with rights-appropriate access. Commit
+            // point = this successful duplication (mirrors native).
+            if let Frame::Xfer(XferMsg::SharedCommit {
+                tid,
+                rid,
+                rights,
+                size: _,
+                handle_value,
+            }) = &mut frame
+            {
+                if let Some((escrow_file, _sender, s_rid, s_rights)) =
+                    self.shared_escrow.remove(tid)
+                {
+                    debug_assert_eq!(s_rid, *rid);
+                    #[cfg(windows)]
+                    {
+                        let dest_proc = self
+                            .conns
+                            .get(dest)
+                            .map(|c| c.child.as_raw_handle() as *mut winapi::ctypes::c_void);
+                        if let Some(dp) = dest_proc {
+                            // Least privilege: a read-only capability must
+                            // arrive unable to map writable (RUN 005B G2).
+                            let access = if s_rights.is_writable() {
+                                authority_fabric::shared::SECTION_RW_ACCESS
+                            } else {
+                                authority_fabric::shared::SECTION_RO_ACCESS
+                            };
+                            let src = escrow_file.as_raw_handle() as *mut winapi::ctypes::c_void;
+                            use std::os::windows::io::AsRawHandle;
+                            match authority_fabric::native::windows::dup_to_process_opts(
+                                dp, src, access, 0,
+                            ) {
+                                Ok(hval) => {
+                                    *handle_value = hval;
+                                    *rights = authority_fabric::router::encode_rights(s_rights);
+                                    marker!(
+                                        "HOST_SHARED_DELIVERED tid={} hval={:#x} ro={}",
+                                        tid.0[0],
+                                        hval,
+                                        !s_rights.is_writable()
+                                    );
+                                }
+                                Err(e) => {
+                                    marker!("HOST_SHARED_COMMIT_FAILED tid={} err={}", tid.0[0], e)
+                                }
+                            }
+                        } else {
+                            drop(escrow_file);
+                        }
+                    }
+                    #[cfg(unix)]
+                    {
+                        let dest_lane = self.conns.get(dest).and_then(|c| {
+                            c.resource_lane.as_ref().and_then(|l| l.try_clone().ok())
+                        });
+                        match dest_lane {
+                            Some(lane) => {
+                                use std::os::unix::io::{FromRawFd, IntoRawFd};
+                                // SAFETY: sole ownership of escrow fd moves
+                                // into OwnedFd for the sendmsg.
+                                let owned = unsafe {
+                                    std::os::fd::OwnedFd::from_raw_fd(escrow_file.into_raw_fd())
+                                };
+                                match authority_fabric::native::unix::deliver_to_recipient(
+                                    &lane,
+                                    *tid,
+                                    authority_fabric::native::ResourceId(s_rid.0),
+                                    authority_fabric::native::unix::Escrowed(owned),
+                                ) {
+                                    Ok(()) => {
+                                        *rights = authority_fabric::router::encode_rights(s_rights);
+                                        marker!("HOST_SHARED_DELIVERED_UNIX tid={}", tid.0[0]);
+                                    }
+                                    Err(e) => marker!(
+                                        "HOST_SHARED_COMMIT_FAILED tid={} err={}",
+                                        tid.0[0],
+                                        e
+                                    ),
+                                }
+                            }
+                            None => drop(escrow_file),
+                        }
+                    }
+                } else {
+                    marker!("HOST_SHARED_ESCROW_MISS tid={}", tid.0[0]);
+                }
+            }
             // Native pre-commit abort: restore escrow to SENDER (windows
             // duplicates the handle back; unix sendmsg's it over the lane).
             if let Frame::Xfer(XferMsg::Abort { tid: abort_tid }) = frame.clone() {
@@ -562,6 +747,92 @@ impl Fabric {
                     } else {
                         drop(escrow_file);
                     }
+                } else if let Some((sfile, s_sender, s_rid, _s_rights)) =
+                    self.shared_escrow.remove(&abort_tid)
+                {
+                    // Shared pre-commit abort: restore the backing to the
+                    // sender with its original access; rights never changed.
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::io::AsRawHandle;
+                        if s_sender != authority_fabric::router::HOST_PEER {
+                            let sender_proc = self
+                                .conns
+                                .get(&s_sender)
+                                .map(|c| c.child.as_raw_handle() as *mut winapi::ctypes::c_void);
+                            if let Some(sp) = sender_proc {
+                                let src = sfile.as_raw_handle() as *mut winapi::ctypes::c_void;
+                                match authority_fabric::native::windows::dup_to_process_opts(
+                                    sp,
+                                    src,
+                                    0,
+                                    winapi::um::winnt::DUPLICATE_SAME_ACCESS,
+                                ) {
+                                    Ok(hval) => {
+                                        frame = Frame::Xfer(XferMsg::SharedAbort {
+                                            tid: abort_tid,
+                                            rid: s_rid,
+                                            handle_value: hval,
+                                        });
+                                        marker!(
+                                            "HOST_SHARED_RESTORED tid={} hval={:#x}",
+                                            abort_tid.0[0],
+                                            hval
+                                        );
+                                    }
+                                    Err(e) => marker!(
+                                        "HOST_SHARED_RESTORE_FAILED tid={} err={}",
+                                        abort_tid.0[0],
+                                        e
+                                    ),
+                                }
+                            } else {
+                                drop(sfile);
+                            }
+                        } else {
+                            // Host-originated grant aborted: the Host regains
+                            // nothing on the wire; backing closes and the
+                            // RegionTable still records the Host as writer.
+                            drop(sfile);
+                            marker!("HOST_SHARED_GRANT_ABORTED tid={}", abort_tid.0[0]);
+                        }
+                    }
+                    #[cfg(unix)]
+                    {
+                        if s_sender != authority_fabric::router::HOST_PEER {
+                            let sender_lane = self.conns.get(&s_sender).and_then(|c| {
+                                c.resource_lane.as_ref().and_then(|l| l.try_clone().ok())
+                            });
+                            match sender_lane {
+                                Some(lane) => {
+                                    use std::os::unix::io::{FromRawFd, IntoRawFd};
+                                    let owned = unsafe {
+                                        std::os::fd::OwnedFd::from_raw_fd(sfile.into_raw_fd())
+                                    };
+                                    match authority_fabric::native::unix::restore_to_sender(
+                                        &lane,
+                                        abort_tid,
+                                        authority_fabric::native::ResourceId(s_rid.0),
+                                        authority_fabric::native::unix::Escrowed(owned),
+                                    ) {
+                                        Ok(()) => marker!(
+                                            "HOST_SHARED_RESTORED_UNIX tid={}",
+                                            abort_tid.0[0]
+                                        ),
+                                        Err(e) => marker!(
+                                            "HOST_SHARED_RESTORE_FAILED tid={} err={}",
+                                            abort_tid.0[0],
+                                            e
+                                        ),
+                                    }
+                                }
+                                None => drop(sfile),
+                            }
+                        } else {
+                            drop(sfile);
+                            marker!("HOST_SHARED_GRANT_ABORTED tid={}", abort_tid.0[0]);
+                        }
+                    }
                 }
             }
             if let Some(c) = self.conns.get(dest) {
@@ -569,7 +840,7 @@ impl Fabric {
                 // Transfer offers ride the reserved ctrl compartment so a
                 // saturated DATA queue cannot strand authority in escrow.
                 let is_ctrl = frame::is_control_frame(&frame)
-                    || matches!(&frame, Frame::Data(d) if !d.attachments.is_empty() || d.native.is_some());
+                    || matches!(&frame, Frame::Data(d) if !d.attachments.is_empty() || d.native.is_some() || d.shared.is_some());
                 if is_ctrl {
                     let deadline = Instant::now() + Duration::from_millis(2000);
                     if c.q.push_ctrl(frame, cost, deadline).is_err() {
@@ -727,6 +998,100 @@ impl Fabric {
             }
         }
     }
+
+    /// Wait for a raw (non-protocol) payload on a host-held control endpoint.
+    fn wait_ctrl_raw(
+        &mut self,
+        timeout: Duration,
+        pred: impl Fn(&[u8]) -> bool,
+    ) -> Result<Vec<u8>, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            while let Some((_, payload)) = self.ctrl_drain.pop_front() {
+                if pred(&payload) {
+                    return Ok(payload);
+                }
+            }
+            if !self.step(deadline) {
+                return Err("raw ctrl wait timeout".into());
+            }
+        }
+    }
+
+    /// Create a NEW region (Host becomes its sole writer) and grant it.
+    fn region_new_grant(
+        &mut self,
+        dest: PeerId,
+        target: EpId,
+        corr: u32,
+        size: u64,
+        rights: Rights,
+        payload: Vec<u8>,
+    ) -> Result<(TransferId, RegionId), String> {
+        let reg = SharedRegion::create(size, &self.lim()).map_err(|e| e.to_string())?;
+        let rid = reg.id();
+        self.router
+            .region_create(rid, size, &self.lim())
+            .map_err(|e| format!("region_create: {e:?}"))?;
+        let (_i, _r, _s, backing) = reg.into_backing();
+        // Escrow gets a same-process duplicate; the Host keeps the master so
+        // later derivations share these exact pages.
+        let escrow_copy =
+            authority_fabric::shared::duplicate_backing(&backing, rights.is_writable())
+                .map_err(|e| e.to_string())?;
+        self.region_backings.insert(rid, backing);
+        let tid = self.grant_existing(rid, dest, target, corr, rights, payload, escrow_copy)?;
+        Ok((tid, rid))
+    }
+
+    /// Grant a capability over an ALREADY-CREATED region (derivation).
+    fn region_derive_grant(
+        &mut self,
+        rid: RegionId,
+        dest: PeerId,
+        target: EpId,
+        rights: Rights,
+        payload: Vec<u8>,
+    ) -> Result<TransferId, String> {
+        let master = self
+            .region_backings
+            .get(&rid)
+            .ok_or_else(|| "derive on unknown region".to_string())?;
+        let escrow_copy = authority_fabric::shared::duplicate_backing(master, rights.is_writable())
+            .map_err(|e| e.to_string())?;
+        self.grant_existing(rid, dest, target, 0, rights, payload, escrow_copy)
+    }
+
+    fn grant_existing(
+        &mut self,
+        rid: RegionId,
+        dest: PeerId,
+        target: EpId,
+        corr: u32,
+        rights: Rights,
+        payload: Vec<u8>,
+        escrow_copy: std::fs::File,
+    ) -> Result<TransferId, String> {
+        let (tid, mut oc) = self
+            .router
+            .host_grant_region(dest, target, corr, rid, rights)
+            .map_err(|p| p.0.to_string())?;
+        for (_, f) in oc.send.iter_mut() {
+            if let Frame::Data(d) = f {
+                d.payload = payload.clone();
+            }
+        }
+        self.shared_escrow
+            .insert(tid, (escrow_copy, router::HOST_PEER, rid, rights));
+        marker!(
+            "SHARED_REGION_GRANTED size={} ro={} tid={}",
+            self.router.region_size(rid).unwrap_or(0),
+            !rights.is_writable(),
+            tid.0[0]
+        );
+        self.dispatch_sends(&oc);
+        Ok(tid)
+    }
 }
 
 // ----------------------------------------------------------- bootstrap ----
@@ -735,8 +1100,8 @@ struct Setup {
     svc: PeerId,
     cli: PeerId,
     _root_client_side: EpId,
-    _root_service_side: EpId,
-    _ctrl_client_side: EpId,
+    root_service_side: EpId,
+    ctrl_client_side: EpId,
     ctrl_host_side: EpId,
     t0: Instant,
 }
@@ -784,8 +1149,8 @@ fn bootstrap(
         svc,
         cli,
         _root_client_side: a,
-        _root_service_side: b,
-        _ctrl_client_side: cc,
+        root_service_side: b,
+        ctrl_client_side: cc,
         ctrl_host_side: ch,
         t0,
     })
@@ -869,6 +1234,7 @@ fn main() {
         "native_happy" => native_happy_case(lim),
         "native_abort" => native_abort_case(lim),
         "native_stress" => native_stress_case(lim),
+        "shared_happy" => shared_happy_case(lim),
         other => fail(&format!("unknown host mode {other:?}")),
     };
     std::process::exit(code);
@@ -1574,8 +1940,8 @@ fn preflight_p4(lim: Limits) -> i32 {
                     svc,
                     cli,
                     _root_client_side: a,
-                    _root_service_side: b,
-                    _ctrl_client_side: cc,
+                    root_service_side: b,
+                    ctrl_client_side: cc,
                     ctrl_host_side: ch,
                     t0: Instant::now(),
                 },
@@ -1677,6 +2043,87 @@ fn native_stress_case(lim: Limits) -> i32 {
         a.native_live
     );
     println!("NATIVE_STRESS_OK n={n}");
+    0
+}
+
+/// Primary cross-process shared-memory proof (Windows-first).
+///
+/// Host creates a 4 MiB region -> Producer (client) receives RW through the
+/// generic transaction, maps writable, fills a deterministic 4 MiB payload and
+/// reports only its 8-byte hash over the control channel -> Host derives RO
+/// and grants it to Consumer (service) with the expected hash riding the offer
+/// metadata -> Consumer maps FILE_MAP_READ-only, hashes all 4 MiB, verifies.
+fn shared_happy_case(lim: Limits) -> i32 {
+    const REGION_SIZE: u64 = 4 * 1024 * 1024;
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "normal".into())],
+        &[("SEAM_CLIENT_MODE", "shared_produce".into())],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    // 1. Host-created region; Producer obtains RW authority.
+    let (_t1, rid) = match fab.region_new_grant(
+        setup.cli,
+        setup.ctrl_client_side,
+        0,
+        REGION_SIZE,
+        Rights::ReadWrite,
+        vec![],
+    ) {
+        Ok(v) => v,
+        Err(e) => return fail(&e),
+    };
+    // 2. Producer writes and reports its hash (metadata only).
+    let hash_bytes = match fab.wait_ctrl_raw(Duration::from_secs(30), |p| p.len() == 8) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    marker!("SHARED_PRODUCER_WRITTEN");
+    // 3. Host derives RO over the SAME backing for the Consumer; expected
+    //    hash rides the offer metadata.
+    if let Err(e) = fab.region_derive_grant(
+        rid,
+        setup.svc,
+        setup.root_service_side,
+        Rights::ReadOnly,
+        hash_bytes.clone(),
+    ) {
+        return fail(&e);
+    }
+    marker!("SHARED_RO_DERIVED");
+    // 4. Consumer materializes + verifies; its ResultAck retires both grants'
+    // retained results. Writer must still be the Producer.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let ra = fab.router.region_accounting();
+        let acct = fab.router.accounting();
+        if ra.writable_authorities == 1 && ra.readonly_authorities == 1 && acct.shared_unacked == 0
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return fail(&format!(
+                "shared settle timeout w={} r={} unacked={}",
+                ra.writable_authorities, ra.readonly_authorities, acct.shared_unacked
+            ));
+        }
+        fab.step(deadline);
+    }
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(10));
+    let _ = fab.wait_exit(setup.svc, Duration::from_secs(10));
+    fab.shutdown_orderly();
+    let a = fab.router.accounting();
+    if a.peers != 0 || a.shared_pending != 0 || a.shared_unacked != 0 {
+        return fail(&format!("shared_happy leak {a:?}"));
+    }
+    let ra = fab.router.region_accounting();
+    if ra.regions != 0 || ra.writable_authorities != 0 || ra.readonly_authorities != 0 {
+        return fail(&format!("region table leak {ra:?}"));
+    }
+    println!("SHARED_HAPPY_OK");
     0
 }
 

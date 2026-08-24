@@ -59,6 +59,33 @@ fn main() {
         if mode == "hold" {
             continue;
         }
+        // Shared-memory Consumer: a committed region capability arrives with
+        // the expected 8-byte hash riding the offer metadata. Verify by
+        // hashing the mapped shared pages (payload bytes never touch frames).
+        if let Some(reg) = req.received_shared {
+            let expected = if req.payload.len() == 8 {
+                u64::from_le_bytes(req.payload[..8].try_into().unwrap())
+            } else {
+                u64::MAX
+            };
+            let got = reg
+                .map_read_only()
+                .map(|v| authority_fabric::shared::fnv64(v.as_slice()));
+            let size_ok = reg.size() == 4 * 1024 * 1024;
+            match got {
+                Ok(h) if h == expected && size_ok => {
+                    marker!(
+                        "SVC_SHARED_VERIFIED ro={} size={}",
+                        reg.rights() == authority_fabric::shared::Rights::ReadOnly,
+                        reg.size()
+                    );
+                }
+                other => {
+                    marker!("SVC_SHARED_VERIFY_FAIL {:?}", other.map(|h| (h, size_ok)));
+                }
+            }
+            continue;
+        }
         if req.local == root_id {
             match proto::decode_root_request(&req.payload) {
                 Ok(RootRequest::Ping) => {

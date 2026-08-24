@@ -907,7 +907,8 @@ impl RuntimeInner {
                     if let Some(p) = st.native_parked.remove(&tid) {
                         drop(st);
                         // Correlation guard: parked offer and commit must
-                        // agree on the resource identity.
+                        // agree on the resource identity; a mismatched pair
+                        // closes the backing instead of minting authority.
                         if p.rid == rid {
                             self.complete_native(p, file);
                         }

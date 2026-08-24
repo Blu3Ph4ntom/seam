@@ -34,6 +34,31 @@ fn dup_from_process(src_process_raw: HANDLE, src_handle: HANDLE) -> std::io::Res
 }
 
 fn dup_to_process(target_process_raw: HANDLE, escrow_handle: HANDLE) -> std::io::Result<u64> {
+    // Same-access duplication: the recipient's handle inherits the source's
+    // exact access rights (dwDesiredAccess must be 0 with this option).
+    dup_to_process_opts(
+        target_process_raw,
+        escrow_handle,
+        0,
+        winapi::um::winnt::DUPLICATE_SAME_ACCESS,
+    )
+}
+
+/// Duplicate an escrowed kernel object into the target process with an
+/// explicit `dwDesiredAccess` / `dwOptions` pair. Used by shared-region
+/// commit delivery to hand the recipient a least-privilege handle
+/// (e.g. SECTION_MAP_READ-only for a read-only capability) instead of blind
+/// same-access duplication.
+///
+/// Win32 contract: when `options` contains DUPLICATE_SAME_ACCESS,
+/// `desired_access` MUST be 0; otherwise `desired_access` is the exact mask
+/// granted to the new handle.
+pub fn dup_to_process_opts(
+    target_process_raw: HANDLE,
+    escrow_handle: HANDLE,
+    desired_access: u32,
+    options: u32,
+) -> std::io::Result<u64> {
     let mut target: HANDLE = std::ptr::null_mut();
     let ok = unsafe {
         DuplicateHandle(
@@ -41,9 +66,9 @@ fn dup_to_process(target_process_raw: HANDLE, escrow_handle: HANDLE) -> std::io:
             escrow_handle,
             target_process_raw,
             &mut target,
+            desired_access,
             0,
-            0,
-            DUPLICATE_SAME_ACCESS,
+            options,
         )
     };
     if ok == 0 {

@@ -342,3 +342,21 @@ fn native_stress_1k() {
     assert_eq!(out.status.code(), Some(0), "native_stress\n{combined}");
     assert_contains(&combined, "NATIVE_STRESS_OK n=1000", "native_stress");
 }
+
+#[test]
+fn shared_happy() {
+    let out = run_host(&["shared_happy"], &[], Duration::from_secs(60));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "shared_happy\n{combined}");
+    for m in [
+        "SHARED_REGION_GRANTED",
+        "CLIENT_SHARED_MATERIALIZED",
+        "SHARED_PRODUCER_WRITTEN",
+        "SHARED_RO_DERIVED",
+        "HOST_SHARED_DELIVERED",
+        "SVC_SHARED_VERIFIED",
+        "SHARED_HAPPY_OK",
+    ] {
+        assert_contains(&combined, m, "shared_happy");
+    }
+}

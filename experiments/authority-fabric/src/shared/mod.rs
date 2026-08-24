@@ -72,6 +72,31 @@ pub fn fresh_region_id(taken: &impl RegionSpace) -> RegionId {
     }
 }
 
+// ------------------------------------------------- e2e payload helpers ----
+
+/// Deterministic pseudorandom byte generator (xorshift64) used to fill shared
+/// regions in cross-process proofs. Never all-zero: hides mapping mistakes.
+pub fn fill_pattern(buf: &mut [u8], seed: u64) {
+    let mut s = seed | 1;
+    for b in buf.iter_mut() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *b = (s & 0xff) as u8;
+    }
+}
+
+/// FNV-1a 64-bit content hash; travels over the control channel as the only
+/// representation of a region's contents.
+pub fn fnv64(buf: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in buf {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
 // ----------------------------------------------------------------- rights --
 
 /// Minimal explicit rights model. No giant lattice.

@@ -62,6 +62,7 @@ fn main() {
         "native_happy" => native_happy(&rt),
         "native_abort" => native_abort(&rt),
         "native_stress" => native_stress(&rt),
+        "shared_produce" => shared_produce(&rt),
         "preflight_p1_client" => preflight_p1_client(&rt),
         "preflight_p3_client" => preflight_p3_client(&rt),
         _ => full_demo(&rt),
@@ -793,6 +794,12 @@ fn native_happy(rt: &Runtime) -> i32 {
         }
         let _ = nf.write_marker(b"_CLIENT");
     } else {
+        eprintln!(
+            "DBG client reply corr={} payload_len={} received={}",
+            res.payload.len(),
+            res.payload.len(),
+            res.received.len()
+        );
     }
     let _ = send_ctrl_wait_ack(&ctrl, proto::ControlMsg::Done);
     0
@@ -873,6 +880,84 @@ fn adopt_native_lane(rt: &Runtime) {
 }
 #[cfg(not(unix))]
 fn adopt_native_lane(_rt: &Runtime) {}
+
+/// Shared-memory Producer: receives the Host-granted RW region through the
+/// generic transaction, maps writable, fills a deterministic payload, and
+/// reports ONLY its 8-byte hash over the control channel. The region
+/// capability is held until fabric shutdown (writer authority must stay
+/// alive for RegionTable consistency).
+fn shared_produce(rt: &Runtime) -> i32 {
+    const REGION_SIZE: usize = 4 * 1024 * 1024;
+    let seed: u64 = 0x1234_5678_9abc_def0;
+    let req = match rt.wait_inbound(Duration::from_secs(30)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("CLIENT_SHARED_FAIL no offer: {e:?}");
+            return 1;
+        }
+    };
+    let mut reg = match req.received_shared {
+        Some(r) => r,
+        None => {
+            eprintln!("CLIENT_SHARED_FAIL offer without shared capability");
+            return 1;
+        }
+    };
+    if reg.rights() != authority_fabric::shared::Rights::ReadWrite
+        || reg.size() as usize != REGION_SIZE
+    {
+        eprintln!(
+            "CLIENT_SHARED_FAIL rights={:?} size={}",
+            reg.rights(),
+            reg.size()
+        );
+        return 1;
+    }
+    marker!("CLIENT_SHARED_MATERIALIZED rw=true");
+    {
+        let mut view = match reg.map_read_write() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("CLIENT_SHARED_FAIL map rw: {e}");
+                return 1;
+            }
+        };
+        authority_fabric::shared::fill_pattern(view.as_mut_slice(), seed);
+    } // writable view unmapped before read-back
+    let hash = {
+        let view = match reg.map_read_only() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("CLIENT_SHARED_FAIL map ro readback: {e}");
+                return 1;
+            }
+        };
+        authority_fabric::shared::fnv64(view.as_slice())
+    };
+    // Report the hash over the control channel via the endpoint the offer
+    // arrived on (pair-routing delivers it to the Host).
+    let ep = match rt.endpoint_for(req.local) {
+        Some(e) => e,
+        None => {
+            eprintln!("CLIENT_SHARED_FAIL offer endpoint not held");
+            return 1;
+        }
+    };
+    // Fire-and-forget hash report: the Host consumes the frame from the
+    // control drain; there is no reply leg, so a short timeout is expected.
+    let _ = ep.call(hash.to_le_bytes().to_vec(), Duration::from_millis(500));
+    marker!("SHARED_PRODUCER_WRITTEN");
+    // Hold writer authority until the fabric shuts down; dropping early would
+    // vacate the writer slot mid-experiment.
+    loop {
+        match rt.wait_inbound(Duration::from_secs(600)) {
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    marker!("CLIENT_SHARED_DONE");
+    0
+}
 
 /// N sequential real native transfers (stress gate). Each cycle is a genuine
 /// transaction: sender creates file+nonce, host escrows, recipient reads.
