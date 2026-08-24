@@ -709,6 +709,12 @@ mod tests {
             map_read_write(ro.backing_ref(), 4096).is_err(),
             "sealed memfd must reject PROT_WRITE"
         );
+        // write(2) through the attenuated descriptor must also fail.
+        {
+            use std::io::Write as _;
+            let mut w = ro.backing_ref().try_clone().unwrap();
+            assert!(w.write_all(b"x").is_err(), "RO fd must reject write(2)");
+        }
         // Read mapping on RO fd succeeds.
         assert!(map_read_only(ro.backing_ref(), 4096).is_ok());
     }

@@ -8,7 +8,7 @@
 
 use std::ffi::CStr;
 use std::fs::File;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::slice;
 
 use rustix::fs::{fcntl_add_seals, ftruncate, memfd_create, MemfdFlags, SealFlags};
@@ -36,16 +36,33 @@ pub fn create_backing(size: u64) -> std::io::Result<File> {
 /// already exist (the producer's established writable view) keep working.
 /// This is the honest Linux attenuation boundary: after RO derivation the
 /// writer may not create *new* writable mappings, but its existing one remains.
-pub fn duplicate_backing(file: &File, _writable: bool) -> std::io::Result<File> {
-    // std dup: a new owned descriptor referencing the same open file
-    // description; the source `file` keeps owning its own.
-    let duped = file.try_clone()?;
-    // Seal FUTURE_WRITE on the shared inode so the derived (RO) fd cannot be
-    // mapped writable by a compromised recipient. Existing mappings survive.
-    // Sealing is inode-wide: it also narrows the producer's *future* writable
-    // mappings (documented RUN 005B attenuation boundary).
-    let _ = rustix::fs::fcntl_add_seals(&duped, rustix::fs::SealFlags::FUTURE_WRITE);
-    Ok(duped)
+pub fn duplicate_backing(file: &File, writable: bool) -> std::io::Result<File> {
+    if writable {
+        // Unsealed regions only: a plain std dup shares the writer state.
+        return file.try_clone();
+    }
+    // READ-ONLY derivation, kernel-enforced:
+    //
+    // 1. Seal the inode with F_SEAL_FUTURE_WRITE. From now on NO new
+    //    writable mapping and no write() can be created through any
+    //    descriptor, while mappings that already exist (the producer's)
+    //    keep working. This is the honest narrowing accepted in RUN 005B.
+    // 2. Mint the consumer descriptor AFTER sealing by reopening the magic
+    //    link /proc/self/fd/<n> with O_RDONLY. A fresh open obtains a fresh
+    //    open-file-description without writer state, so even bypassing Seam
+    //    and calling mmap(PROT_WRITE) directly fails with EACCES/EIO, and
+    //    write(2) fails with EBADF.
+    //
+    // A plain dup() would share the PRE-seal open file description and
+    // therefore still permit writable maps — verified experimentally.
+    rustix::fs::fcntl_add_seals(file.as_fd(), rustix::fs::SealFlags::FUTURE_WRITE)?;
+    let raw = file.as_raw_fd();
+    let link = std::path::Path::new("/proc/self/fd").join(raw.to_string());
+    let reopened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open(&link)?;
+    Ok(reopened)
 }
 
 /// A live writable view of a region. Dropping unmaps; does NOT drop the
