@@ -448,7 +448,7 @@ mod tests {
             // structural bound: internal buffer can never exceed capacity
             assert!(total_in - total_out <= 64 + 37);
         }
-        let _ = c.close_read();
+        c.close_read();
         p.close_write();
     }
 
