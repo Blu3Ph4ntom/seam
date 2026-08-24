@@ -1937,7 +1937,14 @@ impl Runtime {
             g = ng;
         };
         match outcome {
-            None => Ok(TransferOutcome::Committed),
+            None => {
+                // Lost-COMMITTED reconciliation path: our status query
+                // confirmed commit, so acknowledge the retained result.
+                let _ = self
+                    .shared
+                    .push_out(Frame::Xfer(XferMsg::ResultAck { tid }));
+                Ok(TransferOutcome::Committed)
+            }
             Some(restored) => Ok(TransferOutcome::SharedAborted(vec![restored])),
         }
     }

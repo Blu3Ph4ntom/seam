@@ -74,6 +74,29 @@ pub fn fresh_region_id(taken: &impl RegionSpace) -> RegionId {
 
 // ------------------------------------------------- e2e payload helpers ----
 
+/// Real OS resource count for leak instrumentation: process HANDLE count on
+/// Windows (`GetProcessHandleCount`), open descriptor count on Linux
+/// (`/proc/self/fd` entries). Never a Rust-wrapper count.
+#[cfg(windows)]
+pub fn os_resource_count() -> usize {
+    // winapi processthreadsapi (feature already enabled project-wide).
+    use winapi::um::processthreadsapi::{GetCurrentProcess, GetProcessHandleCount};
+    unsafe {
+        let mut n: u32 = 0;
+        if GetProcessHandleCount(GetCurrentProcess(), &mut n) != 0 {
+            n as usize
+        } else {
+            0
+        }
+    }
+}
+#[cfg(unix)]
+pub fn os_resource_count() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count())
+        .unwrap_or(0)
+}
+
 /// Deterministic pseudorandom byte generator (xorshift64) used to fill shared
 /// regions in cross-process proofs. Never all-zero: hides mapping mistakes.
 pub fn fill_pattern(buf: &mut [u8], seed: u64) {

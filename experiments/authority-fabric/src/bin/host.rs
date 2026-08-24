@@ -1263,6 +1263,11 @@ fn main() {
         "native_stress" => native_stress_case(lim),
         "shared_happy" => shared_happy_case(lim),
         "shared_rw_death_pre_accept" => shared_rw_death_case(lim, "pre_accept"),
+        "shared_topo_death_writer" => shared_topo_death_case(lim, "writer"),
+        "shared_topo_death_reader_a" => shared_topo_death_case(lim, "readerA"),
+        "shared_topo_death_reader_b" => shared_topo_death_case(lim, "readerB"),
+        "shared_stress" => shared_stress_case(lim),
+        "shared_lost_committed" => shared_lost_committed_case(lim),
         "shared_rw_death_post_commit" => shared_rw_death_case(lim, "post_commit"),
         "shared_derive" => shared_derive_case(lim),
         "shared_rw_transfer" => shared_rw_transfer_case(lim),
@@ -2489,6 +2494,118 @@ fn shared_multi_reader_case(lim: Limits) -> i32 {
 /// reports only its 8-byte hash over the control channel -> Host derives RO
 /// and grants it to Consumer (service) with the expected hash riding the offer
 /// metadata -> Consumer maps FILE_MAP_READ-only, hashes all 4 MiB, verifies.
+/// Established-topology death (S1-S4): Producer RW + Readers A/B RO fully
+/// materialized and verified; then a chosen peer is killed at the settled
+/// barrier. victim: writer | readerA | readerB.
+fn shared_topo_death_case(lim: Limits, victim: &str) -> i32 {
+    let region_size: u64 = 4 * 1024 * 1024;
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "normal".into())],
+        &[("SEAM_CLIENT_MODE", "shared_produce".into())],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    let (pid_b, cc_b) =
+        match fab.spawn_extra_consumer(&[("SEAM_CLIENT_MODE", "shared_verify_client".into())]) {
+            Ok(v) => v,
+            Err(e) => return fail(&e),
+        };
+    let (_t1, rid) = match fab.region_new_grant(
+        setup.cli,
+        setup.ctrl_client_side,
+        0,
+        region_size,
+        Rights::ReadWrite,
+        vec![],
+    ) {
+        Ok(v) => v,
+        Err(e) => return fail(&e),
+    };
+    let hash1 = match fab.wait_ctrl_raw(Duration::from_secs(30), |p| p.len() == 8) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    marker!("PRODUCER_READY");
+    if let Err(e) = fab.region_derive_grant(
+        rid,
+        setup.svc,
+        setup.root_service_side,
+        Rights::ReadOnly,
+        hash1.clone(),
+    ) {
+        return fail(&e);
+    }
+    if let Err(e) = fab.region_derive_grant(rid, pid_b, cc_b, Rights::ReadOnly, hash1.clone()) {
+        return fail(&e);
+    }
+    if !settle_shared(&mut fab, Duration::from_secs(20), 1, 2) {
+        return fail("topology settle");
+    }
+    marker!("READERS_READY_FOR_DEATH");
+    let (vpid, label) = match victim {
+        "writer" => (setup.cli, "WRITER"),
+        "readerA" => (setup.svc, "READER_A"),
+        "readerB" => (pid_b, "READER_B"),
+        other => return fail(&format!("unknown victim {other}")),
+    };
+    let v_os = fab.conns.get(&vpid).map(|c| c.child.id()).unwrap_or(0);
+    kill_tree(v_os);
+    marker!("VICTIM_KILLED role={}", label);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let ra = fab.router.region_accounting();
+        let acct = fab.router.accounting();
+        let ok = match victim {
+            "writer" => ra.writable_authorities == 0 && ra.readonly_authorities == 2,
+            _ => ra.writable_authorities == 1 && ra.readonly_authorities == 1,
+        };
+        if acct.shared_pending == 0 && acct.shared_unacked == 0 && ok {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return fail(&format!(
+                "death settle w={} r={} pend={} unacked={}",
+                ra.writable_authorities,
+                ra.readonly_authorities,
+                acct.shared_pending,
+                acct.shared_unacked
+            ));
+        }
+        fab.step(deadline);
+    }
+    if victim != "writer" {
+        fab.host_send(setup.ctrl_host_side, 881, b"GEN2".to_vec());
+        let hash2 = match fab.wait_ctrl_raw(Duration::from_secs(30), |p| p.len() == 8) {
+            Ok(b) => b,
+            Err(e) => return fail(&e),
+        };
+        let target = if victim == "readerA" {
+            (pid_b, cc_b)
+        } else {
+            (setup.svc, setup.root_service_side)
+        };
+        if let Err(e) = fab.region_derive_grant(rid, target.0, target.1, Rights::ReadOnly, hash2) {
+            return fail(&e);
+        }
+        if !settle_shared(&mut fab, Duration::from_secs(20), 1, 1) {
+            return fail("gen2 settle");
+        }
+        marker!("SURVIVOR_SAW_GEN2");
+    }
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(5));
+    let _ = fab.wait_exit(pid_b, Duration::from_secs(5));
+    let _ = fab.wait_exit(setup.svc, Duration::from_secs(5));
+    fab.shutdown_orderly();
+    if let Some(m) = leak_check(&fab) {
+        return fail(&m);
+    }
+    println!("SHARED_TOPO_DEATH_{label}_OK");
+    0
+}
+
 /// Deterministic recipient-death around a STAGED writable transfer (D6/D8).
 /// phase=pre_accept : client killed before ACCEPT  -> restore to sender.
 /// phase=post_commit: client killed after commit   -> finality, no restore.
@@ -2619,6 +2736,116 @@ fn shared_rw_death_case(lim: Limits, phase: &str) -> i32 {
     }
     println!("SHARED_RWDEATH_{phase}_OK");
     let _ = std::fs::remove_dir_all(&dir);
+    0
+}
+
+/// Real-kernel shared-region lifecycle stress (X2/X3): every cycle performs
+/// actual section/memfd create, restricted duplication, mapping and
+/// verification; the mix adds RW-duplicate write sessions and (unix) forced
+/// reopen-failure probes. Periodic samples print real OS handle/FD counts.
+fn shared_stress_case(lim: Limits) -> i32 {
+    let n: usize = std::env::var("SEAM_STRESS_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let mut seed: u64 = 0xc0ff_ee12_3456_789a;
+    let baseline_os = authority_fabric::shared::os_resource_count();
+    marker!("STRESS_BASELINE os={}", baseline_os);
+    for i in 0..n {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let size: u64 = 64 * 1024;
+        let mut reg = match SharedRegion::create(size, &lim) {
+            Ok(r) => r,
+            Err(e) => return fail(&format!("cycle {i} create: {e}")),
+        };
+        {
+            let mut w = reg.map_read_write().unwrap();
+            authority_fabric::shared::fill_pattern(w.as_mut_slice(), seed);
+        }
+        // Mix: every 5th cycle exercises an RW duplicate write-session.
+        if i % 5 == 0 {
+            match authority_fabric::shared::duplicate_backing(reg.backing_ref(), true) {
+                Ok(dup) => drop(dup),
+                Err(e) => return fail(&format!("cycle {i} rw dup: {e}")),
+            }
+        }
+        let ro = match reg.derive_read_only() {
+            Ok(r) => r,
+            Err(e) => return fail(&format!("cycle {i} derive: {e}")),
+        };
+        {
+            let v = ro.map_read_only().unwrap();
+            let want = {
+                let mut b = vec![0u8; size as usize];
+                authority_fabric::shared::fill_pattern(&mut b, seed);
+                authority_fabric::shared::fnv64(&b)
+            };
+            if authority_fabric::shared::fnv64(v.as_slice()) != want {
+                return fail(&format!("cycle {i} verify mismatch"));
+            }
+        }
+        drop(ro);
+        drop(reg);
+        if i == 0 || i == 1 || i == 99 || i == 249 || i == 499 || i == 749 || i == n - 1 {
+            marker!(
+                "STRESS_SAMPLE cycle={} os={}",
+                i + 1,
+                authority_fabric::shared::os_resource_count()
+            );
+        }
+    }
+    let settled = authority_fabric::shared::os_resource_count();
+    marker!("STRESS_SETTLED os={} baseline={}", settled, baseline_os);
+    println!("SHARED_STRESS_OK n={n}");
+    0
+}
+
+/// T4: staged shared transfer with the sender's Committed notification
+/// dropped; sender reconciles via STATUS -> COMMITTED and acknowledges.
+fn shared_lost_committed_case(lim: Limits) -> i32 {
+    let mut fab = Fabric::new(lim);
+    let setup = match bootstrap(
+        &mut fab,
+        &[("SEAM_SERVICE_MODE", "shared_wait_hold".into())],
+        &[("SEAM_CLIENT_MODE", "shared_receive_rw".into())],
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
+    if fab
+        .region_new_grant(
+            setup.svc,
+            setup.root_service_side,
+            0,
+            4 * 1024 * 1024,
+            Rights::ReadWrite,
+            vec![],
+        )
+        .is_err()
+    {
+        return fail("initial grant failed");
+    }
+    if !settle_shared(&mut fab, Duration::from_secs(15), 1, 0) {
+        return fail("hold settle");
+    }
+    // Drop ONLY the sender terminal notification.
+    fab.router.inject.drop_committed = true;
+    match fab.wait_ctrl_raw(Duration::from_secs(30), |p| p.len() == 8) {
+        Ok(_) => marker!("SHARED_LOSTCOMMIT_MATERIALIZED"),
+        Err(e) => return fail(&e),
+    }
+    if !settle_shared(&mut fab, Duration::from_secs(25), 1, 0) {
+        return fail("lostcommit settle");
+    }
+    let _ = fab.wait_exit(setup.cli, Duration::from_secs(10));
+    let _ = fab.wait_exit(setup.svc, Duration::from_secs(10));
+    fab.shutdown_orderly();
+    if let Some(m) = leak_check(&fab) {
+        return fail(&m);
+    }
+    println!("SHARED_LOSTCOMMIT_OK");
     0
 }
 

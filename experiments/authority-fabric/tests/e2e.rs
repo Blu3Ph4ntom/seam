@@ -473,6 +473,75 @@ fn shared_rw_death_post_commit() {
 }
 
 #[test]
+fn shared_topo_death_writer() {
+    let out = run_host(&["shared_topo_death_writer"], &[], Duration::from_secs(120));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "topo writer\n{combined}");
+    assert_contains(&combined, "SHARED_TOPO_DEATH_WRITER_OK", "topo writer");
+}
+
+#[test]
+fn shared_topo_death_reader_a() {
+    let out = run_host(
+        &["shared_topo_death_reader_a"],
+        &[],
+        Duration::from_secs(120),
+    );
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "topo readerA\n{combined}");
+    for m in ["SURVIVOR_SAW_GEN2", "SHARED_TOPO_DEATH_READER_A_OK"] {
+        assert_contains(&combined, m, "topo readerA");
+    }
+}
+
+#[test]
+fn shared_topo_death_reader_b() {
+    let out = run_host(
+        &["shared_topo_death_reader_b"],
+        &[],
+        Duration::from_secs(120),
+    );
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "topo readerB\n{combined}");
+    for m in ["SURVIVOR_SAW_GEN2", "SHARED_TOPO_DEATH_READER_B_OK"] {
+        assert_contains(&combined, m, "topo readerB");
+    }
+}
+
+#[test]
+fn shared_lost_committed() {
+    let out = run_host(&["shared_lost_committed"], &[], Duration::from_secs(90));
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "lost_committed\n{combined}");
+    for m in [
+        "SHARED_LOSTCOMMIT_MATERIALIZED",
+        "CLIENT_SHARED_RW_RECEIVED",
+        "SHARED_LOSTCOMMIT_OK",
+    ] {
+        assert_contains(&combined, m, "lost_committed");
+    }
+}
+
+#[test]
+fn shared_stress_1k_real() {
+    let out = run_host(
+        &["shared_stress"],
+        &[("SEAM_STRESS_N", "1000")],
+        Duration::from_secs(600),
+    );
+    let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));
+    assert_eq!(out.status.code(), Some(0), "stress\n{combined}");
+    for m in [
+        "STRESS_SAMPLE cycle=100 ",
+        "STRESS_SAMPLE cycle=1000",
+        "STRESS_SETTLED",
+        "SHARED_STRESS_OK n=1000",
+    ] {
+        assert_contains(&combined, m, "stress");
+    }
+}
+
+#[test]
 fn shared_multi_reader() {
     let out = run_host(&["shared_multi_reader"], &[], Duration::from_secs(120));
     let combined = format!("{}\n{}", stdout_str(&out), stderr_str(&out));

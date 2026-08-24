@@ -54,12 +54,7 @@ pub fn duplicate_backing(file: &File, writable: bool) -> std::io::Result<File> {
     // all seal operations; there the guarantee rests solely on fd mode,
     // which matches the Windows restricted-handle model 1:1.
     let _ = rustix::fs::fcntl_add_seals(file.as_fd(), rustix::fs::SealFlags::FUTURE_WRITE);
-    let raw = file.as_raw_fd();
-    let link = std::path::Path::new("/proc/self/fd").join(raw.to_string());
-    let reopened = std::fs::OpenOptions::new()
-        .read(true)
-        .write(false)
-        .open(&link)?;
+    let reopened = reopen_read_only(file.as_raw_fd())?;
     Ok(reopened)
 }
 
@@ -95,6 +90,18 @@ impl<'a> MappedReadOnly<'a> {
     }
 
     /// Raw parts for lifetime-preserving slice construction in mod.rs.
+    /// Reopen a descriptor read-only through the /proc/self/fd magic link.
+    /// A3: this is THE attenuation primitive; it must fail closed. There is
+    /// deliberately no dup() fallback — a caller that receives Err must not
+    /// mint any RO authority.
+    pub(crate) fn reopen_read_only(raw: std::os::fd::RawFd) -> std::io::Result<File> {
+        let link = std::path::Path::new("/proc/self/fd").join(raw.to_string());
+        let reopened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(&link)?;
+        Ok(reopened)
+    }
     pub(crate) fn raw_parts(&self) -> (*const u8, usize) {
         (self.ptr, self.len)
     }
@@ -150,5 +157,24 @@ pub fn map_read_only<'a>(file: &File, len: usize) -> std::io::Result<MappedReadO
             len,
             _owner: std::marker::PhantomData,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A3: forced reopen failure must be an error, never a writable dup.
+    /// We close a real descriptor first so /proc/self/fd/<n> cannot resolve;
+    /// if the implementation ever silently falls back to dup(), this test
+    /// catches the escalation.
+    #[test]
+    fn reopen_failure_is_fail_closed() {
+        // A valid fd, then closed: the magic link disappears with it.
+        let probe = std::fs::File::open("/dev/null").unwrap();
+        let raw = probe.as_raw_fd();
+        drop(probe); // fd now closed: stale number
+        let res = reopen_read_only(raw);
+        assert!(res.is_err(), "stale-fd reopen must fail closed");
     }
 }
