@@ -74,7 +74,7 @@ pub fn recv_lane_msg(lane: &std::os::unix::net::UnixStream) -> std::io::Result<L
     let mut buf = [0u8; HDR + 1];
     let mut iov = [IoSliceMut::new(&mut buf)];
     let msg = recvmsg(lane, &mut iov, &mut ancillary, RecvFlags::empty()).map_err(errno_to_io)?;
-    if msg.bytes < HDR as usize {
+    if msg.bytes < HDR {
         // EOF or truncated: any received-but-unmatched descriptors drop here.
         for c in ancillary.drain() {
             if let RecvAncillaryMessage::ScmRights(fds) = c {
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn scm_rights_roundtrip_transfers_real_descriptor() {
         let (a, b) = UnixStream::pair().unwrap();
-        let mut src = tempfile_bytes(b"SEAM_SCM_NONCE");
+        let src = tempfile_bytes(b"SEAM_SCM_NONCE");
         let raw_before = src.as_raw_fd();
         let tid = TransferId([7; 16]);
         let rid = ResourceId([9; 16]);
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn missing_descriptor_fails_closed() {
         let (mut a, b) = UnixStream::pair().unwrap();
-        a.write_all(&vec![0u8; HDR]).unwrap(); // header only, no cmsg
+        a.write_all(&[0u8; HDR]).unwrap(); // header only, no cmsg
         assert!(recv_lane_msg(&b).is_err());
     }
 }

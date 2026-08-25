@@ -15,7 +15,7 @@ use rustix::fs::{fcntl_add_seals, ftruncate, memfd_create, MemfdFlags, SealFlags
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 
 pub fn create_backing(size: u64) -> std::io::Result<File> {
-    let name = CStr::from_bytes_with_nul(b"seam-region\0").unwrap();
+    let name = CStr::from_bytes_with_nul(c"seam-region");
     // SAFETY: memfd_create takes only a name and flags; no pointers.
     let fd: OwnedFd = memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
     ftruncate(&fd, size)?;
@@ -165,6 +165,14 @@ pub fn map_read_only<'a>(file: &File, len: usize) -> std::io::Result<MappedReadO
     }
 }
 
+/// Bench support: unmap a raw view previously obtained via raw_parts_pub.
+pub fn unmap_view(ptr: *const u8, len: usize) {
+    // SAFETY: pointer/length came from mmap for a live caller-owned view.
+    unsafe {
+        let _ = rustix::mm::munmap(ptr as *mut _, len);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,13 +189,5 @@ mod tests {
         drop(probe); // fd now closed: stale number
         let res = reopen_read_only(raw);
         assert!(res.is_err(), "stale-fd reopen must fail closed");
-    }
-}
-
-/// Bench support: unmap a raw view previously obtained via raw_parts_pub.
-pub fn unmap_view(ptr: *const u8, len: usize) {
-    // SAFETY: pointer/length came from mmap for a live caller-owned view.
-    unsafe {
-        let _ = rustix::mm::munmap(ptr as *mut _, len);
     }
 }

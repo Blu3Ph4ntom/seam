@@ -931,7 +931,7 @@ impl RuntimeInner {
                 }
                 #[cfg(not(windows))]
                 {
-                    let _ = (rid, handle_value);
+                    let _ = &handle_value;
                 }
                 st.native_commit_seen.insert(tid);
                 if let Some(file) = st.native_recv.remove(&tid) {
@@ -984,6 +984,10 @@ impl RuntimeInner {
                 // Commit observed. Host-authoritative rights/size arrive here;
                 // the kernel object arrives inline (Windows) or via the lane
                 // (Linux). Join order-independently with the parked offer.
+                #[cfg(not(windows))]
+                {
+                    let _ = (&tid, &rid, &handle_value);
+                }
                 let Some(rights) = decode_rights_byte(rights) else {
                     return true; // malformed: no authority is minted
                 };
