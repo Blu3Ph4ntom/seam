@@ -1,0 +1,12 @@
+[package]
+name = "seam-core"
+version = "0.1.0"
+edition = "2021"
+description = "Seam core — pure safe-Rust semantics (no OS APIs)"
+publish = false
+
+[dependencies]
+getrandom = { workspace = true }
+
+[features]
+default = []

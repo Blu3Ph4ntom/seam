@@ -1,0 +1,10 @@
+[package]
+name = "seam-process"
+version = "0.1.0"
+edition = "2021"
+description = "Seam process spawn/bootstrap helper (public-optional)"
+publish = false
+
+[dependencies]
+seam-core = { path = "../seam-core" }
+seam-platform = { path = "../seam-platform" }

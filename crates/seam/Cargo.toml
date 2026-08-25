@@ -1,0 +1,12 @@
+[package]
+name = "seam"
+version = "0.1.0"
+edition = "2021"
+description = "Seam — fast, typed, capability-oriented IPC runtime (public facade)"
+publish = false
+
+[dependencies]
+seam-core = { path = "../seam-core" }
+seam-platform = { path = "../seam-platform" }
+seam-process = { path = "../seam-process" }
+seam-idl = { path = "../seam-idl" }

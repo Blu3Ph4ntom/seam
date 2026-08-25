@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/seam-core",
+    "crates/seam-platform",
+    "crates/seam-process",
+    "crates/seam-idl",
+    "crates/seam",
+    "experiments/authority-fabric",
+]
+resolver = "2"
+
+[workspace.dependencies]
+getrandom = "0.3"
+rustix = { version = "0.38", features = ["fs", "net", "mm"] }

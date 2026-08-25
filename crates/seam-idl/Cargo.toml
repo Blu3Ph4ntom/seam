@@ -1,0 +1,8 @@
+[package]
+name = "seam-idl"
+version = "0.1.0"
+edition = "2021"
+description = "Seam IDL parser and codegen (build-time tooling)"
+publish = false
+
+[dependencies]

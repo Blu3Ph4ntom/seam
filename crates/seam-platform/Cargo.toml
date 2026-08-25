@@ -1,0 +1,15 @@
+[package]
+name = "seam-platform"
+version = "0.1.0"
+edition = "2021"
+description = "Seam platform leaf — OS primitives (unsafe isolated)"
+publish = false
+
+[dependencies]
+seam-core = { path = "../seam-core" }
+rustix = { workspace = true }
+getrandom = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation"] }
+winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winbase"] }
