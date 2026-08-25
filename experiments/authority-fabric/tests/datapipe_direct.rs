@@ -73,8 +73,12 @@ struct Topology {
 impl Drop for Topology {
     fn drop(&mut self) {
         // Never leave orphan peers behind on a failed assert.
-        kill_tree(self.prod.id());
-        kill_tree(self.cons.id());
+        if self.prod.try_wait().expect("try_wait").is_none() {
+            kill_tree(self.prod.id());
+        }
+        if self.cons.try_wait().expect("try_wait").is_none() {
+            kill_tree(self.cons.id());
+        }
         let _ = self.prod.wait();
         let _ = self.cons.wait();
     }
