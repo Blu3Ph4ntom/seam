@@ -16,7 +16,7 @@ pub mod direct;
 pub mod registry;
 
 /// Bounded retirement recall window for the host pipe table.
-pub(crate) const PIPE_RETIRE_CAP: usize = 4096;
+pub const PIPE_RETIRE_CAP: usize = 4096;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};

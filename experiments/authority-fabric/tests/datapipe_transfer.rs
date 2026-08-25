@@ -142,3 +142,36 @@ fn registry_commit_join_is_order_independent_single_mint() {
         (Some(PeerId(4)), Some(PeerId(5)))
     );
 }
+
+#[test]
+fn registry_10k_churn_bounded() {
+    // 10,000 full create -> offer -> commit -> retire arcs. Table size,
+    // retirement ledger, and authority count must stay bounded throughout;
+    // no state may grow with cycle count.
+    let mut table = PipeTable::new();
+    for i in 0..10_000u32 {
+        let mut b = [0u8; 16];
+        b[..4].copy_from_slice(&i.to_be_bytes());
+        let pid = authority_fabric::data_pipe::PipeId(b);
+        table.create(pid, 64, PeerId(1), PeerId(2)).unwrap();
+        assert_eq!(table.live(), 1);
+        table
+            .offer_transfer(
+                &pid,
+                PipeRole::Producer,
+                tid((i % 251) as u8 + 1),
+                PeerId(1),
+                PeerId(7),
+            )
+            .unwrap();
+        assert_eq!(table.producer_holder(&pid), None);
+        assert_eq!(
+            table.commit_transfer(PipeRole::Producer, tid((i % 251) as u8 + 1)),
+            Ok(pid)
+        );
+        assert_eq!(table.producer_holder(&pid), Some(PeerId(7)));
+        table.retire(&pid, PeerId(7)).unwrap();
+        assert_eq!(table.live(), 0);
+        assert!(table.retired_len() <= authority_fabric::data_pipe::PIPE_RETIRE_CAP);
+    }
+}

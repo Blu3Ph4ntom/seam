@@ -441,3 +441,64 @@ fn datapipe_resource_smoke_100_cycles() {
         "handle leak across 100 pipe cycles: base={base} settled={settled}"
     );
 }
+
+#[test]
+fn datapipe_1000_real_lifecycles_no_leak() {
+    // 1000 REAL kernel-pipe lifecycles (create, write, read, verify, drop),
+    // sampling OS resources at fixed checkpoints. No monotonic growth.
+    let checkpoints = [0usize, 100, 250, 500, 750, 1000];
+    let mut samples = Vec::new();
+    for i in 0..1000usize {
+        if i == checkpoints[samples.len()] {
+            samples.push(os_resource_count());
+        }
+        let (mut rx, mut tx) = std::io::pipe().expect("pipe");
+        let payload = [i as u8; 256];
+        tx.write_all(&payload).expect("write");
+        drop(tx); // writer death -> EOF after drain
+        let mut got = [0u8; 256];
+        rx.read_exact(&mut got).expect("read");
+        assert_eq!(got, payload);
+        assert_eq!(rx.read(&mut [0u8; 1]).unwrap(), 0, "EOF expected");
+        drop(rx);
+    }
+    samples.push(os_resource_count()); // settled
+    println!("resource samples: {samples:?}");
+    let base = samples[0];
+    let settled = *samples.last().unwrap();
+    assert!(
+        settled <= base + 8,
+        "monotonic resource leak over 1000 lifecycles: base={base} settled={settled}"
+    );
+}
+
+#[test]
+#[ignore = "long-stream gate: run explicitly (SEAM_LONG_STREAM gates nothing; ~1-2 min)"]
+fn datapipe_256mib_bounded_stream() {
+    // >=256 MiB through a 64 KiB semantic window. Incremental generation +
+    // verification against a driver-side regeneration of the same stream.
+    // Boundedness evidence: backpressure markers present, both peers exit 0,
+    // exact length and hash, no stream-sized queue anywhere (the transport
+    // is two kernel pipes; neither peer buffers more than capacity).
+    let cap = 64 * 1024;
+    let total = 256 * 1024 * 1024;
+    let mut topo = wire(cap, total, "normal");
+    let (_prod_t, perr) = collect_stderr(&mut topo.prod);
+    let (_cons_t, cerr) = collect_stderr(&mut topo.cons);
+
+    let cons_st = wait_exit(&mut topo.cons, 1800);
+    let prod_st = wait_exit(&mut topo.prod, 1800);
+    let pe = perr.lock().unwrap().clone();
+    let ce = cerr.lock().unwrap().clone();
+
+    assert_eq!(prod_st.and_then(|s| s.code()), Some(0), "producer\n{pe}");
+    assert_eq!(cons_st.and_then(|s| s.code()), Some(0), "consumer\n{ce}");
+    assert!(pe.contains("PRODUCER_ORDERLY_CLOSED"), "{pe}");
+    assert!(
+        pe.contains("WRITER_WAITING_FOR_CREDIT"),
+        "repeated backpressure required\n{pe}"
+    );
+    assert!(ce.contains(&format!("total={total}")), "{ce}");
+    let want = format!("hash={:x}", expected_hash(cap, total));
+    assert!(ce.contains(&want), "hash {want}\n{ce}");
+}

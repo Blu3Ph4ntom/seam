@@ -112,6 +112,11 @@ impl PipeTable {
         e.flight(role).map(|f| (f.tid, f.to))
     }
 
+    /// Bounded recall-window occupancy (test/observability).
+    pub fn retired_len(&self) -> usize {
+        self.retired.len()
+    }
+
     /// Register a fresh active pipe. Fails closed on bad capacity or an
     /// exhausted table; nothing partial is created.
     pub fn create(
