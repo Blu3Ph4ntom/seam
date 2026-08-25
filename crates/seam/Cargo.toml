@@ -9,4 +9,7 @@ publish = false
 seam-core = { path = "../seam-core" }
 seam-platform = { path = "../seam-platform" }
 seam-process = { path = "../seam-process" }
+# seam-idl is build-time only; generated code depends on seam, not the reverse (CTO 1A)
+
+[dev-dependencies]
 seam-idl = { path = "../seam-idl" }

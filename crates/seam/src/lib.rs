@@ -1,14 +1,15 @@
 //! seam — public facade.
 
 pub use seam_core as core;
-pub use seam_core::ids::*;
+pub use seam_core::ids::{
+    AttachmentIndex, ChannelId, EndpointId, PeerId, PipeId, RegionId, RequestId, ResourceId,
+    TransferId,
+};
 pub use seam_core::limits::Limits;
 pub use seam_core::wire::{Header, HEADER_SIZE, MAGIC};
 pub mod prelude {
     pub use seam_core::prelude::*;
 }
-
-use seam_core::ids::{PeerId, TransferId};
 
 /// Fabric — embedded authority role.
 pub struct Fabric {
@@ -25,10 +26,10 @@ impl Fabric {
 }
 
 /// Linear Client<T> — move-only, no Clone/Copy.
-pub struct Client<T>(std::marker::PhantomData<T>, PeerId);
+pub struct Client<T>(std::marker::PhantomData<T>, #[allow(dead_code)] PeerId);
 
 /// Linear Receiver<T> — move-only, no Clone/Copy.
-pub struct Receiver<T>(std::marker::PhantomData<T>, PeerId);
+pub struct Receiver<T>(std::marker::PhantomData<T>, #[allow(dead_code)] PeerId);
 
 pub fn channel<T>(_fabric: &Fabric) -> (Client<T>, Receiver<T>) {
     (
@@ -63,6 +64,7 @@ impl SharedRegionMut {
 pub struct Producer;
 pub struct Consumer;
 pub struct DataPipe;
+#[allow(clippy::new_ret_no_self)]
 impl DataPipe {
     pub fn new(_fabric: &Fabric, _cap: usize) -> Result<(Producer, Consumer), String> {
         Ok((Producer, Consumer))

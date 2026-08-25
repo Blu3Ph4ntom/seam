@@ -8,6 +8,10 @@ pub mod windows {
 #[cfg(unix)]
 pub mod unix {}
 
+pub mod lane;
+
+pub use lane::NativeLane;
+
 pub fn hello() -> &'static str {
     "platform"
 }
