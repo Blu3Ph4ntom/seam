@@ -53,6 +53,14 @@ pub fn encode(w: &mut dyn Write, rec: &Rec) -> std::io::Result<()> {
 /// Decode one record header + body from a buffered reader.
 /// Returns Ok(None) on clean transport EOF between records.
 pub fn decode(r: &mut dyn BufRead) -> std::io::Result<Option<Rec>> {
+    decode_capped(r, MAX_DATA)
+}
+
+/// Per-pipe runtime gate: `max_data` is the pipe's Seam capacity (the
+/// semantic window), so a record can never demand an allocation beyond what
+/// the pipe itself could legally carry, even when far below MAX_DATA.
+pub fn decode_capped(r: &mut dyn BufRead, max_data: usize) -> std::io::Result<Option<Rec>> {
+    let max_data = max_data.min(MAX_DATA);
     let mut line = String::new();
     if r.read_line(&mut line)? == 0 {
         return Ok(None);
@@ -73,7 +81,7 @@ pub fn decode(r: &mut dyn BufRead) -> std::io::Result<Option<Rec>> {
         .map_err(|_| perr("bad len"))?;
     match kind {
         KIND_DATA => {
-            if len == 0 || len > MAX_DATA {
+            if len == 0 || len > max_data {
                 return Err(perr("data len out of bounds"));
             }
             let mut body = vec![0u8; len];
@@ -81,7 +89,7 @@ pub fn decode(r: &mut dyn BufRead) -> std::io::Result<Option<Rec>> {
             Ok(Some(Rec::Data(body)))
         }
         KIND_CREDIT => {
-            if len == 0 || len > MAX_DATA {
+            if len == 0 || len > max_data {
                 return Err(perr("credit delta out of bounds"));
             }
             Ok(Some(Rec::Credit(len)))
@@ -192,5 +200,33 @@ mod tests {
         let mut br = BufReader::new(&buf[..]);
         assert_eq!(decode(&mut br).unwrap(), Some(Rec::Close));
         assert_eq!(decode(&mut br).unwrap(), Some(Rec::Data(b"x".to_vec())));
+    }
+
+    /// M7 per-pipe runtime gate: a DATA record legal against MAX_DATA but
+    /// larger than the pipe's semantic capacity is rejected pre-allocation.
+    #[test]
+    fn m7_data_over_pipe_capacity_rejected() {
+        let mut buf: Vec<u8> = Vec::new();
+        encode(&mut buf, &Rec::Data(vec![7u8; 300])).unwrap();
+        let mut br = BufReader::new(&buf[..]);
+        assert_eq!(
+            decode_capped(&mut br, 256).err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::InvalidData)
+        );
+        // Same bytes decode fine under an adequate per-pipe bound.
+        let mut br = BufReader::new(&buf[..]);
+        assert_eq!(
+            decode_capped(&mut br, 512).unwrap(),
+            Some(Rec::Data(vec![7u8; 300]))
+        );
+    }
+
+    /// M8 forged credit above the pipe capacity rejected.
+    #[test]
+    fn m8_credit_over_pipe_capacity_rejected() {
+        let mut buf: Vec<u8> = Vec::new();
+        encode(&mut buf, &Rec::Credit(4096)).unwrap();
+        let mut br = BufReader::new(&buf[..]);
+        assert!(decode_capped(&mut br, 1024).is_err());
     }
 }

@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use authority_fabric::shared::os_resource_count;
+
 fn peer_exe() -> &'static str {
     env!("CARGO_BIN_EXE_datapipe_peer")
 }
@@ -356,5 +358,81 @@ fn diag_d5_driver_feeds_consumer_big_record() {
     assert!(
         ce.contains("peer_gone=true"),
         "driver drop must EOF the consumer\n{ce}"
+    );
+}
+
+#[test]
+fn datapipe_consumer_close_breaks_producer() {
+    // Deliberate consumer-initiated CONSUMER_CLOSE: consumer finishes clean;
+    // producer must wake and fail permanently (never hang, never succeed).
+    let mut topo = wire(4096, 16 * 1024 * 1024, "close_early");
+    let (_prod_t, perr) = collect_stderr(&mut topo.prod);
+    let (_cons_t, cerr) = collect_stderr(&mut topo.cons);
+
+    let cons_st = wait_exit(&mut topo.cons, 60);
+    let ce0 = cerr.lock().unwrap().clone();
+    assert_eq!(cons_st.and_then(|s| s.code()), Some(0), "consumer\n{ce0}");
+    assert!(wait_marker(&cerr, "CONSUMER_CLOSE_EARLY", 5), "{ce0}");
+
+    let prod_st = wait_exit(&mut topo.prod, 30);
+    match prod_st {
+        Some(st) => assert_ne!(
+            st.code(),
+            Some(0),
+            "producer must not survive consumer close"
+        ),
+        None => panic!("producer hung after CONSUMER_CLOSE"),
+    }
+    let pe = perr.lock().unwrap().clone();
+    assert!(pe.contains("PRODUCER_SAW_CONSUMER_CLOSE"), "{pe}");
+}
+
+#[test]
+fn datapipe_8mib_irregular_bounded() {
+    // 8 MiB through a 64 KiB semantic window: exact bytes verified against a
+    // driver-side regeneration, with proven backpressure along the way.
+    let cap = 64 * 1024;
+    let total = 8 * 1024 * 1024;
+    let mut topo = wire(cap, total, "normal");
+    let (_prod_t, perr) = collect_stderr(&mut topo.prod);
+    let (_cons_t, cerr) = collect_stderr(&mut topo.cons);
+
+    let cons_st = wait_exit(&mut topo.cons, 300);
+    let prod_st = wait_exit(&mut topo.prod, 300);
+    let pe = perr.lock().unwrap().clone();
+    let ce = cerr.lock().unwrap().clone();
+
+    assert_eq!(cons_st.and_then(|s| s.code()), Some(0), "consumer\n{ce}");
+    assert_eq!(prod_st.and_then(|s| s.code()), Some(0), "producer\n{pe}");
+    assert!(pe.contains("PRODUCER_ORDERLY_CLOSED"), "{pe}");
+    // Boundedness: the writer MUST have hit the credit clamp at least once.
+    assert!(
+        pe.contains("WRITER_WAITING_FOR_CREDIT"),
+        "no backpressure observed\n{pe}"
+    );
+    assert!(ce.contains(&format!("total={total}")), "{ce}");
+    let want = format!("hash={:x}", expected_hash(cap, total));
+    assert!(ce.contains(&want), "hash {want}\n{ce}");
+    assert!(
+        ce.contains("orderly=true") && !ce.contains("peer_gone=true"),
+        "{ce}"
+    );
+}
+
+#[test]
+fn datapipe_resource_smoke_100_cycles() {
+    // 100 create/drop cycles of the native transport primitive; OS handle
+    // count must return to baseline (no monotonic leak).
+    let base = os_resource_count();
+    for _ in 0..100 {
+        let (rx, tx) = std::io::pipe().expect("pipe");
+        drop(rx);
+        drop(tx);
+    }
+    thread::sleep(Duration::from_millis(50)); // allow deferred cleanup
+    let settled = os_resource_count();
+    assert!(
+        settled <= base + 4,
+        "handle leak across 100 pipe cycles: base={base} settled={settled}"
     );
 }

@@ -246,6 +246,9 @@ fn consumer_role(cap: usize, mode: &str) -> i32 {
     let _ = hold;
     // modes: normal | hold_unconsumed | close_early
     let hold_unconsumed = mode == "hold_unconsumed";
+    // close_early: after the first DATA record, deliver one credit batch and
+    // issue CONSUMER_CLOSE — a deliberate consumer-initiated orderly break.
+    let close_early = mode == "close_early";
     let stdin = std::io::stdin();
     let mut r = stdin.lock();
     let out = std::io::stdout();
@@ -255,6 +258,7 @@ fn consumer_role(cap: usize, mode: &str) -> i32 {
     let mut pending = 0usize;
     let mut orderly = false;
     let mut peer_gone = false;
+    let mut closed_early = false;
     let mut staged_unread = 0usize; // bounded by capacity (HOLD_UNCONSUMED)
     loop {
         match read_rec(&mut r, cap) {
@@ -292,6 +296,12 @@ fn consumer_role(cap: usize, mode: &str) -> i32 {
                         send(&mut w, KIND_CREDIT, pending).ok();
                         pending = 0;
                     }
+                    if close_early {
+                        marker("CONSUMER_CLOSE_EARLY");
+                        send(&mut w, KIND_CONSUMER_CLOSE, 0).ok();
+                        closed_early = true;
+                        break;
+                    }
                 }
             }
             Ok(Some(Rec::Close)) => {
@@ -313,10 +323,15 @@ fn consumer_role(cap: usize, mode: &str) -> i32 {
         }
     }
     marker(&format!(
-        "CONSUMER_DONE total={total} hash={hash:x} orderly={orderly} peer_gone={peer_gone} peak_pending_credit={pending}"
+        "CONSUMER_DONE total={total} hash={hash:x} orderly={orderly} peer_gone={peer_gone} closed_early={closed_early} peak_pending_credit={pending}"
     ));
-    // Truncated/unannounced streams are failures, never clean finishes.
-    let code = if orderly && !peer_gone { 0 } else { 5 };
+    // Truncated/unannounced streams are failures, never clean finishes; a
+    // deliberate consumer-initiated close IS a clean finish.
+    let code = if (orderly && !peer_gone) || closed_early {
+        0
+    } else {
+        5
+    };
     eprintln!("CONSUMER_EXIT code={code} orderly={orderly} peer_gone={peer_gone}");
     code
 }
