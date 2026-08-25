@@ -13,6 +13,7 @@
 
 pub mod credit;
 pub mod direct;
+pub mod materialize;
 pub mod registry;
 
 /// Bounded retirement recall window for the host pipe table.
