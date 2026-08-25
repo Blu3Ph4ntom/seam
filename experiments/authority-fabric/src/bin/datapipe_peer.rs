@@ -90,9 +90,20 @@ fn fill(chunk: &mut [u8], seed: u64) {
     }
 }
 
+struct State {
+    tracker: CreditTracker,
+    /// Credits received but not yet applied; drained by the writer thread
+    /// only after its own commits so forgery detection sees an exact
+    /// `outstanding`.
+    pending: usize,
+    term: bool,
+}
+
 struct Shared {
-    tracker: Mutex<CreditTracker>,
-    term: Mutex<bool>,
+    /// Single state mutex: the writer waits on THIS guard, and every
+    /// predicate mutation (credits, termination) happens under it before
+    /// notify — no lost-wakeup window can exist.
+    st: Mutex<State>,
     /// Set once the CLOSE record has been physically written: control-channel
     /// EOF afterwards is expected teardown, not peer death.
     close_sent: Mutex<bool>,
@@ -103,8 +114,11 @@ struct Shared {
 /// a control-reader thread consumes CREDIT/CONSUMER_CLOSE and wakes waits.
 fn producer_role(cap: usize, total: usize) -> i32 {
     let sh = Arc::new(Shared {
-        tracker: Mutex::new(CreditTracker::new(cap).expect("capacity")),
-        term: Mutex::new(false),
+        st: Mutex::new(State {
+            tracker: CreditTracker::new(cap).expect("capacity"),
+            pending: 0,
+            term: false,
+        }),
         close_sent: Mutex::new(false),
         cv: Condvar::new(),
     });
@@ -117,17 +131,12 @@ fn producer_role(cap: usize, total: usize) -> i32 {
                 match read_rec(&mut ctrl, cap) {
                     Ok(Some(Rec::Credit(k))) => {
                         trace(&format!("prod credit k={k}"));
-                        let failed = sh.tracker.lock().unwrap().return_credit(k).is_err();
+                        sh.st.lock().unwrap().pending += k;
                         sh.cv.notify_all();
-                        if failed {
-                            marker("PRODUCER_FORGED_CREDIT");
-                            *sh.term.lock().unwrap() = true;
-                            return;
-                        }
                     }
                     Ok(Some(Rec::ConsumerClose)) => {
                         marker("PRODUCER_SAW_CONSUMER_CLOSE");
-                        *sh.term.lock().unwrap() = true;
+                        sh.st.lock().unwrap().term = true;
                         sh.cv.notify_all();
                         return;
                     }
@@ -140,7 +149,7 @@ fn producer_role(cap: usize, total: usize) -> i32 {
                         } else {
                             let _ = outcome;
                             marker("PRODUCER_PEER_GONE");
-                            *sh.term.lock().unwrap() = true;
+                            sh.st.lock().unwrap().term = true;
                             sh.cv.notify_all();
                         }
                         return;
@@ -177,29 +186,34 @@ fn producer_role(cap: usize, total: usize) -> i32 {
         fill(&mut chunk[..n], seed);
         seed ^= seed << 1;
 
-        // reservation-safe blocking write. The wait must hold the SAME lock
-        // the control reader mutates through, otherwise a credit arriving
-        // between reserve()==0 and cv.wait() is lost (writer sleeps forever).
+        // reservation-safe blocking write: drain/reserve/wait all under the
+        // single state mutex the control reader mutates through.
         let mut rem = &chunk[..n];
         while !rem.is_empty() {
             let k = {
-                let mut t = sh.tracker.lock().unwrap();
+                let mut s = sh.st.lock().unwrap();
                 loop {
-                    let k = t.reserve(rem.len());
+                    // Apply arrived credits only here, after our own commits:
+                    // outstanding is exact, so forgery detection is sound.
+                    let got = std::mem::take(&mut s.pending);
+                    if got > 0 {
+                        if s.tracker.return_credit(got).is_err() {
+                            marker("PRODUCER_FORGED_CREDIT");
+                            return 3;
+                        }
+                        continue;
+                    }
+                    let k = s.tracker.reserve(rem.len());
                     if k > 0 {
                         break k;
                     }
-                    {
-                        let g = sh.term.lock().unwrap();
-                        if *g {
-                            drop(g);
-                            marker("PRODUCER_BROKEN");
-                            return 3;
-                        }
+                    if s.term {
+                        marker("PRODUCER_BROKEN");
+                        return 3;
                     }
                     marker("WRITER_WAITING_FOR_CREDIT");
-                    let (guard, _) = sh.cv.wait_timeout(t, Duration::from_secs(600)).unwrap();
-                    t = guard;
+                    let (guard, _) = sh.cv.wait_timeout(s, Duration::from_secs(600)).unwrap();
+                    s = guard;
                 }
             };
             // DATA header then exactly k payload bytes on the payload pipe.
@@ -216,7 +230,7 @@ fn producer_role(cap: usize, total: usize) -> i32 {
                 marker("PRODUCER_MID_RECORD_FAILURE");
                 return 4;
             }
-            sh.tracker.lock().unwrap().commit(k, k).unwrap();
+            sh.st.lock().unwrap().tracker.commit(k, k).unwrap();
             rem = &rem[k..];
             sent += k;
             // Deterministic abrupt-death barrier for harness scenarios:
