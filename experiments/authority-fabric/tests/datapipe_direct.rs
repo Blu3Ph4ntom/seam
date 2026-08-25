@@ -1,4 +1,5 @@
-//! Windows direct DataPipe data-plane proof.
+//! Direct cross-process DataPipe data-plane proof (Windows pipe2 / Linux
+//! pipe2 via std::io::pipe()).
 //!
 //! Topology (driver wires two anonymous kernel pipes then drops every
 //! transport copy; it relays neither payload nor credits):
