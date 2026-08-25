@@ -1,0 +1,28 @@
+error[E0382]: borrow of moved value: `c`
+  --> tests/compile-fail/pipe_consumer_use_after_transfer.rs:12:13
+   |
+10 |     let (_p, c) = Producer::new(4096).unwrap();
+   |              - move occurs because `c` has type `authority_fabric::data_pipe::Consumer`, which does not implement the `Copy` trait
+11 |     transfer_like_move(c);
+   |                        - value moved here
+12 |     let _ = c.try_read(&mut [0u8; 4]); //~ ERROR E0382
+   |             ^ value borrowed here after move
+   |
+note: consider changing this parameter type in function `transfer_like_move` to borrow instead if owning the value isn't necessary
+  --> tests/compile-fail/pipe_consumer_use_after_transfer.rs:7:27
+   |
+ 7 | fn transfer_like_move(_c: Consumer) {}
+   |    ------------------     ^^^^^^^^ this parameter takes ownership of the value
+   |    |
+   |    in this function
+
+error[E0596]: cannot borrow `c` as mutable, as it is not declared as mutable
+  --> tests/compile-fail/pipe_consumer_use_after_transfer.rs:12:13
+   |
+12 |     let _ = c.try_read(&mut [0u8; 4]); //~ ERROR E0382
+   |             ^ cannot borrow as mutable
+   |
+help: consider changing this to be mutable
+   |
+10 |     let (_p, mut c) = Producer::new(4096).unwrap();
+   |              +++

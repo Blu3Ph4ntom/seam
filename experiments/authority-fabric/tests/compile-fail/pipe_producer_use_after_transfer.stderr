@@ -1,0 +1,28 @@
+error[E0382]: borrow of moved value: `p`
+  --> tests/compile-fail/pipe_producer_use_after_transfer.rs:12:13
+   |
+10 |     let (p, _c) = Producer::new(4096).unwrap();
+   |          - move occurs because `p` has type `authority_fabric::data_pipe::Producer`, which does not implement the `Copy` trait
+11 |     transfer_like_move(p);
+   |                        - value moved here
+12 |     let _ = p.try_write(b"x"); //~ ERROR E0382
+   |             ^ value borrowed here after move
+   |
+note: consider changing this parameter type in function `transfer_like_move` to borrow instead if owning the value isn't necessary
+  --> tests/compile-fail/pipe_producer_use_after_transfer.rs:7:27
+   |
+ 7 | fn transfer_like_move(_p: Producer) {}
+   |    ------------------     ^^^^^^^^ this parameter takes ownership of the value
+   |    |
+   |    in this function
+
+error[E0596]: cannot borrow `p` as mutable, as it is not declared as mutable
+  --> tests/compile-fail/pipe_producer_use_after_transfer.rs:12:13
+   |
+12 |     let _ = p.try_write(b"x"); //~ ERROR E0382
+   |             ^ cannot borrow as mutable
+   |
+help: consider changing this to be mutable
+   |
+10 |     let (mut p, _c) = Producer::new(4096).unwrap();
+   |          +++
