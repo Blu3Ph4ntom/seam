@@ -110,3 +110,39 @@ mod unix {
         Err(std::io::Error::other("no fd received"))
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::NativeLane;
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn lane_moves_fd_still_functional() {
+        // Linchpin for DataPipe: any fd sent via SCM_RIGHTS remains
+        // functional in the recipient. Pipe continuity (prefix||suffix)
+        // follows because the fd refers to the same kernel object.
+        let (lane_a, lane_b) = NativeLane::pair().unwrap();
+        let (payload_a, payload_b) = UnixStream::pair().unwrap();
+        let raw_before = payload_b.as_raw_fd();
+        // Move ownership of payload_b into the lane
+        let fd_to_send: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw_before) };
+        std::mem::forget(payload_b);
+        lane_a.send_fd(fd_to_send).unwrap();
+        let received: OwnedFd = lane_b.recv_fd().unwrap();
+        // Received fd must be valid and distinct from the original number
+        // (kernel allocates a new descriptor), yet refer to the same object.
+        assert!(received.as_raw_fd() >= 0);
+        // Verify the peer end still works by writing through the moved fd
+        // and reading on the retained peer (UnixStream pair is bidirectional).
+        let mut moved_stream = unsafe { UnixStream::from_raw_fd(received.into_raw_fd()) };
+        let mut peer = payload_a;
+        use std::io::{Read, Write};
+        moved_stream.write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .ok();
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+}
