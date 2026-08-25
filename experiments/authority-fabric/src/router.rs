@@ -999,6 +999,16 @@ impl Router {
         self.results.retain(|_, (s, _)| *s != p);
         self.native_results.retain(|_, (s, _, _)| *s != p);
         self.shared_results.retain(|_, (s, _, _)| *s != p);
+        // Last peer gone: no ResultAck can ever arrive anymore, so ANY
+        // retained terminal result is definitionally garbage — including
+        // ones whose Committed frame was still queued when the sender's
+        // EOF raced this handler. Results exist to be delivered; an empty
+        // fabric has nobody left to deliver to.
+        if self.peers.is_empty() {
+            self.results.clear();
+            self.native_results.clear();
+            self.shared_results.clear();
+        }
         // Collect conversations touching this peer.
         let touched: Vec<EpId> = self
             .eps
