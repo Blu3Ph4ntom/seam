@@ -15,6 +15,12 @@ fn marker(s: &str) {
     eprintln!("MARK {s}");
 }
 
+fn trace(s: &str) {
+    if std::env::var_os("SEAM_PIPE_TRACE").is_some() {
+        marker(&format!("TRC {s}"));
+    }
+}
+
 // ---- record codec (line header "kind len", DATA body follows) ----
 
 const KIND_DATA: u32 = 1;
@@ -40,7 +46,9 @@ fn send(w: &mut dyn Write, kind: u32, len: usize) -> std::io::Result<()> {
 
 fn read_rec(r: &mut dyn BufRead, max: usize) -> std::io::Result<Option<Rec>> {
     let mut line = String::new();
-    if r.read_line(&mut line)? == 0 {
+    let n = r.read_line(&mut line)?;
+    trace(&format!("rec hdr bytes={n} line={:?}", line.trim_end()));
+    if n == 0 {
         return Ok(None);
     }
     let mut it = line.split_whitespace();
@@ -56,6 +64,7 @@ fn read_rec(r: &mut dyn BufRead, max: usize) -> std::io::Result<Option<Rec>> {
                 return Err(bad("data len out of bounds"));
             }
             let mut body = vec![0u8; len];
+            trace(&format!("rec body want={len}"));
             r.read_exact(&mut body)?;
             Ok(Some(Rec::Data(body)))
         }
@@ -84,6 +93,9 @@ fn fill(chunk: &mut [u8], seed: u64) {
 struct Shared {
     tracker: Mutex<CreditTracker>,
     term: Mutex<bool>,
+    /// Set once the CLOSE record has been physically written: control-channel
+    /// EOF afterwards is expected teardown, not peer death.
+    close_sent: Mutex<bool>,
     cv: Condvar,
 }
 
@@ -93,6 +105,7 @@ fn producer_role(cap: usize, total: usize) -> i32 {
     let sh = Arc::new(Shared {
         tracker: Mutex::new(CreditTracker::new(cap).expect("capacity")),
         term: Mutex::new(false),
+        close_sent: Mutex::new(false),
         cv: Condvar::new(),
     });
     // control-reader thread over stdin
@@ -103,6 +116,7 @@ fn producer_role(cap: usize, total: usize) -> i32 {
             loop {
                 match read_rec(&mut ctrl, cap) {
                     Ok(Some(Rec::Credit(k))) => {
+                        trace(&format!("prod credit k={k}"));
                         let failed = sh.tracker.lock().unwrap().return_credit(k).is_err();
                         sh.cv.notify_all();
                         if failed {
@@ -117,11 +131,18 @@ fn producer_role(cap: usize, total: usize) -> i32 {
                         sh.cv.notify_all();
                         return;
                     }
-                    _ => {
-                        // transport death without CONSUMER_CLOSE => PeerGone
-                        marker("PRODUCER_PEER_GONE");
-                        *sh.term.lock().unwrap() = true;
-                        sh.cv.notify_all();
+                    outcome => {
+                        // Transport EOF/error without CONSUMER_CLOSE. If we
+                        // already sent CLOSE this is the peer's orderly exit;
+                        // otherwise it is genuine PeerGone.
+                        if *sh.close_sent.lock().unwrap() {
+                            marker("PRODUCER_CONTROL_EOF_AFTER_CLOSE");
+                        } else {
+                            let _ = outcome;
+                            marker("PRODUCER_PEER_GONE");
+                            *sh.term.lock().unwrap() = true;
+                            sh.cv.notify_all();
+                        }
                         return;
                     }
                 }
@@ -144,37 +165,53 @@ fn producer_role(cap: usize, total: usize) -> i32 {
         1000,
     ];
     let mut sent = 0usize;
+    // Chunk-size schedule advances per CHUNK (not per sent byte): indexing
+    // by `sent % len` self-traps when two adjacent sizes sum to the period
+    // (7+3==10) and degrades the stream to an endless 7/3 alternation.
+    let mut chunk_idx = 0usize;
     let mut seed = 0x1234_5678_9abc_def0u64;
-    let mut chunk = vec![0u8; cap];
+    let mut chunk = vec![0u8; 65535];
     while sent < total {
-        let n = sizes[sent % sizes.len()].min(total - sent);
+        let n = sizes[chunk_idx % sizes.len()].min(total - sent);
+        chunk_idx += 1;
         fill(&mut chunk[..n], seed);
         seed ^= seed << 1;
 
-        // reservation-safe blocking write
+        // reservation-safe blocking write. The wait must hold the SAME lock
+        // the control reader mutates through, otherwise a credit arriving
+        // between reserve()==0 and cv.wait() is lost (writer sleeps forever).
         let mut rem = &chunk[..n];
         while !rem.is_empty() {
             let k = {
                 let mut t = sh.tracker.lock().unwrap();
-                t.reserve(rem.len())
-            };
-            if k == 0 {
-                marker("WRITER_WAITING_FOR_CREDIT");
-                let g = sh.term.lock().unwrap();
-                if *g {
-                    marker("PRODUCER_BROKEN");
-                    return 3;
+                loop {
+                    let k = t.reserve(rem.len());
+                    if k > 0 {
+                        break k;
+                    }
+                    {
+                        let g = sh.term.lock().unwrap();
+                        if *g {
+                            drop(g);
+                            marker("PRODUCER_BROKEN");
+                            return 3;
+                        }
+                    }
+                    marker("WRITER_WAITING_FOR_CREDIT");
+                    let (guard, _) = sh.cv.wait_timeout(t, Duration::from_secs(600)).unwrap();
+                    t = guard;
                 }
-                let (guard, _) = sh.cv.wait_timeout(g, Duration::from_secs(600)).unwrap();
-                drop(guard);
-                continue;
-            }
-            // DATA header then exactly k payload bytes on the payload pipe
+            };
+            // DATA header then exactly k payload bytes on the payload pipe.
+            // StdoutLock is a LineWriter: binary bodies contain 0x0A bytes
+            // and would leave their post-newline tail buffered while
+            // write_all still reports success — an explicit flush makes the
+            // physical-write accounting match the credit reservation.
             if send(&mut out, KIND_DATA, k).is_err() {
                 marker("PRODUCER_MID_RECORD_FAILURE");
                 return 4;
             }
-            if out.write_all(&rem[..k]).is_err() {
+            if out.write_all(&rem[..k]).is_err() || out.flush().is_err() {
                 // mid-record failure: terminal, do NOT reuse reservation
                 marker("PRODUCER_MID_RECORD_FAILURE");
                 return 4;
@@ -182,9 +219,21 @@ fn producer_role(cap: usize, total: usize) -> i32 {
             sh.tracker.lock().unwrap().commit(k, k).unwrap();
             rem = &rem[k..];
             sent += k;
+            // Deterministic abrupt-death barrier for harness scenarios:
+            // die mid-stream WITHOUT CLOSE after N physical bytes.
+            if let Some(n) = std::env::var("SEAM_CRASH_AFTER_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                if sent >= n {
+                    marker("PRODUCER_SELF_CRASH");
+                    std::process::exit(101);
+                }
+            }
         }
     }
     send(&mut out, KIND_CLOSE, 0).expect("close");
+    *sh.close_sent.lock().unwrap() = true;
     marker("PRODUCER_ORDERLY_CLOSED");
     0
 }
@@ -223,23 +272,36 @@ fn consumer_role(cap: usize, mode: &str) -> i32 {
                         // stop reading kernel + return zero credits forever;
                         // producer must now clamp at semantic capacity.
                         let _ = r.read(&mut [0u8; 0]);
-                        loop {
-                            if r.fill_buf().map(|b| b.is_empty()).unwrap_or(true) {
-                                break; // producer died / closed: EOF
+                        while let Ok(b) = r.fill_buf() {
+                            if b.is_empty() {
+                                break; // EOF: producer gone/closed
                             }
+                            // Data may sit unconsumed while we hold
+                            // capacity; wait for writer death without
+                            // consuming. 1ms keeps this off the CPU.
+                            std::thread::sleep(Duration::from_millis(1));
                         }
                         peer_gone = !orderly;
                         break;
                     }
                 } else {
                     pending += b.len();
+                    trace(&format!("cons rec len={} total={total}", b.len()));
                     if pending >= cap / 4 {
+                        trace(&format!("cons credit send pending={pending}"));
                         send(&mut w, KIND_CREDIT, pending).ok();
                         pending = 0;
                     }
                 }
             }
             Ok(Some(Rec::Close)) => {
+                // Deliver every owed credit before orderly completion so the
+                // producer's accounting can reach zero; EPIPE here is benign
+                // (producer may already be gone after CLOSE).
+                if pending > 0 {
+                    let _ = send(&mut w, KIND_CREDIT, pending);
+                    pending = 0;
+                }
                 orderly = true;
                 break;
             }
@@ -262,7 +324,8 @@ fn consumer_role(cap: usize, mode: &str) -> i32 {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     eprintln!(
-        "PEER_ENTRY role={:?} argc={} args={:?}",
+        "PEER_ENTRY pid={} role={:?} argc={} args={:?}",
+        std::process::id(),
         args.first(),
         args.len(),
         &args[..args.len().min(4)]

@@ -6,11 +6,11 @@
 //!   producer child: stdin <- control.rx   stdout -> payload.tx
 //!   consumer child: stdin <- payload.rx   stdout -> control.tx
 //!
-//! Scenarios use the peer binary's role/mode arguments. Evidence markers
-//! arrive on each child's stderr, captured by dedicated reader threads.
+//! Evidence markers arrive on each child's stderr, captured into shared
+//! buffers so tests can poll for markers while peers run (no sleeps).
 
-use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::io::{Read, Write};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,19 +34,16 @@ fn kill_tree(pid: u32) {
     }
 }
 
-/// Spawn both peers over std::io::pipe() transport and immediately drop all
-/// driver-side copies of the four pipe endpoints plus the Command builders,
-/// so peer death/closure wakes the opposite side deterministically.
-fn wire(cap: usize, total: usize, consumer_mode: &str, producer_args: &[&str]) -> Topology {
+/// Spawn both peers over std::io::pipe() transport; the Stdio conversions
+/// consume the pipe objects, so the driver holds zero transport endpoints
+/// and peer death/closure wakes the opposite side deterministically.
+fn wire(cap: usize, total: usize, consumer_mode: &str) -> Topology {
     let (payload_rx, payload_tx) = std::io::pipe().expect("payload pipe");
     let (control_rx, control_tx) = std::io::pipe().expect("control pipe");
 
     // Producer: stdin <- control.rx (credits), stdout -> payload.tx (DATA).
-    // The builder is consumed by spawn(); the pipe objects are dropped after
-    // both children exist so the driver holds zero transport endpoints.
     let prod = Command::new(peer_exe())
         .args(["producer", &cap.to_string(), &total.to_string()])
-        .args(producer_args)
         .stdin(Stdio::from(control_rx))
         .stdout(Stdio::from(payload_tx))
         .stderr(Stdio::piped())
@@ -62,9 +59,6 @@ fn wire(cap: usize, total: usize, consumer_mode: &str, producer_args: &[&str]) -
         .spawn()
         .expect("spawn consumer");
 
-    // Drop driver copies: children own the only transport endpoints now.
-    // payload_rx/payload_tx/control_rx/control_tx moved into children via
-    // Stdio::from; nothing left to drop.
     Topology { prod, cons }
 }
 
@@ -73,18 +67,39 @@ struct Topology {
     cons: Child,
 }
 
-/// Background stderr collector with joinable evidence string.
-fn collect_stderr(child: &mut Child) -> (thread::JoinHandle<String>, Arc<Mutex<()>>) {
-    let mut err = child.stderr.take().expect("stderr piped");
-    let handle = thread::spawn(move || {
-        let mut s = String::new();
-        let _ = err.read_to_string(&mut s);
-        s
-    });
-    (handle, Arc::new(Mutex::new(())))
+impl Drop for Topology {
+    fn drop(&mut self) {
+        // Never leave orphan peers behind on a failed assert.
+        kill_tree(self.prod.id());
+        kill_tree(self.cons.id());
+        let _ = self.prod.wait();
+        let _ = self.cons.wait();
+    }
 }
 
-fn wait_exit(child: &mut Child, secs: u64) -> Option<std::process::ExitStatus> {
+/// Live stderr capture: readers append into a shared buffer the test polls.
+type ErrBuf = Arc<Mutex<String>>;
+
+fn collect_stderr(child: &mut Child) -> (thread::JoinHandle<()>, ErrBuf) {
+    let mut err = child.stderr.take().expect("stderr piped");
+    let buf: ErrBuf = Arc::new(Mutex::new(String::new()));
+    let sink = buf.clone();
+    let handle = thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match err.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&chunk[..n])),
+            }
+        }
+    });
+    (handle, buf)
+}
+
+fn wait_exit(child: &mut Child, secs: u64) -> Option<ExitStatus> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         if let Some(st) = child.try_wait().expect("try_wait") {
@@ -97,12 +112,21 @@ fn wait_exit(child: &mut Child, secs: u64) -> Option<std::process::ExitStatus> {
     }
 }
 
-fn expected_stream(total: usize, seed0: u64) -> (usize, u64) {
-    // Mirrors the peer generator: per-write chunk seeds advance via seed^=seed<<1
-    // after fill_pattern's internal xorshift on a local copy. We recompute the
-    // exact byte stream chunk-by-chunk using the SAME sizes list as the peer.
-    let cap = 64 * 1024;
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+/// True once `needle` appears in the captured stream before `secs` elapse.
+fn wait_marker(buf: &ErrBuf, needle: &str, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if buf.lock().unwrap().contains(needle) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// Driver-independent regeneration of the exact byte stream the producer
+/// emits (same size schedule, same xorshift fill, same seed chain).
+fn expected_hash(cap: usize, total: usize) -> u64 {
     let sizes = [
         1usize,
         7,
@@ -115,12 +139,14 @@ fn expected_stream(total: usize, seed0: u64) -> (usize, u64) {
         3,
         1000,
     ];
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut sent = 0usize;
+    let mut chunk_idx = 0usize;
     let mut base_seed = 0x1234_5678_9abc_def0u64;
     let mut chunk = vec![0u8; 65535];
     while sent < total {
-        let n = sizes[sent % sizes.len()].min(total - sent);
-        // replicate: peer does fill(chunk[..n], seed) then seed ^= seed<<1
+        let n = sizes[chunk_idx % sizes.len()].min(total - sent);
+        chunk_idx += 1;
         super_fill(&mut chunk[..n], base_seed);
         base_seed ^= base_seed << 1;
         for x in &chunk[..n] {
@@ -129,7 +155,7 @@ fn expected_stream(total: usize, seed0: u64) -> (usize, u64) {
         }
         sent += n;
     }
-    (sent, hash)
+    hash
 }
 
 fn super_fill(buf: &mut [u8], seed0: u64) {
@@ -140,6 +166,20 @@ fn super_fill(buf: &mut [u8], seed0: u64) {
         s ^= s << 17;
         *b = s as u8;
     }
+}
+
+/// Extract "key=value" from a "key=<value>" marker field.
+fn field<'a>(stderr: &'a str, key: &str) -> Option<&'a str> {
+    stderr
+        .split([',', ' ', '\n'])
+        .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// PEER_ENTRY pid must equal the spawned Child pid: catches any collector/
+/// endpoint cross-association permanently.
+fn assert_entry_pid(stderr: &str, child: &Child, role: &str) {
+    let want = format!("PEER_ENTRY pid={} role=Some(\"{role}\")", child.id());
+    assert!(stderr.contains(&want), "{role} identity\n{stderr}");
 }
 
 // ---------------------------------------------------------------- tests --
@@ -159,91 +199,114 @@ fn datapipe_native_control_eof_on_consumer_death() {
     let (rx, tx) = std::io::pipe().unwrap();
     drop(rx);
     let mut wtx = tx;
-    // With the only reader gone, write wakes/fails (broken pipe).
-    let mut wtx: Box<dyn std::io::Write> = Box::new(wtx);
-    let mut wtx: Box<dyn std::io::Write> = Box::new(wtx);
+    // With the only reader gone, write wakes/fails (broken pipe), never hangs.
     let res = wtx.write_all(b"ping");
-    assert!(res.is_err() || res.is_ok()); // must not hang; error typical
+    let _ = res;
 }
 
 #[test]
 fn datapipe_happy_small_stream() {
-    // capacity 4096, total 32 KiB through the small window.
-    let mut topo = wire(4096, 32 * 1024, "normal", &[]);
-    let (prod_err_t, _) = collect_stderr(&mut topo.prod);
-    let (cons_err_h, _) = collect_stderr(&mut topo.cons);
+    // capacity 4096, total 32 KiB through the small window; both peers must
+    // finish cleanly with an exactly-verified byte stream.
+    let cap = 4096;
+    let total = 32 * 1024;
+    let mut topo = wire(cap, total, "normal");
+    let (prod_t, perr) = collect_stderr(&mut topo.prod);
+    let (cons_t, cerr) = collect_stderr(&mut topo.cons);
 
-    // Deterministic collection: wait BOTH children to terminate, THEN join
-    // stderr readers (they hit EOF at process exit), THEN assert.
     let cons_st = wait_exit(&mut topo.cons, 120);
     let prod_st = wait_exit(&mut topo.prod, 120);
-    let perr = prod_err_t.join().unwrap();
-    let cerr = cons_err_h.join().unwrap();
+    let pe = perr.lock().unwrap().clone();
+    let ce = cerr.lock().unwrap().clone();
 
-    assert_eq!(cons_st.and_then(|s| s.code()), Some(0), "consumer\n{cerr}");
-    assert_eq!(prod_st.and_then(|s| s.code()), Some(0), "producer\n{perr}");
+    assert_eq!(cons_st.and_then(|s| s.code()), Some(0), "consumer\n{ce}");
+    assert_eq!(prod_st.and_then(|s| s.code()), Some(0), "producer\n{pe}");
+    assert_entry_pid(&pe, &topo.prod, "producer");
+    assert_entry_pid(&ce, &topo.cons, "consumer");
+    assert!(pe.contains("PRODUCER_ORDERLY_CLOSED"), "producer\n{pe}");
     assert!(
-        perr.contains("PRODUCER_ORDERLY_CLOSED"),
-        "producer stderr:\n{perr}"
+        !pe.contains("PRODUCER_PEER_GONE"),
+        "EOF after CLOSE is benign but pre-close PeerGone is not\n{pe}"
     );
-    assert!(cerr.contains("ORDERLY true"), "consumer stderr:\n{cerr}");
-    assert!(!cerr.contains("peer_gone=true"), "{cerr}");
+    assert!(ce.contains("orderly=true"), "consumer\n{ce}");
+    assert!(!ce.contains("peer_gone=true"), "{ce}");
+    // Exact bytes: driver recomputes the stream independently of the peer.
+    let want = format!("hash={:x}", expected_hash(cap, total));
+    assert!(ce.contains(&want), "hash {want}\n{ce}");
+    assert!(ce.contains(&format!("total={total}")), "{ce}");
+
+    prod_t.join().unwrap();
+    cons_t.join().unwrap();
 }
 
 #[test]
 fn datapipe_capacity_clamp_hold_unconsumed() {
-    // Consumer stages up to capacity without crediting; producer clamps at
-    // exactly semantic capacity. Then consumer death wakes producer as
-    // PeerGone/Broken (never clean finish).
-    let mut topo = wire(64 * 1024, 16 * 1024 * 1024, "hold_unconsumed", &[]);
-    let (prod_err_t, _) = collect_stderr(&mut topo.prod);
-    let (cons_err_h, _) = collect_stderr(&mut topo.cons);
+    // Consumer stages up to EXACT semantic capacity without crediting; the
+    // producer clamps there (never past it). Consumer death while clamped
+    // must wake the producer as a failure, never a clean finish.
+    let cap = 64 * 1024;
+    let total = 16 * 1024 * 1024;
+    let mut topo = wire(cap, total, "hold_unconsumed");
+    let (prod_t, perr) = collect_stderr(&mut topo.prod);
+    let (cons_t, cerr) = collect_stderr(&mut topo.cons);
 
-    // Wait for the staged-capacity marker, proving the clamp point.
-    let dl = Instant::now() + Duration::from_secs(30);
-    loop {
-        let done = {
-            // poll consumer exit OR producer stall evidence via timeout below
-            topo.cons.try_wait().is_ok() && false
-        };
-        let _ = done;
-        if Instant::now() >= dl {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    // Kill consumer while producer is credit-stalled: producer must wake
-    // terminal (nonzero exit), never complete cleanly.
-    kill_tree(topo.cons.id());
-    match wait_exit(&mut topo.prod, 20) {
-        Some(st) => assert_ne!(st.code(), Some(0), "clamp+death must fail producer"),
-        None => {
-            // Physical write can still be blocked on a full kernel buffer;
-            // force-kill and rely on marker evidence for the wake proof.
-            kill_tree(topo.prod.id());
-            let _ = topo.prod.wait();
-        }
-    }
-    let perr = prod_err_t.join().unwrap();
-    let cerr = cons_err_h.join().unwrap();
-    assert!(cerr.contains("CONSUMER_STAGED_CAPACITY"), "{cerr}");
+    // The clamp point: staged-unread reaches capacity exactly, zero credits
+    // returned, producer parked waiting for credit.
     assert!(
-        perr.contains("PRODUCER_PEER_GONE") || perr.contains("PRODUCER_BROKEN"),
-        "{perr}"
+        wait_marker(&cerr, "CONSUMER_STAGED_CAPACITY", 60),
+        "consumer never reached capacity clamp\nproducer:\n{}\nconsumer:\n{}",
+        perr.lock().unwrap(),
+        cerr.lock().unwrap()
     );
+    let ce_now = cerr.lock().unwrap().clone();
+    let staged: usize = field(&ce_now, "bytes")
+        .and_then(|v| v.parse().ok())
+        .expect("staged byte count in marker");
+    assert_eq!(staged, cap, "clamp must engage at EXACT semantic capacity");
+
+    assert!(
+        wait_marker(&perr, "WRITER_WAITING_FOR_CREDIT", 10),
+        "producer must be credit-stalled at the clamp\n{}",
+        perr.lock().unwrap()
+    );
+
+    kill_tree(topo.cons.id());
+    let prod_st = wait_exit(&mut topo.prod, 20);
+    match prod_st {
+        Some(st) => assert_ne!(st.code(), Some(0), "clamped producer must not exit clean"),
+        None => panic!("producer failed to wake from consumer death"),
+    }
+    let pe = perr.lock().unwrap().clone();
+    assert!(
+        pe.contains("PRODUCER_BROKEN")
+            || pe.contains("PRODUCER_PEER_GONE")
+            || pe.contains("PRODUCER_MID_RECORD_FAILURE"),
+        "{pe}"
+    );
+
+    let _ = topo.cons.wait();
+    prod_t.join().unwrap();
+    cons_t.join().unwrap();
 }
 
 #[test]
 fn datapipe_producer_crash_not_clean_eof() {
-    // Consumer runs normally but producer exits mid-stream WITHOUT CLOSE:
-    // consumer must report orderly=false / peer_gone=true.
-    let mut topo = wire(64 * 1024, 16 * 1024 * 1024, "normal", &["--crash-mid"]);
-    // Producer has no --crash-mid arg support? It ignores unknown args, so
-    // instead kill producer at first opportunity after data flows.
-    thread::sleep(Duration::from_millis(300));
-    kill_tree(topo.prod.id());
+    // Producer dies mid-stream WITHOUT CLOSE at a deterministic barrier:
+    // consumer must wake and report a truncated stream, never clean EOF.
+    let cap = 4096;
+    let total = 16 * 1024 * 1024;
+    std::env::set_var("SEAM_CRASH_AFTER_BYTES", "8192");
+    let mut topo = wire(cap, total, "normal");
+    let (_prod_t, perr) = collect_stderr(&mut topo.prod);
+    let (_cons_t, cerr) = collect_stderr(&mut topo.cons);
 
+    assert!(
+        wait_marker(&perr, "PRODUCER_SELF_CRASH", 30),
+        "producer never reached crash barrier\n{}",
+        perr.lock().unwrap()
+    );
+    // Children already spawned carry their copy; stop leaking to siblings.
+    std::env::remove_var("SEAM_CRASH_AFTER_BYTES");
     let st = wait_exit(&mut topo.cons, 20);
     assert!(st.is_some(), "consumer must wake from producer death");
     assert_ne!(
@@ -251,6 +314,47 @@ fn datapipe_producer_crash_not_clean_eof() {
         Some(0),
         "truncated stream must not be clean"
     );
-    let (_, _) = collect_stderr(&mut topo.cons);
-    let _ = topo.cons.wait();
+    let ce = cerr.lock().unwrap().clone();
+    assert!(ce.contains("orderly=false"), "{ce}");
+    assert!(ce.contains("peer_gone=true"), "{ce}");
+}
+
+#[test]
+fn diag_d5_driver_feeds_consumer_big_record() {
+    // Driver keeps payload_tx and hand-feeds the consumer child the exact
+    // byte sequence the producer would write (records 1,7,17,511,3560).
+    let cap = 4096usize;
+    let (payload_rx, mut payload_tx) = std::io::pipe().expect("pipe");
+    let (control_rx, control_tx) = std::io::pipe().expect("ctl");
+    let mut cons = Command::new(peer_exe())
+        .args(["consumer", &cap.to_string(), "normal"])
+        .stdin(Stdio::from(payload_rx))
+        .stdout(Stdio::from(control_tx))
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    drop(control_rx); // driver must not hold consumer-side control end
+    let (_t, cerrb) = collect_stderr(&mut cons);
+
+    let mut wire: Vec<u8> = Vec::new();
+    for len in [1usize, 7, 17, 511, 3560] {
+        use std::io::Write as _;
+        writeln!(wire, "1 {len}").unwrap();
+        let base = wire.len();
+        wire.resize(base + len, b'x');
+    }
+    eprintln!("D5 writing {} physical bytes", wire.len());
+    payload_tx.write_all(&wire).expect("driver feed");
+    eprintln!("D5 feed complete");
+    drop(payload_tx);
+
+    let st = wait_exit(&mut cons, 30);
+    let ce = cerrb.lock().unwrap().clone();
+    eprintln!("D5 exit={st:?}\n{ce}");
+    assert!(ce.contains("total=4096"), "{ce}");
+    assert!(ce.contains("hash=7580ad4254676325"), "exact bytes\n{ce}");
+    assert!(
+        ce.contains("peer_gone=true"),
+        "driver drop must EOF the consumer\n{ce}"
+    );
 }
