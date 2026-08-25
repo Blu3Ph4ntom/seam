@@ -5,7 +5,7 @@
 //! control (CREDIT back to producer). For role=producer: stdin = control,
 //! stdout = payload. Diagnostics go to stderr only.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -192,7 +192,11 @@ fn producer_role(cap: usize, total: usize) -> i32 {
 /// Consumer role: reads DATA/CLOSE, verifies incrementally, returns batched
 /// application-consumed credits. hold=1 stops consuming after the first
 /// byte so the driver can prove the exact semantic capacity clamp.
-fn consumer_role(cap: usize, hold: bool) -> i32 {
+fn consumer_role(cap: usize, mode: &str) -> i32 {
+    let hold = mode == "hold";
+    let _ = hold;
+    // modes: normal | hold_unconsumed | close_early
+    let hold_unconsumed = mode == "hold_unconsumed";
     let stdin = std::io::stdin();
     let mut r = stdin.lock();
     let out = std::io::stdout();
@@ -202,6 +206,7 @@ fn consumer_role(cap: usize, hold: bool) -> i32 {
     let mut pending = 0usize;
     let mut orderly = false;
     let mut peer_gone = false;
+    let mut staged_unread = 0usize; // bounded by capacity (HOLD_UNCONSUMED)
     loop {
         match read_rec(&mut r, cap) {
             Ok(Some(Rec::Credit(_))) | Ok(Some(Rec::ConsumerClose)) => {}
@@ -211,14 +216,27 @@ fn consumer_role(cap: usize, hold: bool) -> i32 {
                     hash = hash.wrapping_mul(0x1000_0000_01b3);
                 }
                 total += b.len();
-                pending += b.len(); // credit only for APPLICATION consumption
-                if !hold && pending >= cap / 4 {
-                    send(&mut w, KIND_CREDIT, pending).ok();
-                    pending = 0;
-                }
-                if hold && total >= 1 {
-                    marker("CONSUMER_HOLDING");
-                    break; // stop reading: producer must clamp at capacity
+                if hold_unconsumed {
+                    staged_unread += b.len(); // staged, NOT consumed
+                    if staged_unread >= cap {
+                        marker(&format!("CONSUMER_STAGED_CAPACITY bytes={staged_unread}"));
+                        // stop reading kernel + return zero credits forever;
+                        // producer must now clamp at semantic capacity.
+                        let _ = r.read(&mut [0u8; 0]);
+                        loop {
+                            if r.fill_buf().map(|b| b.is_empty()).unwrap_or(true) {
+                                break; // producer died / closed: EOF
+                            }
+                        }
+                        peer_gone = !orderly;
+                        break;
+                    }
+                } else {
+                    pending += b.len();
+                    if pending >= cap / 4 {
+                        send(&mut w, KIND_CREDIT, pending).ok();
+                        pending = 0;
+                    }
                 }
             }
             Ok(Some(Rec::Close)) => {
@@ -235,7 +253,12 @@ fn consumer_role(cap: usize, hold: bool) -> i32 {
     marker(&format!(
         "CONSUMER_DONE total={total} hash={hash:x} orderly={orderly} peer_gone={peer_gone} peak_pending_credit={pending}"
     ));
-    0
+    // Truncated/unannounced streams are failures, never clean finishes.
+    if orderly && !peer_gone {
+        0
+    } else {
+        5
+    }
 }
 
 fn main() {
@@ -253,7 +276,7 @@ fn main() {
             args.get(1)
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(65536),
-            args.get(2).map(String::as_str) == Some("hold"),
+            args.get(2).map(String::as_str).unwrap_or("normal"),
         ),
         _ => {
             eprintln!("usage: datapipe_peer producer|consumer <cap> ...");
