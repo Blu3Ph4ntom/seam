@@ -167,34 +167,30 @@ fn datapipe_native_control_eof_on_consumer_death() {
 }
 
 #[test]
-#[ignore = "flaky: producer exit-code evidence under investigation"]
 fn datapipe_happy_small_stream() {
     // capacity 4096, total 32 KiB through the small window.
     let mut topo = wire(4096, 32 * 1024, "normal", &[]);
     let (prod_err_t, _) = collect_stderr(&mut topo.prod);
     let (cons_err_h, _) = collect_stderr(&mut topo.cons);
 
-    // Consumer finishes first (it holds the tail); producer exits after
-    // control EOF. Wait consumer, then producer.
-    assert_eq!(
-        wait_exit(&mut topo.cons, 120).and_then(|s| s.code()),
-        Some(0),
-        "consumer"
-    );
-    assert_eq!(
-        wait_exit(&mut topo.prod, 120).and_then(|s| s.code()),
-        Some(0),
-        "producer"
-    );
+    // Deterministic collection: wait BOTH children to terminate, THEN join
+    // stderr readers (they hit EOF at process exit), THEN assert.
+    let cons_st = wait_exit(&mut topo.cons, 120);
+    let prod_st = wait_exit(&mut topo.prod, 120);
     let perr = prod_err_t.join().unwrap();
     let cerr = cons_err_h.join().unwrap();
-    assert!(perr.contains("PRODUCER_ORDERLY_CLOSED"), "{perr}");
-    assert!(cerr.contains("ORDERLY true"), "{cerr}");
+
+    assert_eq!(cons_st.and_then(|s| s.code()), Some(0), "consumer\n{cerr}");
+    assert_eq!(prod_st.and_then(|s| s.code()), Some(0), "producer\n{perr}");
+    assert!(
+        perr.contains("PRODUCER_ORDERLY_CLOSED"),
+        "producer stderr:\n{perr}"
+    );
+    assert!(cerr.contains("ORDERLY true"), "consumer stderr:\n{cerr}");
     assert!(!cerr.contains("peer_gone=true"), "{cerr}");
 }
 
 #[test]
-#[ignore = "flaky: producer exit-code evidence under investigation"]
 fn datapipe_capacity_clamp_hold_unconsumed() {
     // Consumer stages up to capacity without crediting; producer clamps at
     // exactly semantic capacity. Then consumer death wakes producer as

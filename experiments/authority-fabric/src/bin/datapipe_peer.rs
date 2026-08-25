@@ -254,15 +254,19 @@ fn consumer_role(cap: usize, mode: &str) -> i32 {
         "CONSUMER_DONE total={total} hash={hash:x} orderly={orderly} peer_gone={peer_gone} peak_pending_credit={pending}"
     ));
     // Truncated/unannounced streams are failures, never clean finishes.
-    if orderly && !peer_gone {
-        0
-    } else {
-        5
-    }
+    let code = if orderly && !peer_gone { 0 } else { 5 };
+    eprintln!("CONSUMER_EXIT code={code} orderly={orderly} peer_gone={peer_gone}");
+    code
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    eprintln!(
+        "PEER_ENTRY role={:?} argc={} args={:?}",
+        args.first(),
+        args.len(),
+        &args[..args.len().min(4)]
+    );
     let code = match args.first().map(String::as_str) {
         Some("producer") => producer_role(
             args.get(1)
