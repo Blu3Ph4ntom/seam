@@ -141,8 +141,10 @@ impl Fabric {
             cmd.env(k, v);
         }
         #[cfg(unix)]
+        let lane_child_fd: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
+        #[cfg(unix)]
         let resource_lane: Option<std::os::unix::net::UnixStream> = {
-            use std::os::unix::io::{FromRawFd, IntoRawFd};
+            use std::os::unix::io::IntoRawFd;
             use std::os::unix::process::CommandExt;
             match std::os::unix::net::UnixStream::pair() {
                 Ok((host_end, child_end)) => {
@@ -165,17 +167,23 @@ impl Fabric {
                             Ok(())
                         });
                     }
-                    // SAFETY: raw_child ownership moved into the pre_exec
-                    // closure; kernel owns the descriptor until the child's
-                    // dup2 completes. Parent must not close it concurrently,
-                    // and spawn() happens immediately below on this thread.
-                    std::mem::forget(raw_child);
+                    // SAFETY: raw_child is duplicated into the child by the
+                    // pre_exec hook during spawn() below; afterwards the
+                    // parent's copy must be closed exactly once or every
+                    // spawned peer leaks one descriptor for the host's life.
+                    // The fd is parked here and closed right after spawn().
+                    lane_child_fd.set(Some(raw_child));
                     Some(host_end)
                 }
                 Err(_) => None,
             }
         };
         let mut child = cmd.spawn().map_err(|e| format!("spawn {role}: {e}"))?;
+        #[cfg(unix)]
+        if let Some(fd) = lane_child_fd.take() {
+            use std::os::unix::io::FromRawFd;
+            drop(unsafe { <std::fs::File as FromRawFd>::from_raw_fd(fd) });
+        }
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         // Parent pipe ends must not be inheritable by later siblings; extra
@@ -307,6 +315,11 @@ impl Fabric {
                 if let (Ok(_), Some(tid), Some(_rid), Some(hval)) =
                     (&res, native_tid, native_rid, native_handle)
                 {
+                    // The handle value only matters where handles exist.
+                    #[cfg(not(windows))]
+                    {
+                        let _ = &hval;
+                    }
                     // Windows: duplicate handle from sender into host escrow
                     #[cfg(windows)]
                     {
@@ -372,6 +385,10 @@ impl Fabric {
                 if let (Ok(_), Some(tid), Some(rid), Some(rbyte), Some(hval)) =
                     (&res, sh_tid, sh_rid, sh_rights_raw, sh_hval)
                 {
+                    #[cfg(not(windows))]
+                    {
+                        let _ = &hval;
+                    }
                     let Some(rights) = decode_rights_byte(rbyte) else {
                         return true;
                     };
@@ -407,16 +424,28 @@ impl Fabric {
                             if let Some(lane) = conn.resource_lane.as_ref() {
                                 match authority_fabric::native::unix::stage_from_sender(lane) {
                                     Ok(m) => {
-                                        if m.tid == tid && m.rid.0 == rid.0 && m.fd.is_some() {
-                                            let file =
-                                                authority_fabric::native::unix::escrow_to_file(
-                                                    authority_fabric::native::unix::Escrowed(
-                                                        m.fd.unwrap(),
-                                                    ),
-                                                );
-                                            self.shared_escrow
-                                                .insert(tid, (file, pid, rid, rights));
-                                            marker!("HOST_SHARED_ESCROWED tid={}", tid.0[0]);
+                                        if m.tid == tid && m.rid.0 == rid.0 {
+                                            match m.fd {
+                                                Some(fd) => {
+                                                    let file = authority_fabric::native::unix::
+                                                        escrow_to_file(
+                                                            authority_fabric::native::unix::
+                                                                Escrowed(fd),
+                                                        );
+                                                    self.shared_escrow
+                                                        .insert(tid, (file, pid, rid, rights));
+                                                    marker!(
+                                                        "HOST_SHARED_ESCROWED tid={}",
+                                                        tid.0[0]
+                                                    );
+                                                }
+                                                None => {
+                                                    marker!(
+                                                        "HOST_SHARED_STAGE_MISMATCH tid={}",
+                                                        tid.0[0]
+                                                    );
+                                                }
+                                            }
                                         } else {
                                             marker!("HOST_SHARED_STAGE_MISMATCH tid={}", tid.0[0]);
                                         }
@@ -510,6 +539,7 @@ impl Fabric {
             if let Frame::Xfer(XferMsg::NativeCommit {
                 tid,
                 rid,
+                #[cfg_attr(not(windows), allow(unused_variables))]
                 handle_value,
             }) = &mut frame
             {
@@ -590,6 +620,7 @@ impl Fabric {
                 rid,
                 rights,
                 size: _,
+                #[cfg_attr(not(windows), allow(unused_variables))]
                 handle_value,
             }) = &mut frame
             {
