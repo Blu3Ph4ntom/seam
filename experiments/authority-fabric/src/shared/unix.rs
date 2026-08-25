@@ -6,7 +6,6 @@
 //! `PROT_READ` only. Size immutability is enforced by sealing the memfd
 //! (SHRINK + GROW + SEAL) once the size is fixed.
 
-use std::ffi::CStr;
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::slice;
@@ -15,9 +14,11 @@ use rustix::fs::{fcntl_add_seals, ftruncate, memfd_create, MemfdFlags, SealFlags
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 
 pub fn create_backing(size: u64) -> std::io::Result<File> {
-    let name = CStr::from_bytes_with_nul(c"seam-region");
     // SAFETY: memfd_create takes only a name and flags; no pointers.
-    let fd: OwnedFd = memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
+    let fd: OwnedFd = memfd_create(
+        c"seam-region",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )?;
     ftruncate(&fd, size)?;
     // Seal size immutability: cannot shrink/grow after this point. SEAL itself
     // prevents further seal changes, locking the size contract.
