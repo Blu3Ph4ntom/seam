@@ -26,7 +26,7 @@ fn producer_transfer_stream_continues_prefix_then_suffix() {
 
     // A writes a prefix, then transfers the Producer away.
     p.write(b"PREFIX-").unwrap();
-    let mut c2 = thread::spawn(move || {
+    let id2 = thread::spawn(move || {
         // Recipient B continues the SAME stream and closes orderly.
         p.write(b"SUFFIX").unwrap();
         p.close_write();
@@ -34,8 +34,7 @@ fn producer_transfer_stream_continues_prefix_then_suffix() {
     })
     .join()
     .unwrap();
-    assert_eq!(id, c2);
-    c2 = id;
+    assert_eq!(id, id2);
 
     // C observes prefix || suffix || EOF, nothing replayed or lost.
     let mut got = Vec::new();
