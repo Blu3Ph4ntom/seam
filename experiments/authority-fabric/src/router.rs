@@ -998,6 +998,7 @@ impl Router {
         // A dead sender can never observe its result: clean retained results.
         self.results.retain(|_, (s, _)| *s != p);
         self.native_results.retain(|_, (s, _, _)| *s != p);
+        self.shared_results.retain(|_, (s, _, _)| *s != p);
         // Collect conversations touching this peer.
         let touched: Vec<EpId> = self
             .eps
@@ -1729,6 +1730,31 @@ mod tests {
         let acct = r.accounting();
         assert_eq!(acct.shared_unacked, 0);
         assert_eq!(acct.shared_pending, 0);
+
+        // Sender-death GC: a committed shared result whose sender vanishes
+        // before acking must not linger as an unacked leak.
+        let (mut r, a, b, x, _y) = primed();
+        r.region_create(rid, 4096, &lim).unwrap();
+        let (t0, _) = r
+            .host_grant_region(a, x, 1, rid, Rights::ReadWrite)
+            .unwrap();
+        r.on_xfer(a, XferMsg::Accept { tid: t0 }).unwrap();
+        r.on_xfer(a, XferMsg::ResultAck { tid: t0 }).unwrap();
+        let _oc = r.on_data(a, shared_data(x, rid, 1)).unwrap();
+        let tid = r
+            .shared_pending
+            .keys()
+            .copied()
+            .next()
+            .expect("staged pending");
+        r.on_xfer(b, XferMsg::Accept { tid }).unwrap();
+        assert_eq!(r.accounting().shared_unacked, 1);
+        r.peer_gone(a, Cause::Graceful);
+        assert_eq!(
+            r.accounting().shared_unacked,
+            0,
+            "dead sender's retained shared result must be purged"
+        );
     }
 
     #[test]
