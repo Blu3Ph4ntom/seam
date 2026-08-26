@@ -77,18 +77,18 @@ pub use windows_lane::NativeLane;
 #[cfg(unix)]
 mod unix {
     use rustix::net::{
-        RecvAncillaryBuffer, RecvAncillaryMessage, SendAncillaryBuffer, SendAncillaryMessage,
+        RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+        SendAncillaryMessage, SendFlags,
     };
-    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::io::OwnedFd;
     use std::os::unix::net::UnixStream;
 
     pub fn send_fd(stream: &UnixStream, fd: OwnedFd) -> std::io::Result<()> {
         let mut cmsg_space = [0u8; rustix::cmsg_space!(ScmRights(1))];
         let mut cmsg = SendAncillaryBuffer::new(&mut cmsg_space);
         cmsg.push(SendAncillaryMessage::ScmRights(&[fd]));
-        // Send a single dummy byte with the cmsg.
         let iov = [std::io::IoSlice::new(&[0u8])];
-        rustix::net::sendmsg(stream.as_raw_fd(), &iov, &mut cmsg, Default::default())
+        rustix::net::sendmsg(stream, &iov, &mut cmsg, SendFlags::empty())
             .map(|_| ())
             .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
     }
@@ -98,7 +98,7 @@ mod unix {
         let mut cmsg_space = [0u8; rustix::cmsg_space!(ScmRights(1))];
         let mut cmsg = RecvAncillaryBuffer::new(&mut cmsg_space);
         let mut iov = [std::io::IoSliceMut::new(&mut buf)];
-        let _n = rustix::net::recvmsg(stream.as_raw_fd(), &mut iov, &mut cmsg, Default::default())
+        let _n = rustix::net::recvmsg(stream, &mut iov, &mut cmsg, RecvFlags::empty())
             .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
         for msg in cmsg.drain() {
             if let RecvAncillaryMessage::ScmRights(mut fds) = msg {
