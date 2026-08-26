@@ -187,16 +187,12 @@ mod tests {
                     .ok();
                 payload_a.read_exact(&mut buf).unwrap();
                 assert_eq!(&buf, b"SUFFIX");
-                let mut status: i32 = 0;
-                unsafe {
-                    rustix::process::waitpid(
-                        Some(child_pid),
-                        rustix::process::WaitOptions::empty(),
-                        &mut status,
-                    )
-                    .unwrap();
-                }
-                assert_eq!(status, 0);
+                let status = rustix::process::waitpid(
+                    Some(child_pid),
+                    rustix::process::WaitOptions::empty(),
+                )
+                .unwrap();
+                assert!(status.unwrap().is_exited());
             }
         }
     }
