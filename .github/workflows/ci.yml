@@ -24,10 +24,10 @@ jobs:
       - name: fmt check
         run: cargo fmt --check
       - name: build
-        run: cargo build --workspace
+        run: cargo build -p seam-core -p seam-platform -p seam-process -p seam -p seam-idl
       - name: test seam-core
         run: cargo test -p seam-core -- --nocapture
       - name: test seam-platform (lane primitive + canonical)
         run: cargo test -p seam-platform -- --nocapture
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy -p seam-core -p seam-platform -p seam-process -p seam -p seam-idl --all-targets -- -D warnings

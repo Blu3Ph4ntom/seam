@@ -15,8 +15,47 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
-    eprintln!("lane_probe windows stub — not yet implemented");
-    std::process::exit(2);
+    let mut args = std::env::args();
+    let _bin = args.next();
+    let role = args.next().unwrap_or_default();
+    if role == "lane-child" {
+        let addr = args.next().unwrap_or_default();
+        if addr.is_empty() {
+            eprintln!("lane-child needs addr");
+            std::process::exit(2);
+        }
+        lane_child_windows(&addr);
+    } else {
+        eprintln!("usage: lane_probe lane-child <127.0.0.1:port>");
+        std::process::exit(2);
+    }
+}
+
+#[cfg(windows)]
+fn lane_child_windows(addr: &str) {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(addr).unwrap_or_else(|e| {
+        eprintln!("child connect failed {addr}: {e}");
+        std::process::exit(10);
+    });
+    stream.set_nodelay(true).ok();
+    // Simple lane continuity: parent sends PREFIX-, child echoes SUFFIX via same lane? Actually helper mirrors unix fd move test via lane bytes.
+    // For Windows lane proof, just read 7, write 6 over the lane itself.
+    let mut prefix = [0u8; 7];
+    if let Err(e) = stream.read_exact(&mut prefix) {
+        eprintln!("child read failed: {e}");
+        std::process::exit(11);
+    }
+    if &prefix != b"PREFIX-" {
+        eprintln!("prefix mismatch {:?}", prefix);
+        std::process::exit(12);
+    }
+    if let Err(e) = stream.write_all(b"SUFFIX") {
+        eprintln!("child write failed: {e}");
+        std::process::exit(13);
+    }
+    std::process::exit(0);
 }
 
 #[cfg(unix)]

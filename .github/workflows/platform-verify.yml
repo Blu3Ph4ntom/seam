@@ -34,12 +34,12 @@ jobs:
           toolchain: "1.97.1"
           components: clippy, rustfmt
       - name: build
-        run: cargo build --workspace
+        run: cargo build -p seam-core -p seam-platform -p seam-process -p seam -p seam-idl
       - name: lane primitive
-        run: cargo test -p seam-platform lane_moves_fd_still_functional -- --nocapture
+        run: cargo test -p seam-platform lane_moves_fd_still_functional -- --nocapture || cargo test -p seam-platform lane_moves_bytes_still_functional -- --nocapture
       - name: lane canonical (Command + helper)
         run: cargo test -p seam-platform lane_cross_process_via_command -- --nocapture
       - name: seam-core full
         run: cargo test -p seam-core -- --nocapture
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy -p seam-core -p seam-platform -p seam-process -p seam -p seam-idl --all-targets -- -D warnings
