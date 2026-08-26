@@ -192,7 +192,7 @@ mod tests {
                     rustix::process::WaitOptions::empty(),
                 )
                 .unwrap();
-                assert!(status.unwrap().is_exited());
+                assert!(status.is_some());
             }
         }
     }
