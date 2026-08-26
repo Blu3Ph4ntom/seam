@@ -17,6 +17,25 @@ pub mod unix_lane {
             Ok((Self { inner: a }, Self { inner: b }))
         }
 
+        /// SAFETY: fd must be an owned UnixStream fd, valid and not used elsewhere.
+        pub unsafe fn from_raw_fd(fd: std::os::unix::io::RawFd) -> Self {
+            // SAFETY: caller guarantees fd is a valid owned UnixStream fd.
+            Self {
+                inner: unsafe { UnixStream::from_raw_fd(fd) },
+            }
+        }
+
+        pub fn from_owned_fd(fd: OwnedFd) -> Self {
+            Self {
+                inner: UnixStream::from(fd),
+            }
+        }
+
+        pub fn into_owned_fd(self) -> OwnedFd {
+            use std::os::unix::io::IntoRawFd;
+            unsafe { OwnedFd::from_raw_fd(self.inner.into_raw_fd()) }
+        }
+
         pub fn send(&self, buf: &[u8]) -> std::io::Result<()> {
             use std::io::Write;
             (&self.inner).write_all(buf)
@@ -153,8 +172,11 @@ mod tests {
 
     #[test]
     fn lane_cross_process_fd_transfer() {
-        // REAL CROSS-PROCESS PROVEN: distinct PIDs, fd ownership moves
-        // via SCM_RIGHTS over a private lane, stream continues.
+        // REAL CROSS-PROCESS KERNEL PROOF — TEST HARNESS PROVISIONAL:
+        // distinct PIDs via fork, SCM_RIGHTS continuity. Fork-from-harness
+        // is not the production model (Command + inherited lane), but a
+        // useful kernel regression. Canonical proof is lane_cross_process_via_command.
+        // Never claim Windows evidence for this unix test.
         let (lane_a, lane_b) = NativeLane::pair().unwrap();
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -189,5 +211,47 @@ mod tests {
             unsafe { libc::waitpid(pid, &mut status, 0) };
             assert_eq!(libc::WEXITSTATUS(status), 0);
         }
+    }
+
+    #[test]
+    fn lane_cross_process_via_command() {
+        // REAL CROSS-PROCESS PROVEN (canonical): distinct executable via
+        // Command + private inherited lane (fd 3) + SCM_RIGHTS. This is the
+        // production bootstrap shape, not fork-from-harness.
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        let (lane_a, lane_b) = NativeLane::pair().unwrap();
+        let lane_b_raw = lane_b.as_raw_fd();
+        // Binary path — CARGO_BIN_EXE is set for binaries in same crate
+        let bin = env!("CARGO_BIN_EXE_lane_probe");
+        let mut cmd = Command::new(bin);
+        cmd.arg("lane-child");
+        // SAFETY: pre_exec runs in child after fork before exec; only async-signal-safe ops.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(lane_b_raw, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn lane_probe");
+        // Parent no longer needs child end — close our copy (keep lane_a)
+        drop(lane_b);
+        // Payload channel whose one end will be moved via lane
+        let (mut payload_a, payload_b) = UnixStream::pair().unwrap();
+        use std::io::{Read, Write};
+        payload_a.write_all(b"PREFIX-").unwrap();
+        let fd_to_send: OwnedFd = unsafe { OwnedFd::from_raw_fd(payload_b.into_raw_fd()) };
+        lane_a.send_fd(fd_to_send).unwrap();
+        // Child should echo SUFFIX on the moved fd's peer
+        let mut buf = [0u8; 6];
+        payload_a
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .ok();
+        payload_a.read_exact(&mut buf).expect("parent read suffix");
+        assert_eq!(&buf, b"SUFFIX");
+        let status = child.wait().expect("wait child");
+        assert!(status.success(), "child failed: {:?}", status);
     }
 }
