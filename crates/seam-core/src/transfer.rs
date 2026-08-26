@@ -19,6 +19,7 @@ pub struct AttachmentState {
     pub index: u16,
     pub object_id: [u8; 16],
     pub object_kind: u8,
+    pub fabric_escrowed: bool,
     pub native_staged: bool,
     pub native_required: bool,
 }
@@ -98,12 +99,34 @@ impl TransferTable {
         Ok(())
     }
 
+    pub fn mark_fabric_escrowed(
+        &mut self,
+        tid: &TransferId,
+        index: u16,
+    ) -> Result<(), TransferError> {
+        let b = self
+            .bundles
+            .get_mut(tid)
+            .ok_or(TransferError::UnknownTransfer)?;
+        let a = b
+            .attachments
+            .iter_mut()
+            .find(|a| a.index == index)
+            .ok_or(TransferError::UnknownTransfer)?;
+        a.fabric_escrowed = true;
+        Ok(())
+    }
+
     pub fn is_ready(&self, tid: &TransferId) -> bool {
         if let Some(b) = self.bundles.get(tid) {
             b.state == BundleState::Accepted
-                && b.attachments
-                    .iter()
-                    .all(|a| !a.native_required || a.native_staged)
+                && b.attachments.iter().all(|a| {
+                    if !a.native_required {
+                        true
+                    } else {
+                        a.fabric_escrowed && a.native_staged
+                    }
+                })
         } else {
             false
         }
@@ -192,6 +215,7 @@ mod tests {
                     index: 0,
                     object_id: [1; 16],
                     object_kind: 2,
+                    fabric_escrowed: false,
                     native_staged: false,
                     native_required: true,
                 },
@@ -199,6 +223,7 @@ mod tests {
                     index: 1,
                     object_id: [2; 16],
                     object_kind: 4,
+                    fabric_escrowed: false,
                     native_staged: false,
                     native_required: false,
                 },
@@ -207,6 +232,8 @@ mod tests {
         };
         t.offer(b).unwrap();
         t.accept(&tid(1)).unwrap();
+        assert!(!t.is_ready(&tid(1)));
+        t.mark_fabric_escrowed(&tid(1), 0).unwrap();
         assert!(!t.is_ready(&tid(1)));
         t.stage_native(&tid(1), 0).unwrap();
         assert!(t.is_ready(&tid(1)));

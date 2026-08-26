@@ -62,6 +62,12 @@ impl Fabric {
             .map_err(|e| format!("{:?}", e))
     }
 
+    pub fn mark_fabric_escrowed(&mut self, tid: &TransferId, idx: u16) -> Result<(), String> {
+        self.transfers
+            .mark_fabric_escrowed(tid, idx)
+            .map_err(|e| format!("{:?}", e))
+    }
+
     pub fn commit_bundle(&mut self, tid: &TransferId) -> Result<Bundle, String> {
         self.transfers.commit(tid).map_err(|e| format!("{:?}", e))
     }
@@ -119,6 +125,7 @@ mod tests {
                     index: 0,
                     object_id: [10; 16],
                     object_kind: 1,
+                    fabric_escrowed: false,
                     native_staged: false,
                     native_required: true,
                 },
@@ -126,6 +133,7 @@ mod tests {
                     index: 1,
                     object_id: [11; 16],
                     object_kind: 2,
+                    fabric_escrowed: false,
                     native_staged: false,
                     native_required: false,
                 },
@@ -134,6 +142,8 @@ mod tests {
         };
         f.offer_bundle(bundle).unwrap();
         f.accept_bundle(&tid(1)).unwrap();
+        assert!(!f.transfers.is_ready(&tid(1)));
+        f.mark_fabric_escrowed(&tid(1), 0).unwrap();
         assert!(!f.transfers.is_ready(&tid(1)));
         f.stage_native(&tid(1), 0).unwrap();
         assert!(f.transfers.is_ready(&tid(1)));
