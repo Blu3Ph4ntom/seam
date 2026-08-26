@@ -154,46 +154,40 @@ mod tests {
     #[test]
     fn lane_cross_process_fd_transfer() {
         // REAL CROSS-PROCESS PROVEN: distinct PIDs, fd ownership moves
-        // via SCM_RIGHTS over a private lane, stream continues (prefix
-        // written before transfer is readable after, suffix written after
-        // is readable on the original peer).
+        // via SCM_RIGHTS over a private lane, stream continues.
         let (lane_a, lane_b) = NativeLane::pair().unwrap();
-        match unsafe { rustix::process::fork().unwrap() } {
-            rustix::process::Fork::Child(_) => {
-                drop(lane_a);
-                let received: OwnedFd = lane_b.recv_fd().expect("child recv");
-                let mut stream = unsafe { UnixStream::from_raw_fd(received.into_raw_fd()) };
-                use std::io::{Read, Write};
-                // Read PREFIX written by parent before transfer
-                let mut prefix = [0u8; 7];
-                stream.read_exact(&mut prefix).expect("child read prefix");
-                assert_eq!(&prefix, b"PREFIX-");
-                stream.write_all(b"SUFFIX").expect("child write");
-                drop(stream);
-                std::process::exit(0);
-            }
-            rustix::process::Fork::Parent(child_pid) => {
-                drop(lane_b);
-                let (mut payload_a, payload_b) = UnixStream::pair().unwrap();
-                use std::io::{Read, Write};
-                // Write PREFIX to payload_a (goes to payload_b's buffer)
-                payload_a.write_all(b"PREFIX-").unwrap();
-                let fd_to_send: OwnedFd = unsafe { OwnedFd::from_raw_fd(payload_b.into_raw_fd()) };
-                lane_a.send_fd(fd_to_send).unwrap();
-                // Child will read PREFIX and write SUFFIX; parent reads SUFFIX
-                let mut buf = [0u8; 6];
-                payload_a
-                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                    .ok();
-                payload_a.read_exact(&mut buf).unwrap();
-                assert_eq!(&buf, b"SUFFIX");
-                let status = rustix::process::waitpid(
-                    Some(child_pid),
-                    rustix::process::WaitOptions::empty(),
-                )
-                .unwrap();
-                assert!(status.is_some());
-            }
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            panic!("fork failed");
+        } else if pid == 0 {
+            // Child
+            drop(lane_a);
+            let received: OwnedFd = lane_b.recv_fd().expect("child recv");
+            let mut stream = unsafe { UnixStream::from_raw_fd(received.into_raw_fd()) };
+            use std::io::{Read, Write};
+            let mut prefix = [0u8; 7];
+            stream.read_exact(&mut prefix).expect("child read prefix");
+            assert_eq!(&prefix, b"PREFIX-");
+            stream.write_all(b"SUFFIX").expect("child write");
+            drop(stream);
+            unsafe { libc::_exit(0) };
+        } else {
+            // Parent
+            drop(lane_b);
+            let (mut payload_a, payload_b) = UnixStream::pair().unwrap();
+            use std::io::{Read, Write};
+            payload_a.write_all(b"PREFIX-").unwrap();
+            let fd_to_send: OwnedFd = unsafe { OwnedFd::from_raw_fd(payload_b.into_raw_fd()) };
+            lane_a.send_fd(fd_to_send).unwrap();
+            let mut buf = [0u8; 6];
+            payload_a
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .ok();
+            payload_a.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"SUFFIX");
+            let mut status: i32 = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            assert_eq!(libc::WEXITSTATUS(status), 0);
         }
     }
 }
