@@ -16,7 +16,10 @@ pub struct Metadata {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     Wait,
-    Materialize { object_id: [u8; 16], object_kind: u8 },
+    Materialize {
+        object_id: [u8; 16],
+        object_kind: u8,
+    },
     CloseNative,
     Reject(&'static str),
 }
@@ -60,12 +63,7 @@ impl Materializer {
         }
     }
 
-    pub fn authorize_metadata(
-        &mut self,
-        tid: TransferId,
-        idx: u16,
-        meta: Metadata,
-    ) -> Action {
+    pub fn authorize_metadata(&mut self, tid: TransferId, idx: u16, meta: Metadata) -> Action {
         let key = (tid, idx);
         // Wrong tid already aborted/committed? Still allow but will be rejected if mismatched
         if self.aborted_tids.contains(&tid) {
@@ -268,7 +266,13 @@ mod tests {
         let p = peer(2);
         m.mark_committed(t);
         assert_eq!(m.authorize_metadata(t, 0, meta(p, true)), Action::Wait);
-        assert_eq!(m.stage_native(t, 0, true), Action::Materialize { object_id: [7; 16], object_kind: 2 });
+        assert_eq!(
+            m.stage_native(t, 0, true),
+            Action::Materialize {
+                object_id: [7; 16],
+                object_kind: 2
+            }
+        );
     }
 
     #[test]
@@ -296,7 +300,10 @@ mod tests {
         let mut m = Materializer::new();
         let t = tid(1);
         m.authorize_metadata(t, 0, meta(peer(2), true));
-        assert_eq!(m.stage_native(t, 0, false), Action::Reject("native_required mismatch"));
+        assert_eq!(
+            m.stage_native(t, 0, false),
+            Action::Reject("native_required mismatch")
+        );
     }
 
     #[test]
@@ -308,7 +315,10 @@ mod tests {
         m.mark_committed(t);
         assert_eq!(
             m.try_materialize(t, 0),
-            Action::Materialize { object_id: [7; 16], object_kind: 2 }
+            Action::Materialize {
+                object_id: [7; 16],
+                object_kind: 2
+            }
         );
         assert_eq!(m.try_materialize(t, 0), Action::CloseNative);
     }
