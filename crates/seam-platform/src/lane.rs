@@ -437,7 +437,7 @@ mod tests {
     fn lane_transfers_file_fd_same_unlinked_object() {
         // REAL CROSS-PROCESS PROVEN — file fd via SCM_RIGHTS, same underlying open file after unlink
         use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write};
+        use std::io::Write;
         use std::os::unix::io::IntoRawFd;
         use std::os::unix::process::CommandExt;
         use std::process::Command;
