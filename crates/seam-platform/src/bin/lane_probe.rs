@@ -61,7 +61,8 @@ fn lane_child_windows(addr: &str) {
 #[cfg(unix)]
 fn lane_child() {
     use std::io::{Read, Write};
-    use std::os::unix::io::{FromRawFd, OwnedFd};
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::unix::io::OwnedFd;
     use std::os::unix::net::UnixStream;
 
     // SAFETY: fd 3 is the private inherited lane endpoint, handed by parent
@@ -97,9 +98,9 @@ fn lane_child() {
 }
 
 #[cfg(unix)]
-fn recv_fd_via(stream: &std::os::unix::net::UnixStream) -> std::io::Result<OwnedFd> {
+fn recv_fd_via(stream: &std::os::unix::net::UnixStream) -> std::io::Result<std::os::fd::OwnedFd> {
     use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
-    use std::os::unix::io::OwnedFd;
+    use std::os::fd::OwnedFd;
     let mut buf = [0u8; 1];
     let mut cmsg_space = [0u8; 128];
     let mut cmsg = RecvAncillaryBuffer::new(&mut cmsg_space);
