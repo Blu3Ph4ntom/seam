@@ -114,7 +114,7 @@ mod unix {
 #[cfg(all(test, unix))]
 mod tests {
     use super::NativeLane;
-    use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
 
     #[test]
