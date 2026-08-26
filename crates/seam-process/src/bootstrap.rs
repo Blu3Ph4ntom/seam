@@ -160,7 +160,7 @@ pub mod unix_spawn {
                 Ok(())
             });
         }
-        let mut child = cmd.spawn()?;
+        let child = cmd.spawn()?;
         // parent no longer needs child_lane copy
         drop(child_lane);
         // Handshake
