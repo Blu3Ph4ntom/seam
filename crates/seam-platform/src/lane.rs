@@ -114,7 +114,7 @@ mod unix {
 #[cfg(all(test, unix))]
 mod tests {
     use super::NativeLane;
-    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
 
     #[test]
@@ -124,14 +124,11 @@ mod tests {
         // follows because the fd refers to the same kernel object.
         let (lane_a, lane_b) = NativeLane::pair().unwrap();
         let (payload_a, payload_b) = UnixStream::pair().unwrap();
-        let raw_before = payload_b.as_raw_fd();
-        // Move ownership of payload_b into the lane
-        let fd_to_send: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw_before) };
-        std::mem::forget(payload_b);
+        // Move ownership of payload_b into the lane (into_raw_fd gives
+        // ownership to the new OwnedFd; no double-close)
+        let fd_to_send: OwnedFd = unsafe { OwnedFd::from_raw_fd(payload_b.into_raw_fd()) };
         lane_a.send_fd(fd_to_send).unwrap();
         let received: OwnedFd = lane_b.recv_fd().unwrap();
-        // Received fd must be valid and distinct from the original number
-        // (kernel allocates a new descriptor), yet refer to the same object.
         assert!(received.as_raw_fd() >= 0);
         // Verify the peer end still works by writing through the moved fd
         // and reading on the retained peer (UnixStream pair is bidirectional).
