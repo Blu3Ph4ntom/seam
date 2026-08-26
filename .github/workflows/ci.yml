@@ -29,5 +29,7 @@ jobs:
         run: cargo test -p seam-core -- --nocapture
       - name: test seam-platform (lane primitive + canonical)
         run: cargo test -p seam-platform -- --nocapture
+      - name: test seam-process (bootstrap)
+        run: cargo test -p seam-process -- --nocapture
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
