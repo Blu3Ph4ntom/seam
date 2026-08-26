@@ -8,3 +8,4 @@ publish = false
 [dependencies]
 seam-core = { path = "../seam-core" }
 seam-platform = { path = "../seam-platform" }
+libc = { workspace = true }
