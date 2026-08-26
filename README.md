@@ -14,3 +14,4 @@ stable.
 | Windows | under development |
 | Linux | under development |
 | macOS | under development |
+<!-- ci trigger 1787764391 -->
