@@ -86,9 +86,10 @@ mod unix {
     pub fn send_fd(stream: &UnixStream, fd: OwnedFd) -> std::io::Result<()> {
         use std::os::fd::{AsRawFd, BorrowedFd};
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
+        let fds = [borrowed];
         let mut cmsg_space = [0u8; rustix::cmsg_space!(ScmRights(1))];
         let mut cmsg = SendAncillaryBuffer::new(&mut cmsg_space);
-        cmsg.push(SendAncillaryMessage::ScmRights(&[borrowed]));
+        cmsg.push(SendAncillaryMessage::ScmRights(&fds));
         let iov = [std::io::IoSlice::new(&[0u8])];
         let res = rustix::net::sendmsg(stream, &iov, &mut cmsg, SendFlags::empty())
             .map(|_| ())
