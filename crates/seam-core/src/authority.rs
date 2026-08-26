@@ -36,7 +36,7 @@ pub enum LedgerError {
 }
 
 pub struct AuthorityLedger {
-    map: HashMap<AuthorityKey, AuthorityState>,
+    pub(crate) map: HashMap<AuthorityKey, AuthorityState>,
 }
 
 impl AuthorityLedger {

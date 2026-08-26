@@ -3,6 +3,7 @@
 
 pub mod authority;
 pub mod fabric;
+pub mod fabric_state;
 pub mod ids;
 pub mod limits;
 pub mod materializer;
