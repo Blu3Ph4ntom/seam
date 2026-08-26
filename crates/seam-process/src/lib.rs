@@ -1,5 +1,7 @@
 //! seam-process — spawn/bootstrap helper.
 
+pub mod bootstrap;
+
 use seam_core::ids::PeerId;
 
 pub struct ChildHandle {
@@ -11,3 +13,9 @@ pub fn spawn(_fabric: &str, _name: &str) -> Result<ChildHandle, String> {
         peer: PeerId::fresh(),
     })
 }
+
+#[cfg(unix)]
+pub use bootstrap::unix_spawn;
+#[cfg(windows)]
+pub use bootstrap::windows_spawn;
+pub use bootstrap::{child_handshake, parent_handshake};

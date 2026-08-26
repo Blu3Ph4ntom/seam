@@ -71,9 +71,16 @@ pub mod windows_lane {
     use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
     use winapi::um::namedpipeapi::CreatePipe;
 
+    pub enum Inner {
+        Pipe {
+            read: OwnedHandle,
+            write: OwnedHandle,
+        },
+        Tcp(std::net::TcpStream),
+    }
+
     pub struct NativeLane {
-        read: OwnedHandle,
-        write: OwnedHandle,
+        inner: Inner,
     }
 
     fn create_pipe() -> std::io::Result<(OwnedHandle, OwnedHandle)> {
@@ -149,22 +156,44 @@ pub mod windows_lane {
             // lane_a: writes w1, reads r2 ; lane_b: writes w2, reads r1
             Ok((
                 Self {
-                    read: r2,
-                    write: w1,
+                    inner: Inner::Pipe {
+                        read: r2,
+                        write: w1,
+                    },
                 },
                 Self {
-                    read: r1,
-                    write: w2,
+                    inner: Inner::Pipe {
+                        read: r1,
+                        write: w2,
+                    },
                 },
             ))
         }
 
+        pub fn from_tcp(stream: std::net::TcpStream) -> Self {
+            Self {
+                inner: Inner::Tcp(stream),
+            }
+        }
+
         pub fn send(&self, buf: &[u8]) -> std::io::Result<()> {
-            write_all(&self.write, buf)
+            match &self.inner {
+                Inner::Pipe { write, .. } => write_all(write, buf),
+                Inner::Tcp(s) => {
+                    use std::io::Write;
+                    (&*s).write_all(buf)
+                }
+            }
         }
 
         pub fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-            read_once(&self.read, buf)
+            match &self.inner {
+                Inner::Pipe { read, .. } => read_once(read, buf),
+                Inner::Tcp(s) => {
+                    use std::io::Read;
+                    (&*s).read(buf)
+                }
+            }
         }
 
         // Real child spawn with explicit handle list will be implemented via
