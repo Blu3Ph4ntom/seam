@@ -200,10 +200,7 @@ pub mod windows_lane {
 
         pub fn as_pipe_handles(&self) -> Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
             match &self.inner {
-                Inner::Pipe { read, write } => Some((
-                    read.as_raw_handle() as *mut std::ffi::c_void,
-                    write.as_raw_handle() as *mut std::ffi::c_void,
-                )),
+                Inner::Pipe { read, write } => Some((read.as_raw_handle(), write.as_raw_handle())),
                 _ => None,
             }
         }
