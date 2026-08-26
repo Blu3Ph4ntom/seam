@@ -170,7 +170,7 @@ mod tests {
                 assert_eq!(&prefix, b"PREFIX-");
                 stream.write_all(b"SUFFIX").expect("child write");
                 drop(stream);
-                unsafe { rustix::process::_exit(0) };
+                std::process::exit(0);
             }
             rustix::process::Fork::Parent(child_pid) => {
                 drop(lane_b);
