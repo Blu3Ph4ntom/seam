@@ -251,8 +251,16 @@ mod tests {
         use std::process::Command;
         let (lane_a, lane_b) = NativeLane::pair().unwrap();
         let lane_b_raw = lane_b.as_raw_fd();
-        // Binary path — CARGO_BIN_EXE is set for binaries in same crate
-        let bin = env!("CARGO_BIN_EXE_lane_probe");
+        // Binary path — CARGO_BIN_EXE set when built with --bins; fallback to target/debug
+        let bin = std::env::var("CARGO_BIN_EXE_lane_probe").unwrap_or_else(|_| {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/debug/lane_probe");
+            if cfg!(windows) {
+                base.with_extension("exe").to_string_lossy().into_owned()
+            } else {
+                base.to_string_lossy().into_owned()
+            }
+        });
         let mut cmd = Command::new(bin);
         cmd.arg("lane-child");
         // SAFETY: pre_exec runs in child after fork before exec; only async-signal-safe ops.
