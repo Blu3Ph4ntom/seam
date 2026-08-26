@@ -5,8 +5,8 @@ members = [
     "crates/seam-process",
     "crates/seam-idl",
     "crates/seam",
-    "experiments/authority-fabric",
 ]
+exclude = ["experiments/authority-fabric"]
 resolver = "2"
 
 [workspace.dependencies]
