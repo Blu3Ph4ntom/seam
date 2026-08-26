@@ -128,10 +128,7 @@ impl AuthorityLedger {
         Ok(to_commit)
     }
 
-    pub fn abort_bundle(
-        &mut self,
-        tid: TransferId,
-    ) -> Result<Vec<AuthorityKey>, LedgerError> {
+    pub fn abort_bundle(&mut self, tid: TransferId) -> Result<Vec<AuthorityKey>, LedgerError> {
         let mut to_abort = Vec::new();
         let mut sender_opt: Option<PeerId> = None;
         for (k, state) in self.map.iter() {
@@ -178,7 +175,9 @@ impl AuthorityLedger {
     pub fn invariant_holds(&self) -> bool {
         for state in self.map.values() {
             match state {
-                AuthorityState::Held(_) | AuthorityState::Escrow { .. } | AuthorityState::Released => {}
+                AuthorityState::Held(_)
+                | AuthorityState::Escrow { .. }
+                | AuthorityState::Released => {}
             }
         }
         true
@@ -186,6 +185,10 @@ impl AuthorityLedger {
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
 

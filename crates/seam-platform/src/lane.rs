@@ -432,6 +432,61 @@ mod tests {
         let status = child.wait().expect("wait child");
         assert!(status.success(), "child failed: {:?}", status);
     }
+
+    #[test]
+    fn lane_transfers_file_fd_same_unlinked_object() {
+        // REAL CROSS-PROCESS PROVEN — file fd via SCM_RIGHTS, same underlying open file after unlink
+        use std::fs::OpenOptions;
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        let (lane_a, lane_b) = NativeLane::pair().unwrap();
+        let lane_b_raw = lane_b.as_raw_fd();
+        let bin = std::env::var("CARGO_BIN_EXE_lane_probe").unwrap_or_else(|_| {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/debug/lane_probe");
+            base.to_string_lossy().into_owned()
+        });
+        let mut cmd = Command::new(bin);
+        cmd.arg("file-child");
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(lane_b_raw, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn file-child");
+        drop(lane_b);
+        // Create temp file, write PREFIX-, unlink, send fd
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "seam-file-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"PREFIX-").unwrap();
+        file.flush().unwrap();
+        // Unlink pathname — file remains via open fd, path reopen impossible
+        let _ = std::fs::remove_file(&path);
+        assert!(!path.exists(), "unlink should remove path");
+        // Send fd via lane (move ownership)
+        let fd_to_send: OwnedFd = unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) };
+        lane_a.send_fd(fd_to_send).unwrap();
+        let status = child.wait().expect("wait child");
+        assert!(status.success(), "file-child failed {:?}", status);
+    }
 }
 
 #[cfg(all(test, windows))]

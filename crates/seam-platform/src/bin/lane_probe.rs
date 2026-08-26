@@ -7,8 +7,10 @@ fn main() {
     let role = std::env::args().nth(1).unwrap_or_default();
     if role == "lane-child" {
         lane_child();
+    } else if role == "file-child" {
+        file_child();
     } else {
-        eprintln!("usage: lane_probe lane-child (fd 3 is private lane)");
+        eprintln!("usage: lane_probe lane-child|file-child (fd 3 is private lane)");
         std::process::exit(2);
     }
 }
@@ -94,6 +96,56 @@ fn lane_child() {
         std::process::exit(13);
     }
     drop(stream);
+    std::process::exit(0);
+}
+
+#[cfg(unix)]
+fn file_child() {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::unix::io::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    let lane_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(3) };
+    let lane_stream = unsafe { UnixStream::from_raw_fd(lane_fd.into_raw_fd()) };
+    let received = recv_fd_via(&lane_stream).unwrap_or_else(|e| {
+        eprintln!("file-child recv_fd failed: {e}");
+        std::process::exit(10);
+    });
+    let mut file = unsafe { File::from_raw_fd(received.into_raw_fd()) };
+    // File should contain PREFIX- at start (shared open file description, seek to 0)
+    file.seek(SeekFrom::Start(0)).unwrap_or_else(|e| {
+        eprintln!("seek failed: {e}");
+        std::process::exit(11);
+    });
+    let mut prefix = [0u8; 7];
+    file.read_exact(&mut prefix).unwrap_or_else(|e| {
+        eprintln!("read prefix failed: {e}");
+        std::process::exit(12);
+    });
+    if &prefix != b"PREFIX-" {
+        eprintln!("prefix mismatch {:?}", prefix);
+        std::process::exit(13);
+    }
+    // Append SUFFIX at end
+    file.seek(SeekFrom::End(0)).unwrap_or_else(|e| {
+        eprintln!("seek end failed: {e}");
+        std::process::exit(14);
+    });
+    file.write_all(b"SUFFIX").unwrap_or_else(|e| {
+        eprintln!("write suffix failed: {e}");
+        std::process::exit(15);
+    });
+    file.flush().unwrap();
+    // Verify final content PREFIX- + SUFFIX
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut all = Vec::new();
+    file.read_to_end(&mut all).unwrap();
+    if all != b"PREFIX-SUFFIX" {
+        eprintln!("final mismatch {:?}", all);
+        std::process::exit(16);
+    }
+    drop(file);
     std::process::exit(0);
 }
 
