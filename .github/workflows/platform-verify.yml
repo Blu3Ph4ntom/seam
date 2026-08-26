@@ -1,0 +1,45 @@
+name: platform-verify
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Runner label"
+        required: true
+        default: "ubuntu-24.04"
+        type: choice
+        options: [ubuntu-24.04, windows-2025, macos-15, macos-15-intel]
+      lifecycle_count:
+        description: "Lifecycle iterations"
+        required: false
+        default: "100"
+        type: choice
+        options: ["100", "1000"]
+      stream_size:
+        description: "Stream size"
+        required: false
+        default: "8MiB"
+        type: choice
+        options: ["8MiB", "256MiB"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ${{ inputs.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: clippy, rustfmt
+      - name: build
+        run: cargo build --workspace
+      - name: lane primitive
+        run: cargo test -p seam-platform lane_moves_fd_still_functional -- --nocapture
+      - name: lane canonical (Command + helper)
+        run: cargo test -p seam-platform lane_cross_process_via_command -- --nocapture
+      - name: seam-core full
+        run: cargo test -p seam-core -- --nocapture
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

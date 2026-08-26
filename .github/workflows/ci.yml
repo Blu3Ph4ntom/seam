@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: clippy, rustfmt
+      - name: fmt check
+        run: cargo fmt --check
+      - name: build
+        run: cargo build --workspace
+      - name: test seam-core
+        run: cargo test -p seam-core -- --nocapture
+      - name: test seam-platform (lane primitive + canonical)
+        run: cargo test -p seam-platform -- --nocapture
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
