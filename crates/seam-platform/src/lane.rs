@@ -33,12 +33,12 @@ pub mod unix_lane {
 
         /// Send a single fd via SCM_RIGHTS (blocking).
         pub fn send_fd(&self, fd: OwnedFd) -> std::io::Result<()> {
-            crate::unix::send_fd(&self.inner, fd)
+            super::unix::send_fd(&self.inner, fd)
         }
 
         /// Receive a single fd via SCM_RIGHTS.
         pub fn recv_fd(&self) -> std::io::Result<OwnedFd> {
-            crate::unix::recv_fd(&self.inner)
+            super::unix::recv_fd(&self.inner)
         }
     }
 }
