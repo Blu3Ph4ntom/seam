@@ -104,6 +104,7 @@ dependencies = [
 name = "seam-process"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "seam-core",
  "seam-platform",
 ]

@@ -176,6 +176,63 @@ pub mod windows_lane {
             }
         }
 
+        /// Create lane from raw pipe handles (child side, inherited).
+        ///
+        /// # Safety
+        /// raw handles must be valid, uniquely owned, and not used elsewhere.
+        pub unsafe fn from_raw_pipe_handles(
+            read_raw: *mut std::ffi::c_void,
+            write_raw: *mut std::ffi::c_void,
+        ) -> Self {
+            let read = unsafe { OwnedHandle::from_raw_handle(read_raw) };
+            let write = unsafe { OwnedHandle::from_raw_handle(write_raw) };
+            Self {
+                inner: Inner::Pipe { read, write },
+            }
+        }
+
+        pub fn into_pipe_handles(self) -> Option<(OwnedHandle, OwnedHandle)> {
+            match self.inner {
+                Inner::Pipe { read, write } => Some((read, write)),
+                _ => None,
+            }
+        }
+
+        pub fn as_pipe_handles(&self) -> Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
+            match &self.inner {
+                Inner::Pipe { read, write } => Some((
+                    read.as_raw_handle() as *mut std::ffi::c_void,
+                    write.as_raw_handle() as *mut std::ffi::c_void,
+                )),
+                _ => None,
+            }
+        }
+
+        /// Duplicate handle as inheritable for child-specific handle list.
+        ///
+        /// # Safety
+        /// handle must be valid in current process.
+        pub fn duplicate_inheritable(handle: &OwnedHandle) -> std::io::Result<OwnedHandle> {
+            use winapi::um::handleapi::DuplicateHandle;
+            use winapi::um::processthreadsapi::GetCurrentProcess;
+            let mut dup: winapi::um::winnt::HANDLE = std::ptr::null_mut();
+            let ok = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    handle.as_raw_handle() as *mut winapi::ctypes::c_void,
+                    GetCurrentProcess(),
+                    &mut dup,
+                    0,
+                    1, // TRUE inheritable
+                    winapi::um::winnt::DUPLICATE_SAME_ACCESS,
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(unsafe { OwnedHandle::from_raw_handle(dup as *mut std::ffi::c_void) })
+        }
+
         pub fn send(&self, buf: &[u8]) -> std::io::Result<()> {
             match &self.inner {
                 Inner::Pipe { write, .. } => write_all(write, buf),
