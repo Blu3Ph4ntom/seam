@@ -87,7 +87,11 @@ impl FabricState {
         // Actual abort logic will be triggered by runtime.
     }
 
-    pub fn register_authority(&mut self, key: AuthorityKey, owner: PeerId) -> Result<(), FabricError> {
+    pub fn register_authority(
+        &mut self,
+        key: AuthorityKey,
+        owner: PeerId,
+    ) -> Result<(), FabricError> {
         // owner must be Active
         match self.peers.get(&owner) {
             Some(PeerState::Active) => {}
@@ -128,14 +132,16 @@ impl FabricState {
         let attachments = keys
             .iter()
             .enumerate()
-            .map(|(idx, (_, oid, kind, native_required))| crate::transfer::AttachmentState {
-                index: idx as u16,
-                object_id: oid.0,
-                object_kind: *kind,
-                fabric_escrowed: false,
-                native_staged: false,
-                native_required: *native_required,
-            })
+            .map(
+                |(idx, (_, oid, kind, native_required))| crate::transfer::AttachmentState {
+                    index: idx as u16,
+                    object_id: oid.0,
+                    object_kind: *kind,
+                    fabric_escrowed: false,
+                    native_staged: false,
+                    native_required: *native_required,
+                },
+            )
             .collect::<Vec<_>>();
         let bundle = Bundle {
             tid,
@@ -158,9 +164,7 @@ impl FabricState {
                 object_kind: *kind,
                 native_required: *native_required,
             };
-            let act = self
-                .materializer
-                .authorize_metadata(tid, idx as u16, meta);
+            let act = self.materializer.authorize_metadata(tid, idx as u16, meta);
             if let MaterialAction::Reject(_) = act {
                 // rollback
                 let _ = self.transfers.abort(&tid);
@@ -213,8 +217,8 @@ impl FabricState {
         // Validate recipient
         self.transfers.stage_native(&tid, idx)?;
         let act = self.materializer.stage_native(tid, idx, true); // native_required true for now; should be from metadata
-        // For native_required false, this would be not required, but we assume true for NativeFile
-        // If materializer says CloseNative, we should close
+                                                                  // For native_required false, this would be not required, but we assume true for NativeFile
+                                                                  // If materializer says CloseNative, we should close
         Ok(act)
     }
 
@@ -255,7 +259,10 @@ impl FabricState {
         // Mark transfer as aborting, but keep ledger Escrow until restore
         // For now, we just mark materializer aborted and transfer aborted, but keep ledger Escrow
         // Instead, we will use abort_needs_restore to track need for physical restore
-        let bundle_state = self.transfers.status(&tid).ok_or(FabricError::UnknownTransfer)?;
+        let bundle_state = self
+            .transfers
+            .status(&tid)
+            .ok_or(FabricError::UnknownTransfer)?;
         if bundle_state == BundleState::Committed {
             return Err(FabricError::WrongPeer);
         }
@@ -286,5 +293,3 @@ impl FabricState {
         self.transfers.result_ack(tid)
     }
 }
-
-
