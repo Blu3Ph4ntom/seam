@@ -1,9 +1,11 @@
 //! seam-core — pure safe-Rust semantics for Seam V1.
 //! No OS APIs. No async runtime. Wire header is exactly 32 bytes LE.
 
+pub mod authority;
 pub mod fabric;
 pub mod ids;
 pub mod limits;
+pub mod materializer;
 pub mod transfer;
 pub mod wire;
 
