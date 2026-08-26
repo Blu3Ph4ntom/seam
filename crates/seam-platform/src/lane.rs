@@ -84,7 +84,7 @@ mod unix {
     use std::os::unix::net::UnixStream;
 
     pub fn send_fd(stream: &UnixStream, fd: OwnedFd) -> std::io::Result<()> {
-        use std::os::fd::BorrowedFd;
+        use std::os::fd::{AsRawFd, BorrowedFd};
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
         let mut cmsg_space = [0u8; rustix::cmsg_space!(ScmRights(1))];
         let mut cmsg = SendAncillaryBuffer::new(&mut cmsg_space);
