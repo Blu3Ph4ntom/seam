@@ -11,4 +11,4 @@ resolver = "2"
 
 [workspace.dependencies]
 getrandom = "0.3"
-rustix = { version = "0.38", features = ["fs", "net", "mm"] }
+rustix = { version = "0.38", features = ["fs", "net", "mm", "process"] }
