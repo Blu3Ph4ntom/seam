@@ -17,7 +17,10 @@ pub mod unix_lane {
             Ok((Self { inner: a }, Self { inner: b }))
         }
 
-        /// SAFETY: fd must be an owned UnixStream fd, valid and not used elsewhere.
+        /// Create lane from raw fd.
+        ///
+        /// # Safety
+        /// fd must be an owned UnixStream fd, valid and not used elsewhere; caller transfers ownership exactly once.
         pub unsafe fn from_raw_fd(fd: std::os::unix::io::RawFd) -> Self {
             // SAFETY: caller guarantees fd is a valid owned UnixStream fd.
             Self {
