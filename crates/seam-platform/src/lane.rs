@@ -66,55 +66,110 @@ pub mod unix_lane {
 
 #[cfg(windows)]
 pub mod windows_lane {
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use winapi::shared::minwindef::{DWORD, FALSE};
+    use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
+    use winapi::um::namedpipeapi::CreatePipe;
 
     pub struct NativeLane {
-        stream: TcpStream,
+        read: OwnedHandle,
+        write: OwnedHandle,
+    }
+
+    fn create_pipe() -> std::io::Result<(OwnedHandle, OwnedHandle)> {
+        let mut read: winapi::um::winnt::HANDLE = std::ptr::null_mut();
+        let mut write: winapi::um::winnt::HANDLE = std::ptr::null_mut();
+        let mut sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as DWORD,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: FALSE,
+        };
+        let ok = unsafe { CreatePipe(&mut read, &mut write, &mut sa, 0) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: CreatePipe returns valid owned handles on success.
+        let r = unsafe { OwnedHandle::from_raw_handle(read as *mut std::ffi::c_void) };
+        let w = unsafe { OwnedHandle::from_raw_handle(write as *mut std::ffi::c_void) };
+        Ok((r, w))
+    }
+
+    fn write_all(handle: &OwnedHandle, mut buf: &[u8]) -> std::io::Result<()> {
+        use winapi::um::fileapi::WriteFile;
+        while !buf.is_empty() {
+            let mut n: DWORD = 0;
+            let ok = unsafe {
+                WriteFile(
+                    handle.as_raw_handle() as *mut _,
+                    buf.as_ptr() as *const _,
+                    buf.len() as DWORD,
+                    &mut n,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            buf = &buf[n as usize..];
+        }
+        Ok(())
+    }
+
+    fn read_once(handle: &OwnedHandle, buf: &mut [u8]) -> std::io::Result<usize> {
+        use winapi::um::fileapi::ReadFile;
+        let mut n: DWORD = 0;
+        let ok = unsafe {
+            ReadFile(
+                handle.as_raw_handle() as *mut _,
+                buf.as_mut_ptr() as *mut _,
+                buf.len() as DWORD,
+                &mut n,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let e = std::io::Error::last_os_error();
+            // Broken pipe == EOF on anonymous pipe when writer closed
+            if e.raw_os_error() == Some(109) || e.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(0);
+            }
+            return Err(e);
+        }
+        Ok(n as usize)
     }
 
     impl NativeLane {
-        /// Private lane pair over loopback (ephemeral port, no global service).
-        /// Production will use anonymous pipe + DuplicateHandle with explicit
-        /// inheritance; loopback satisfies private lane semantics for CI
-        /// while keeping RAII OwnedHandle/socket ownership and death via EOF.
+        /// Duplex private lane via two anonymous pipes (no global name, no TCP).
+        /// Each lane owns one read and one write handle; opposite ends are cross-wired.
+        /// Handles are non-inheritable by default; child spawn will use explicit
+        /// STARTUPINFOEX + PROC_THREAD_ATTRIBUTE_HANDLE_LIST (see CTO lock §2).
         pub fn pair() -> std::io::Result<(Self, Self)> {
-            let listener = TcpListener::bind("127.0.0.1:0")?;
-            let addr = listener.local_addr()?;
-            // Accept in background thread to avoid deadlock.
-            let handle = std::thread::spawn(move || listener.accept());
-            let client = TcpStream::connect(addr)?;
-            client.set_nodelay(true).ok();
-            let (server, _) = handle
-                .join()
-                .map_err(|_| std::io::Error::other("accept thread panicked"))??;
-            server.set_nodelay(true).ok();
-            Ok((Self { stream: client }, Self { stream: server }))
-        }
-
-        /// For Command-spawned child: connect to ephemeral port given as arg.
-        pub fn connect(addr: &str) -> std::io::Result<Self> {
-            let s = TcpStream::connect(addr)?;
-            s.set_nodelay(true).ok();
-            Ok(Self { stream: s })
-        }
-
-        pub fn listen_once() -> std::io::Result<(TcpListener, std::net::SocketAddr)> {
-            let l = TcpListener::bind("127.0.0.1:0")?;
-            let a = l.local_addr()?;
-            Ok((l, a))
+            let (r1, w1) = create_pipe()?;
+            let (r2, w2) = create_pipe()?;
+            // lane_a: writes w1, reads r2 ; lane_b: writes w2, reads r1
+            Ok((
+                Self {
+                    read: r2,
+                    write: w1,
+                },
+                Self {
+                    read: r1,
+                    write: w2,
+                },
+            ))
         }
 
         pub fn send(&self, buf: &[u8]) -> std::io::Result<()> {
-            (&self.stream).write_all(buf)
+            write_all(&self.write, buf)
         }
 
         pub fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-            (&self.stream).read(buf)
+            read_once(&self.read, buf)
         }
 
-        // Handle duplication helpers (Windows native resource movement)
-        // Real DuplicateHandle impl deferred to keep CI green; see native/windows.rs for proven pattern.
+        // Real child spawn with explicit handle list will be implemented via
+        // CreateProcessW + STARTUPINFOEXW + UpdateProcThreadAttribute in seam-process.
+        // For now lane_probe Windows helper remains via separate binary + pipe inheritance test harness.
     }
 }
 
