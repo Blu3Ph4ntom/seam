@@ -16,6 +16,20 @@ pub enum Kind {
     Request = 3,
     Reply = 4,
     OneWay = 5,
+    // Transfer-protocol control messages (all on CONTROL lane unless noted)
+    Register = 11,
+    Offer = 12,
+    Accept = 13,
+    NativeEscrow = 14, // on NATIVE lane, carries SCM_RIGHTS
+    EscrowAcquired = 15,
+    NativeDeliver = 16, // on NATIVE lane, carries SCM_RIGHTS
+    NativeStaged = 17,
+    Commit = 18,
+    Abort = 19,
+    Restore = 20, // on NATIVE lane, carries SCM_RIGHTS back to sender
+    RestoreAck = 21,
+    Status = 22,
+    ResultAck = 23,
 }
 
 impl TryFrom<u8> for Kind {
@@ -27,6 +41,19 @@ impl TryFrom<u8> for Kind {
             3 => Ok(Kind::Request),
             4 => Ok(Kind::Reply),
             5 => Ok(Kind::OneWay),
+            11 => Ok(Kind::Register),
+            12 => Ok(Kind::Offer),
+            13 => Ok(Kind::Accept),
+            14 => Ok(Kind::NativeEscrow),
+            15 => Ok(Kind::EscrowAcquired),
+            16 => Ok(Kind::NativeDeliver),
+            17 => Ok(Kind::NativeStaged),
+            18 => Ok(Kind::Commit),
+            19 => Ok(Kind::Abort),
+            20 => Ok(Kind::Restore),
+            21 => Ok(Kind::RestoreAck),
+            22 => Ok(Kind::Status),
+            23 => Ok(Kind::ResultAck),
             _ => Err(WireError::UnknownKind(v)),
         }
     }

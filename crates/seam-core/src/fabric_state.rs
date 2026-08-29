@@ -1,13 +1,33 @@
 //! FabricState — deterministic composition of AuthorityLedger, TransferTable, Materializer.
 //! Pure safe Rust, no OS handles, no threads.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::authority::{AuthorityKey, AuthorityLedger, LedgerError};
 use crate::ids::{PeerId, TransferId};
 use crate::limits::Limits;
 use crate::materializer::{Action as MaterialAction, Materializer, Metadata};
-use crate::transfer::{Bundle, BundleState, TransferError, TransferTable};
+use crate::transfer::{Bundle, BundleState, TransferError, TransferStatus, TransferTable};
+
+/// A retained terminal result, bounded by limits.max_retained_results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedResult {
+    pub tid: TransferId,
+    pub state: BundleState,
+    pub sender: PeerId,
+    pub recipient: PeerId,
+}
+
+/// Action the runtime must take when a peer dies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeathAction {
+    /// Recipient died pre-commit: restore physical escrow to live sender.
+    RestoreToSender { tid: TransferId, sender: PeerId },
+    /// Sender died during Restoring: close physical escrow, authority Abandoned.
+    AbortDeadSender { tid: TransferId },
+    /// Post-commit death: never restore, recipient remains holder.
+    LeaveCommitted { tid: TransferId },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerState {
@@ -47,6 +67,10 @@ pub struct FabricState {
     materializer: Materializer,
     // For abort restore tracking: which tids are awaiting physical restore before logical Held restore
     abort_needs_restore: HashSet<TransferId>,
+    // Retained terminal results (bounded)
+    retained: VecDeque<RetainedResult>,
+    by_sender: HashMap<PeerId, Vec<TransferId>>,
+    by_recipient: HashMap<PeerId, Vec<TransferId>>,
 }
 
 impl FabricState {
@@ -59,6 +83,9 @@ impl FabricState {
             transfers: TransferTable::new(lim2),
             materializer: Materializer::new(),
             abort_needs_restore: HashSet::new(),
+            retained: VecDeque::new(),
+            by_sender: HashMap::new(),
+            by_recipient: HashMap::new(),
         }
     }
 
@@ -78,13 +105,60 @@ impl FabricState {
         self.peers.insert(*pid, PeerState::Gone);
     }
 
-    pub fn peer_gone(&mut self, pid: PeerId) {
+    pub fn peer_gone(&mut self, pid: PeerId) -> Vec<DeathAction> {
+        // Exactly-once: if already Gone, no second effects.
+        if self.peers.get(&pid) == Some(&PeerState::Gone) {
+            return Vec::new();
+        }
         self.peers.insert(pid, PeerState::Gone);
-        // For each transfer where this peer is recipient pre-commit, mark abort needs restore
-        // Simple: if transfer is Offered/Accepted and recipient == pid, then abort will need restore (if fabric escrow exists)
-        // We don't have direct access to physical escrow, but we can mark abort.
-        // For now, just mark transfers for this peer as needing abort.
-        // Actual abort logic will be triggered by runtime.
+        let mut actions = Vec::new();
+        // Snapshot active transfers (bundles map)
+        let active: Vec<(TransferId, PeerId, PeerId, BundleState)> = self
+            .transfers
+            .iter()
+            .map(|(t, b)| (*t, b.sender, b.recipient, b.state))
+            .collect();
+        for (tid, sender, recipient, state) in active {
+            let sender_alive = self.peers.get(&sender) == Some(&PeerState::Active);
+            if recipient == pid {
+                match state {
+                    BundleState::Offered | BundleState::Accepted => {
+                        if sender_alive {
+                            self.mark_restoring_internal(tid);
+                            actions.push(DeathAction::RestoreToSender { tid, sender });
+                        } else {
+                            self.mark_restoring_internal(tid);
+                            actions.push(DeathAction::AbortDeadSender { tid });
+                        }
+                    }
+                    BundleState::Restoring => {
+                        actions.push(DeathAction::AbortDeadSender { tid });
+                    }
+                    BundleState::Committed => {
+                        actions.push(DeathAction::LeaveCommitted { tid });
+                    }
+                    _ => {}
+                }
+            } else if sender == pid {
+                match state {
+                    BundleState::Restoring => {
+                        actions.push(DeathAction::AbortDeadSender { tid });
+                    }
+                    BundleState::Committed => {
+                        actions.push(DeathAction::LeaveCommitted { tid });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        actions
+    }
+
+    fn mark_restoring_internal(&mut self, tid: TransferId) {
+        if self.transfers.mark_restoring(&tid).is_ok() {
+            self.abort_needs_restore.insert(tid);
+            self.materializer.mark_aborted(tid);
+        }
     }
 
     pub fn register_authority(
@@ -246,12 +320,18 @@ impl FabricState {
             }
         }
         let recipient = recipient_opt.ok_or(FabricError::UnknownTransfer)?;
+        let sender = self
+            .transfers
+            .sender_of(&tid)
+            .ok_or(FabricError::UnknownTransfer)?;
         // Atomic commit under one lock (we are already holding FabricState mut)
         // First, commit ledger
         self.authority.commit_bundle(tid, recipient)?;
         // Then transfer
         self.transfers.commit(&tid)?;
         self.materializer.mark_committed(tid);
+        // Retain terminal result
+        self.push_retained(tid, BundleState::Committed, sender, recipient);
         Ok(())
     }
 
@@ -277,18 +357,106 @@ impl FabricState {
         if !self.abort_needs_restore.contains(&tid) {
             return Err(FabricError::UnknownTransfer);
         }
+        let sender = self
+            .transfers
+            .sender_of(&tid)
+            .ok_or(FabricError::UnknownTransfer)?;
+        let recipient = self
+            .transfers
+            .recipient_of(&tid)
+            .ok_or(FabricError::UnknownTransfer)?;
         self.authority.abort_bundle(tid)?;
         self.transfers.abort(&tid)?;
         self.abort_needs_restore.remove(&tid);
+        self.push_retained(tid, BundleState::Aborted, sender, recipient);
         Ok(())
     }
 
-    pub fn status(&self, tid: &TransferId) -> Option<BundleState> {
-        self.transfers.status(tid)
+    /// Finalize an abort whose sender is dead (no physical restore possible).
+    pub fn finish_abort_dead(&mut self, tid: TransferId) -> Result<(), FabricError> {
+        if !self.abort_needs_restore.contains(&tid) {
+            return Err(FabricError::UnknownTransfer);
+        }
+        let sender = self
+            .transfers
+            .sender_of(&tid)
+            .ok_or(FabricError::UnknownTransfer)?;
+        let recipient = self
+            .transfers
+            .recipient_of(&tid)
+            .ok_or(FabricError::UnknownTransfer)?;
+        self.authority.abort_bundle_dead(tid)?;
+        self.transfers.abort(&tid)?;
+        self.abort_needs_restore.remove(&tid);
+        self.push_retained(tid, BundleState::Aborted, sender, recipient);
+        Ok(())
     }
 
+    fn push_retained(
+        &mut self,
+        tid: TransferId,
+        state: BundleState,
+        sender: PeerId,
+        recipient: PeerId,
+    ) {
+        if self.retained.len() >= self.limits.max_retained_results {
+            if let Some(front) = self.retained.pop_front() {
+                Self::remove_index(&mut self.by_sender, front.sender, tid);
+                Self::remove_index(&mut self.by_recipient, front.recipient, tid);
+            }
+        }
+        self.retained.push_back(RetainedResult {
+            tid,
+            state,
+            sender,
+            recipient,
+        });
+        self.by_sender.entry(sender).or_default().push(tid);
+        self.by_recipient.entry(recipient).or_default().push(tid);
+    }
+
+    fn remove_index(map: &mut HashMap<PeerId, Vec<TransferId>>, peer: PeerId, tid: TransferId) {
+        if let Some(v) = map.get_mut(&peer) {
+            v.retain(|t| *t != tid);
+        }
+    }
+
+    /// External status of a transfer (terminal retained or active).
+    pub fn status(&self, tid: &TransferId) -> TransferStatus {
+        if let Some(active) = self.transfers.active_status(tid) {
+            return active.to_status();
+        }
+        if let Some(r) = self.retained.iter().find(|r| &r.tid == tid) {
+            return r.state.to_status();
+        }
+        TransferStatus::Unknown
+    }
+
+    pub fn by_sender(&self, peer: &PeerId) -> &[TransferId] {
+        self.by_sender
+            .get(peer)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn by_recipient(&self, peer: &PeerId) -> &[TransferId] {
+        self.by_recipient
+            .get(peer)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Acknowledgement of a retained terminal result; removes exactly once.
     pub fn result_ack(&mut self, tid: &TransferId) -> bool {
-        self.transfers.result_ack(tid)
+        let entry = self.retained.iter().find(|r| &r.tid == tid).copied();
+        if let Some(r) = entry {
+            self.retained.retain(|x| &x.tid != tid);
+            Self::remove_index(&mut self.by_sender, r.sender, *tid);
+            Self::remove_index(&mut self.by_recipient, r.recipient, *tid);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -438,5 +606,244 @@ mod tests {
         s.mark_recipient_staged(b, tid(1), 0).unwrap();
         s.commit_if_ready(tid(1)).unwrap();
         assert!(s.decide_abort(tid(1)).is_err());
+    }
+
+    // --- Restoring-phase coverage (CTO §5) ---
+
+    #[test]
+    fn restoring_cannot_commit() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.register_authority(key_res(1), a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(key_res(1), res(1), 2, true)])
+            .unwrap();
+        s.accept_bundle(b, tid(1)).unwrap();
+        s.mark_fabric_escrowed(a, tid(1), 0).unwrap();
+        s.mark_recipient_staged(b, tid(1), 0).unwrap();
+        s.decide_abort(tid(1)).unwrap();
+        // commit must be impossible while Restoring
+        assert!(s.commit_if_ready(tid(1)).is_err());
+        assert_eq!(s.transfers.status(&tid(1)), Some(BundleState::Restoring));
+    }
+
+    #[test]
+    fn restoring_cannot_accept_again() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.register_authority(key_res(1), a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(key_res(1), res(1), 2, true)])
+            .unwrap();
+        s.decide_abort(tid(1)).unwrap();
+        // A second ACCEPT during Restoring must be rejected
+        assert!(s.accept_bundle(b, tid(1)).is_err());
+    }
+
+    #[test]
+    fn duplicate_decide_abort_rejected() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.register_authority(key_res(1), a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(key_res(1), res(1), 2, true)])
+            .unwrap();
+        s.decide_abort(tid(1)).unwrap();
+        assert!(s.decide_abort(tid(1)).is_err());
+    }
+
+    #[test]
+    fn finish_before_restoring_rejected() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.register_authority(key_res(1), a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(key_res(1), res(1), 2, true)])
+            .unwrap();
+        // not yet decided: finish rejected
+        assert!(s.finish_abort_restore(tid(1)).is_err());
+    }
+
+    #[test]
+    fn restore_ack_wrong_transfer_rejected() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.register_authority(key_res(1), a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(key_res(1), res(1), 2, true)])
+            .unwrap();
+        // unknown tid
+        assert!(s.finish_abort_restore(tid(9)).is_err());
+    }
+
+    #[test]
+    fn restore_ack_after_commit_rejected() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.register_authority(key_res(1), a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(key_res(1), res(1), 2, true)])
+            .unwrap();
+        s.accept_bundle(b, tid(1)).unwrap();
+        s.mark_fabric_escrowed(a, tid(1), 0).unwrap();
+        s.mark_recipient_staged(b, tid(1), 0).unwrap();
+        s.commit_if_ready(tid(1)).unwrap();
+        assert!(s.finish_abort_restore(tid(1)).is_err());
+    }
+
+    #[test]
+    fn sender_gone_while_restoring_not_held_dead() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        s.accept_bundle(b, tid(1)).unwrap();
+        s.mark_fabric_escrowed(a, tid(1), 0).unwrap();
+        s.mark_recipient_staged(b, tid(1), 0).unwrap();
+        s.decide_abort(tid(1)).unwrap();
+        // sender dies during Restoring
+        let actions = s.peer_gone(a);
+        assert_eq!(actions, vec![DeathAction::AbortDeadSender { tid: tid(1) }]);
+        s.finish_abort_dead(tid(1)).unwrap();
+        // authority must NOT be Held(dead sender)
+        assert!(matches!(
+            s.authority.lookup(&k),
+            Some(crate::authority::AuthorityState::Abandoned)
+        ));
+        assert_ne!(
+            s.authority.lookup(&k),
+            Some(crate::authority::AuthorityState::Held(a))
+        );
+        assert_eq!(s.status(&tid(1)), TransferStatus::Aborted);
+    }
+
+    #[test]
+    fn status_restoring_not_aborted() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.register_authority(key_res(1), a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(key_res(1), res(1), 2, true)])
+            .unwrap();
+        s.decide_abort(tid(1)).unwrap();
+        assert_eq!(s.status(&tid(1)), TransferStatus::Restoring);
+        assert_ne!(s.status(&tid(1)), TransferStatus::Aborted);
+    }
+
+    #[test]
+    fn result_ack_cannot_retire_restoring() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.register_authority(key_res(1), a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(key_res(1), res(1), 2, true)])
+            .unwrap();
+        s.decide_abort(tid(1)).unwrap();
+        // Restoring transfer is not yet a retained terminal result
+        assert!(!s.result_ack(&tid(1)));
+    }
+
+    // --- Retained STATUS / RESULT_ACK (CTO §13) ---
+
+    #[test]
+    fn commit_status_and_ack() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.register_authority(key_res(1), a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(key_res(1), res(1), 2, true)])
+            .unwrap();
+        s.accept_bundle(b, tid(1)).unwrap();
+        s.mark_fabric_escrowed(a, tid(1), 0).unwrap();
+        s.mark_recipient_staged(b, tid(1), 0).unwrap();
+        s.commit_if_ready(tid(1)).unwrap();
+        assert_eq!(s.status(&tid(1)), TransferStatus::Committed);
+        assert!(s.result_ack(&tid(1)));
+        assert_eq!(s.status(&tid(1)), TransferStatus::Unknown);
+        assert!(!s.result_ack(&tid(1)));
+    }
+
+    #[test]
+    fn abort_status_and_ack() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.register_authority(key_res(1), a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(key_res(1), res(1), 2, true)])
+            .unwrap();
+        s.decide_abort(tid(1)).unwrap();
+        s.finish_abort_restore(tid(1)).unwrap();
+        assert_eq!(s.status(&tid(1)), TransferStatus::Aborted);
+        assert!(s.result_ack(&tid(1)));
+        assert_eq!(s.status(&tid(1)), TransferStatus::Unknown);
+    }
+
+    #[test]
+    fn peer_gone_exactly_once() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.register_authority(key_res(1), a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(key_res(1), res(1), 2, true)])
+            .unwrap();
+        let first = s.peer_gone(b);
+        assert!(!first.is_empty());
+        let second = s.peer_gone(b);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn retention_bound_does_not_leak() {
+        let lim = Limits {
+            max_retained_results: 4,
+            ..Limits::default()
+        };
+        let bound = lim.max_retained_results;
+        let mut s = FabricState::new(lim);
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        for i in 1u8..=8 {
+            let k = key_res(i);
+            s.register_authority(k, a).unwrap();
+            s.offer_bundle(a, b, tid(i), vec![(k, res(i), 2, true)])
+                .unwrap();
+            s.accept_bundle(b, tid(i)).unwrap();
+            s.mark_fabric_escrowed(a, tid(i), 0).unwrap();
+            s.mark_recipient_staged(b, tid(i), 0).unwrap();
+            s.commit_if_ready(tid(i)).unwrap();
+            let _ = s.result_ack(&tid(i)); // ack immediately to simulate retention churn
+        }
+        // by_sender should only ever hold at most max_retained_results entries
+        assert!(s.by_sender(&a).len() <= bound);
+        assert!(s.by_recipient(&b).len() <= bound);
     }
 }

@@ -8,3 +8,6 @@ target/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# local cross-compile build dir (WSL)
+.wsl-target/

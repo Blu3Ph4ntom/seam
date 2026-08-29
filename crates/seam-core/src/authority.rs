@@ -23,6 +23,9 @@ pub enum AuthorityState {
         recipient: PeerId,
     },
     Released,
+    /// Authority abandoned because the only possible holder (sender) died during
+    /// Restoring and physical restoration is impossible. No live holder remains.
+    Abandoned,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -161,6 +164,25 @@ impl AuthorityLedger {
         Ok(to_abort)
     }
 
+    /// Abort a bundle whose sender is dead: authority goes Abandoned (no Held(dead)).
+    pub fn abort_bundle_dead(&mut self, tid: TransferId) -> Result<Vec<AuthorityKey>, LedgerError> {
+        let mut to_abort = Vec::new();
+        for (k, state) in self.map.iter() {
+            if let AuthorityState::Escrow { transfer_id, .. } = state {
+                if *transfer_id == tid {
+                    to_abort.push(*k);
+                }
+            }
+        }
+        if to_abort.is_empty() {
+            return Err(LedgerError::NotFound);
+        }
+        for k in &to_abort {
+            self.map.insert(*k, AuthorityState::Abandoned);
+        }
+        Ok(to_abort)
+    }
+
     pub fn release(&mut self, key: AuthorityKey) -> Result<(), LedgerError> {
         match self.map.get(&key) {
             Some(_) => {
@@ -177,7 +199,8 @@ impl AuthorityLedger {
             match state {
                 AuthorityState::Held(_)
                 | AuthorityState::Escrow { .. }
-                | AuthorityState::Released => {}
+                | AuthorityState::Released
+                | AuthorityState::Abandoned => {}
             }
         }
         true

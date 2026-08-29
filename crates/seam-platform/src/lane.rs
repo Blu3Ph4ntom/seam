@@ -5,6 +5,9 @@ pub mod unix_lane {
     use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
 
+    use seam_core::limits::Limits;
+    use seam_core::wire::Header;
+
     pub struct NativeLane {
         inner: UnixStream,
     }
@@ -48,6 +51,29 @@ pub mod unix_lane {
             (&self.inner).read(buf)
         }
 
+        /// Exact-bounded send of a whole frame buffer (write_all loop).
+        pub fn send_all(&self, buf: &[u8]) -> std::io::Result<()> {
+            use std::io::Write;
+            (&self.inner).write_all(buf)
+        }
+
+        /// Exact-bounded receive: blocks until `buf.len()` bytes read or EOF.
+        pub fn recv_exact(&self, buf: &mut [u8]) -> std::io::Result<()> {
+            use std::io::Read;
+            let mut off = 0;
+            while off < buf.len() {
+                let n = (&self.inner).read(&mut buf[off..])?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "lane eof",
+                    ));
+                }
+                off += n;
+            }
+            Ok(())
+        }
+
         pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
             self.inner.as_raw_fd()
         }
@@ -60,6 +86,76 @@ pub mod unix_lane {
         /// Receive a single fd via SCM_RIGHTS.
         pub fn recv_fd(&self) -> std::io::Result<OwnedFd> {
             super::unix::recv_fd(&self.inner)
+        }
+
+        /// Send a control frame (no ancillary data).
+        pub fn send_frame(&self, h: &Header, body: &[u8]) -> std::io::Result<()> {
+            let mut buf = [0u8; 32];
+            h.encode(&mut buf);
+            self.send_all(&buf)?;
+            if !body.is_empty() {
+                self.send_all(body)?;
+            }
+            Ok(())
+        }
+
+        /// Receive a control frame (no ancillary data).
+        pub fn recv_frame(&self, limits: &Limits) -> std::io::Result<(Header, Vec<u8>)> {
+            let mut hdr = [0u8; 32];
+            self.recv_exact(&mut hdr)?;
+            let h = Header::decode(&hdr, limits)
+                .map_err(|e| std::io::Error::other(format!("bad header: {e:?}")))?;
+            let mut body = vec![0u8; h.body_len as usize];
+            if h.body_len > 0 {
+                self.recv_exact(&mut body)?;
+            }
+            Ok((h, body))
+        }
+
+        /// Send a native frame carrying exactly one fd via SCM_RIGHTS.
+        pub fn send_frame_fd(&self, h: &Header, body: &[u8], fd: OwnedFd) -> std::io::Result<()> {
+            use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+            use std::io::IoSlice;
+            use std::os::fd::AsFd;
+            let mut buf = [0u8; 32];
+            h.encode(&mut buf);
+            let fds = [fd.as_fd()];
+            let mut space = [0u8; rustix::cmsg_space!(ScmRights(1))];
+            let mut cmsg = SendAncillaryBuffer::new(&mut space);
+            cmsg.push(SendAncillaryMessage::ScmRights(&fds));
+            let iov = [IoSlice::new(&buf), IoSlice::new(body)];
+            rustix::net::sendmsg(&self.inner, &iov, &mut cmsg, SendFlags::empty())
+                .map(|_| ())
+                .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+            drop(fd);
+            Ok(())
+        }
+
+        /// Receive a native frame carrying exactly one fd via SCM_RIGHTS.
+        pub fn recv_frame_fd(
+            &self,
+            limits: &Limits,
+        ) -> std::io::Result<(Header, Vec<u8>, OwnedFd)> {
+            use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+            use std::io::IoSliceMut;
+            let mut hdr = [0u8; 32];
+            self.recv_exact(&mut hdr)?;
+            let h = Header::decode(&hdr, limits)
+                .map_err(|e| std::io::Error::other(format!("bad header: {e:?}")))?;
+            let mut body = vec![0u8; h.body_len as usize];
+            let mut space = [0u8; rustix::cmsg_space!(ScmRights(1))];
+            let mut cmsg = RecvAncillaryBuffer::new(&mut space);
+            let mut iov = [IoSliceMut::new(&mut body)];
+            rustix::net::recvmsg(&self.inner, &mut iov, &mut cmsg, RecvFlags::empty())
+                .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+            for msg in cmsg.drain() {
+                if let RecvAncillaryMessage::ScmRights(mut fds) = msg {
+                    if let Some(fd) = fds.next() {
+                        return Ok((h, body, fd));
+                    }
+                }
+            }
+            Err(std::io::Error::other("native frame without fd"))
         }
     }
 }
@@ -238,6 +334,27 @@ pub mod windows_lane {
                     (&*s).write_all(buf)
                 }
             }
+        }
+
+        /// Exact-bounded send of a whole frame buffer.
+        pub fn send_all(&self, buf: &[u8]) -> std::io::Result<()> {
+            self.send(buf)
+        }
+
+        /// Exact-bounded receive: blocks until filled or EOF (read_once loop).
+        pub fn recv_exact(&self, buf: &mut [u8]) -> std::io::Result<()> {
+            let mut off = 0;
+            while off < buf.len() {
+                let n = self.recv(&mut buf[off..])?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "lane eof",
+                    ));
+                }
+                off += n;
+            }
+            Ok(())
         }
 
         pub fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {

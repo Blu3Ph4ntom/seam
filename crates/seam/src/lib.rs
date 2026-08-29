@@ -41,6 +41,9 @@ pub fn channel<T>(_fabric: &Fabric) -> (Client<T>, Receiver<T>) {
 pub mod native_file;
 pub use native_file::NativeFile;
 
+#[cfg(unix)]
+pub mod fabric_runtime;
+
 /// SharedRegion types (stub)
 pub struct SharedRegionMut;
 pub struct SharedRegionRead;

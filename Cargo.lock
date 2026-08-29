@@ -71,6 +71,8 @@ dependencies = [
 name = "seam"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "rustix",
  "seam-core",
  "seam-idl",
  "seam-platform",

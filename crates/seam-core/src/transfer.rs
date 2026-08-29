@@ -15,6 +15,27 @@ pub enum BundleState {
     Restoring,
 }
 
+/// External status of a transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferStatus {
+    Unknown,
+    Pending,
+    Restoring,
+    Committed,
+    Aborted,
+}
+
+impl BundleState {
+    pub fn to_status(self) -> TransferStatus {
+        match self {
+            BundleState::Offered | BundleState::Accepted => TransferStatus::Pending,
+            BundleState::Restoring => TransferStatus::Restoring,
+            BundleState::Committed => TransferStatus::Committed,
+            BundleState::Aborted => TransferStatus::Aborted,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AttachmentState {
     pub index: u16,
@@ -187,6 +208,24 @@ impl TransferTable {
                 .find(|(t, _)| t == tid)
                 .map(|(_, s)| *s)
         })
+    }
+
+    /// Active (non-terminal) status only; terminal results live in FabricState.retained.
+    pub fn active_status(&self, tid: &TransferId) -> Option<BundleState> {
+        self.bundles.get(tid).map(|b| b.state)
+    }
+
+    pub fn sender_of(&self, tid: &TransferId) -> Option<PeerId> {
+        self.bundles.get(tid).map(|b| b.sender)
+    }
+
+    pub fn recipient_of(&self, tid: &TransferId) -> Option<PeerId> {
+        self.bundles.get(tid).map(|b| b.recipient)
+    }
+
+    /// Iterate active (non-retained) bundles: (tid, &Bundle).
+    pub fn iter(&self) -> impl Iterator<Item = (&TransferId, &Bundle)> {
+        self.bundles.iter()
     }
 
     pub fn result_ack(&mut self, tid: &TransferId) -> bool {
