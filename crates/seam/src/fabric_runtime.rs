@@ -66,8 +66,8 @@ fn header(kind: Kind, body_len: u32) -> Header {
     }
 }
 
-fn envelope(tid: &TransferId, rid: &ResourceId) -> [u8; 35] {
-    let mut b = [0u8; 35];
+fn envelope(tid: &TransferId, rid: &ResourceId) -> [u8; 36] {
+    let mut b = [0u8; 36];
     b[0..16].copy_from_slice(&tid.0);
     b[16..18].copy_from_slice(&0u16.to_le_bytes()); // attachment index 0
     b[18] = 2; // ObjectKind::Native
@@ -197,7 +197,7 @@ impl FabricRuntime {
             .unwrap()
             .native
             .send_frame_fd(
-                &header(Kind::NativeDeliver, 35),
+                &header(Kind::NativeDeliver, 36),
                 &envelope(&tid, &rid),
                 send_fd,
             )
@@ -292,7 +292,7 @@ impl FabricRuntime {
                 .unwrap()
                 .native
                 .send_frame_fd(
-                    &header(Kind::Restore, 35),
+                    &header(Kind::Restore, 36),
                     &envelope(&tid, &rid),
                     restore_fd,
                 )
