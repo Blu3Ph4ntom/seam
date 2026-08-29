@@ -9,8 +9,6 @@ pub mod fabric_state;
 pub mod ids;
 pub mod limits;
 pub mod materializer;
-#[cfg(test)]
-mod nf_matrix_tests;
 pub mod pipe_table;
 pub mod transfer;
 pub mod wire;

@@ -846,4 +846,87 @@ mod tests {
         assert!(s.by_sender(&a).len() <= bound);
         assert!(s.by_recipient(&b).len() <= bound);
     }
+
+    #[test]
+    fn nf_01_reject_before_accept() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        s.decide_abort(tid(1)).unwrap();
+        assert_eq!(s.status(&tid(1)), TransferStatus::Restoring);
+        s.finish_abort_restore(tid(1)).unwrap();
+        assert_eq!(s.status(&tid(1)), TransferStatus::Aborted);
+    }
+
+    #[test]
+    fn nf_03_wrong_tid() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        assert!(s.finish_abort_restore(tid(9)).is_err());
+    }
+
+    #[test]
+    fn nf_07_duplicate_native() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        s.accept_bundle(b, tid(1)).unwrap();
+        s.mark_fabric_escrowed(a, tid(1), 0).unwrap();
+        // Duplicate escrow for same idx should be rejected or leave state unchanged
+        let second = s.mark_fabric_escrowed(a, tid(1), 0);
+        assert!(second.is_err() || s.transfers.status(&tid(1)) == Some(BundleState::Accepted));
+    }
+
+    #[test]
+    fn nf_08_late_after_commit() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        s.accept_bundle(b, tid(1)).unwrap();
+        s.mark_fabric_escrowed(a, tid(1), 0).unwrap();
+        s.mark_recipient_staged(b, tid(1), 0).unwrap();
+        s.commit_if_ready(tid(1)).unwrap();
+        assert!(s.mark_fabric_escrowed(a, tid(1), 0).is_err());
+    }
+
+    #[test]
+    fn nf_10_missing_fd() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        s.accept_bundle(b, tid(1)).unwrap();
+        assert!(s.commit_if_ready(tid(1)).is_err());
+        assert_eq!(s.status(&tid(1)), TransferStatus::Pending);
+    }
 }
