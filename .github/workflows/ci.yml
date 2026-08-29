@@ -32,5 +32,7 @@ jobs:
         run: cargo test -p seam-platform -- --nocapture
       - name: test seam-process (bootstrap)
         run: cargo test -p seam-process -- --nocapture
+      - name: test seam (fabric runtime e2e)
+        run: cargo test -p seam -- --nocapture
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
