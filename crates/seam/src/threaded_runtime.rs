@@ -11,7 +11,7 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
-use seam_core::fabric_state::{DeathAction, FabricState};
+use seam_core::fabric_state::FabricState;
 use seam_core::ids::PeerId;
 use seam_core::limits::Limits;
 use seam_platform::NativeLane;
@@ -19,6 +19,12 @@ use seam_platform::NativeLane;
 /// Death gate: Alive -> Gone exactly once.
 pub struct DeathGate {
     alive: AtomicBool,
+}
+
+impl Default for DeathGate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DeathGate {
@@ -74,11 +80,9 @@ impl ThreadedRuntime {
         }
         let death_gate = Arc::new(DeathGate::new());
         let state_clone = Arc::clone(&self.state);
-        let gate_clone = Arc::clone(&death_gate);
         let limits = self.limits.clone();
         // Control reader
         let control_handle = {
-            let peer = peer;
             let gate = Arc::clone(&death_gate);
             let state = Arc::clone(&state_clone);
             std::thread::spawn(move || {
@@ -113,7 +117,6 @@ impl ThreadedRuntime {
             })
         };
         let native_handle = {
-            let peer = peer;
             let gate = Arc::clone(&death_gate);
             let state = Arc::clone(&state_clone);
             let limits = self.limits.clone();
@@ -158,8 +161,6 @@ impl ThreadedRuntime {
                 native_handle: Some(native_handle),
             },
         );
-        // Keep gate clones for test access
-        drop(gate_clone);
         Ok(())
     }
 
