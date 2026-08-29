@@ -143,8 +143,9 @@ pub mod unix_lane {
             let mut space = [0u8; rustix::cmsg_space!(ScmRights(1))];
             let mut cmsg = RecvAncillaryBuffer::new(&mut space);
             let mut iov = [IoSliceMut::new(&mut buf)];
-            let n = rustix::net::recvmsg(&self.inner, &mut iov, &mut cmsg, RecvFlags::empty())
+            let ret = rustix::net::recvmsg(&self.inner, &mut iov, &mut cmsg, RecvFlags::empty())
                 .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+            let n = ret.bytes;
             if n < 32 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
