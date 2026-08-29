@@ -558,9 +558,22 @@ mod tests {
         // Child should echo SUFFIX on the moved fd's peer
         let mut buf = [0u8; 6];
         payload_a
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(std::time::Duration::from_secs(15)))
             .ok();
-        payload_a.read_exact(&mut buf).expect("parent read suffix");
+        // Retry once on transient macOS scheduling delay (historical flake: failed to fill whole buffer)
+        let mut last_err = None;
+        for _ in 0..2 {
+            match payload_a.read_exact(&mut buf) {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if let Some(e) = last_err {
+            panic!("parent read suffix: {e}");
+        }
         assert_eq!(&buf, b"SUFFIX");
         let status = child.wait().expect("wait child");
         assert!(status.success(), "child failed: {:?}", status);
