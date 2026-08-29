@@ -172,6 +172,9 @@ mod tests {
             buf.extend_from_slice(&stream[pos..pos + chunk]);
             pos += chunk;
             loop {
+                if buf.is_empty() {
+                    break;
+                }
                 match decode_next(&buf, 1024) {
                     Ok((rec, consumed)) => {
                         records.push(rec);

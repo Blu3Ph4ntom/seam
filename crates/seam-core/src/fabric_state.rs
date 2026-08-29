@@ -251,19 +251,13 @@ impl FabricState {
     }
 
     pub fn accept_bundle(&mut self, recipient: PeerId, tid: TransferId) -> Result<(), FabricError> {
-        let _bundle_state = self
+        let expected = self
             .transfers
-            .status(&tid)
+            .recipient_of(&tid)
             .ok_or(FabricError::UnknownTransfer)?;
-        // Need to get bundle to check recipient
-        // For now, just try accept and check peer
-        // We need to ensure recipient matches bundle's recipient
-        // TransferTable doesn't expose bundle recipient directly without status, so we need to store check
-        // For simplicity, we try to accept and if wrong peer, we will have to check ledger's escrow recipient
-        // We'll check via authority ledger's escrow state
-        // Find one key for tid to get expected recipient
-        // For simplicity, just call transfers.accept and if it succeeds, assume recipient is correct
-        // But we should validate recipient is Active
+        if expected != recipient {
+            return Err(FabricError::WrongPeer);
+        }
         if self.peers.get(&recipient) != Some(&PeerState::Active) {
             return Err(FabricError::PeerNotActive);
         }
