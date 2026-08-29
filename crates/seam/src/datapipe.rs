@@ -260,9 +260,12 @@ mod tests {
         let prod_hash = handler.join().unwrap();
         assert_eq!(received, 32768);
         assert_eq!(hasher.finish(), prod_hash);
-        // All credit returned after full application consumption.
-        let g = consumer.shared.credit.lock().unwrap();
-        assert_eq!(g.available(), 4096);
+        // Applicative consumption returns credit; await full settlement via
+        // condvar predicate (wake-driven, not a sleep).
+        let mut g = consumer.shared.credit.lock().unwrap();
+        while g.available() != 4096 {
+            g = consumer.shared.cond.wait(g).unwrap();
+        }
         assert_eq!(g.outstanding(), 0);
         assert!(g.invariant_holds());
     }
