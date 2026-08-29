@@ -147,6 +147,87 @@ fn threaded_native_file_wrong_envelope_rejected() {
 }
 
 #[test]
+fn threaded_wrong_index_rejected() {
+    // Hostile wrong AttachmentIndex (1 instead of 0) -> reject + close fd.
+    let a = PeerId([7; 16]);
+    let b = PeerId([8; 16]);
+    let rid = ResourceId([13; 16]);
+    let tid = TransferId([23; 16]);
+    let rt = ThreadedRuntime::new(Limits::default());
+    let bin = env!("CARGO_BIN_EXE_fabric_peer_probe");
+    let (c_a, n_a, child_a) = spawn_peer(
+        "holder",
+        Mode::WrongIndex,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&a.0),
+        bin,
+    )
+    .expect("spawn holder");
+    let (c_b, n_b, child_b) = spawn_peer(
+        "recipient",
+        Mode::Success,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&b.0),
+        bin,
+    )
+    .expect("spawn recipient");
+    rt.add_peer(a, c_a, n_a, child_a).unwrap();
+    rt.add_peer(b, c_b, n_b, child_b).unwrap();
+    let res = rt.run_native_file(a, b, tid, rid, Mode::Success);
+    assert!(res.is_err(), "wrong index must be rejected");
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("wrong transfer"),
+        "expected wrong transfer, got {err}"
+    );
+    wait_children(vec![]);
+    drop(rt);
+}
+
+#[test]
+fn threaded_duplicate_late_native_closed() {
+    // Holder sends a second (duplicate) NativeEscrow after ESCROW_ACQUIRED.
+    // Transfer still commits; the late fd must be closed, never leaked.
+    let a = PeerId([9; 16]);
+    let b = PeerId([10; 16]);
+    let rid = ResourceId([14; 16]);
+    let tid = TransferId([24; 16]);
+    let rt = ThreadedRuntime::new(Limits::default());
+    let bin = env!("CARGO_BIN_EXE_fabric_peer_probe");
+    let (c_a, n_a, child_a) = spawn_peer(
+        "holder",
+        Mode::Duplicate,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&a.0),
+        bin,
+    )
+    .expect("spawn holder");
+    let (c_b, n_b, child_b) = spawn_peer(
+        "recipient",
+        Mode::Success,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&b.0),
+        bin,
+    )
+    .expect("spawn recipient");
+    rt.add_peer(a, c_a, n_a, child_a).unwrap();
+    rt.add_peer(b, c_b, n_b, child_b).unwrap();
+    let d = rt
+        .run_native_file(a, b, tid, rid, Mode::Duplicate)
+        .expect("transfer with late duplicate native");
+    assert_eq!(d.escrow_count_after, 0, "escrow must settle to zero");
+    assert!(
+        d.ledger_after.contains("Committed"),
+        "ledger should be Committed, got {}",
+        d.ledger_after
+    );
+}
+
+#[test]
 fn threaded_death_gate_exactly_once_via_readers() {
     // Real reader-thread death: drop child-side lanes causing control+native
     // EOF on both reader threads; exactly one semantic peer_gone occurs.

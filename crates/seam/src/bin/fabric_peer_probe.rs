@@ -119,16 +119,45 @@ mod imp {
             env[18] = 2;
             env[19] = 1;
             env[20..36].copy_from_slice(&rid.0);
+            if mode == "wrong-index" {
+                env[16..18].copy_from_slice(&1u16.to_le_bytes());
+            }
             native
                 .send_frame_fd(&header(Kind::NativeEscrow, 36), &env, owned)
                 .unwrap();
             // ESCROW_ACQUIRED (not for wrong-envelope — Fabric will reject and close)
-            if mode == "wrong-envelope" {
+            if mode == "wrong-envelope" || mode == "wrong-index" {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 exit(0);
             }
             let (k, _) = control.recv_frame(&Limits::default()).unwrap();
             assert_eq!(k.kind, Kind::EscrowAcquired, "expected ESCROW_ACQUIRED");
+            if mode == "duplicate" {
+                // Send a second (duplicate) NativeEscrow with a fresh fd; Fabric
+                // must close the late descriptor without breaking the transfer.
+                let mut dup = std::env::temp_dir();
+                dup.push(format!(
+                    "seam-dup-{}-{}.tmp",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                let mut f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&dup)
+                    .unwrap();
+                f.write_all(b"DUP-").unwrap();
+                f.flush().unwrap();
+                let _ = std::fs::remove_file(&dup);
+                let dup_fd = unsafe { OwnedFd::from_raw_fd(f.into_raw_fd()) };
+                let _ = native.send_frame_fd(&header(Kind::NativeEscrow, 36), &env, dup_fd);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                exit(0);
+            }
             if mode == "success" {
                 exit(0);
             } else if mode == "abort" {

@@ -304,6 +304,21 @@ impl ThreadedRuntime {
         Ok(())
     }
 
+    /// Drain late/duplicate native events for a peer and close their fds.
+    /// Late natives after COMMIT/ABORT must never leak descriptors.
+    fn close_late_natives(&self, peer: &PeerId) {
+        let peers = self.peers.lock().unwrap();
+        if let Some(rt) = peers.get(peer) {
+            loop {
+                match rt.native_rx.try_recv() {
+                    Ok(DriverEvent::Native { fd: Some(fd), .. }) => drop(fd),
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
     pub fn death_gate_alive(&self, peer: &PeerId) -> bool {
         self.peers
             .lock()
@@ -346,7 +361,11 @@ impl ThreadedRuntime {
             drop(fd);
             return Err("wrong transfer envelope".into());
         }
-        if env.len() != 36 || env[0..16] != tid.0 || env[20..36] != rid.0 {
+        if env.len() != 36
+            || env[0..16] != tid.0
+            || env[20..36] != rid.0
+            || env[16..18] != 0u16.to_le_bytes()
+        {
             drop(fd);
             return Err("wrong transfer envelope".into());
         }
@@ -397,7 +416,7 @@ impl ThreadedRuntime {
             .mark_recipient_staged(recipient, tid, 0)
             .map_err(|e| format!("{e:?}"))?;
 
-        if mode == Mode::Success {
+        if mode == Mode::Success || mode == Mode::Duplicate {
             self.state
                 .lock()
                 .unwrap()
@@ -407,6 +426,10 @@ impl ThreadedRuntime {
             self.reap(&sender)?;
             self.reap(&recipient)?;
             self.escrow.lock().unwrap().remove(&(tid, 0));
+            // Late/duplicate natives (e.g. duplicate escrow after commit) are
+            // drained and their descriptors closed.
+            self.close_late_natives(&sender);
+            self.close_late_natives(&recipient);
         } else {
             // Pre-commit abort (Mode::Abort only; WrongEnvelope already returned)
             self.state
@@ -458,6 +481,8 @@ pub enum Mode {
     Success,
     Abort,
     WrongEnvelope,
+    WrongIndex,
+    Duplicate,
 }
 
 #[derive(Debug)]
@@ -504,6 +529,8 @@ pub fn spawn_peer(
         Mode::Success => "success",
         Mode::Abort => "abort",
         Mode::WrongEnvelope => "wrong-envelope",
+        Mode::WrongIndex => "wrong-index",
+        Mode::Duplicate => "duplicate",
     });
     cmd.arg("--transfer-id").arg(tid_hex);
     cmd.arg("--resource-id").arg(rid_hex);
