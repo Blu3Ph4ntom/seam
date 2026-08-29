@@ -34,6 +34,7 @@ struct PeerLanes {
     child: Child,
 }
 
+#[derive(Debug)]
 pub struct Diagnostics {
     pub fabric_pid: u32,
     pub sender_pid: u32,
