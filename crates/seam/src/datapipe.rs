@@ -95,7 +95,7 @@ impl DataPipe {
             Producer {
                 _pid: pid,
                 stream: p,
-                shared,
+                shared: Arc::clone(&shared),
             },
             Consumer {
                 _pid: pid,
