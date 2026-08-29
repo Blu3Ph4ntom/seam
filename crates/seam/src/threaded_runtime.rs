@@ -281,12 +281,8 @@ impl ThreadedRuntime {
     }
 
     fn send_control(&self, peer: &PeerId, kind: Kind, body: &[u8]) -> Result<(), String> {
-        let lane = self
-            .control_writers
-            .lock()
-            .unwrap()
-            .get(peer)
-            .ok_or("no control writer")?;
+        let writers = self.control_writers.lock().unwrap();
+        let lane = writers.get(peer).ok_or("no control writer")?;
         lane.send_frame(&header(kind, body.len() as u32), body)
             .map_err(|e| format!("send_control: {e}"))
     }
@@ -298,12 +294,8 @@ impl ThreadedRuntime {
         env: &[u8],
         fd: OwnedFd,
     ) -> Result<(), String> {
-        let lane = self
-            .native_writers
-            .lock()
-            .unwrap()
-            .get(peer)
-            .ok_or("no native writer")?;
+        let writers = self.native_writers.lock().unwrap();
+        let lane = writers.get(peer).ok_or("no native writer")?;
         lane.send_frame_fd(&header(kind, env.len() as u32), env, fd)
             .map_err(|e| format!("send_native: {e}"))
     }
@@ -311,7 +303,7 @@ impl ThreadedRuntime {
     fn reap(&self, peer: &PeerId) -> Result<(), String> {
         let mut peers = self.peers.lock().unwrap();
         if let Some(rt) = peers.get_mut(peer) {
-            if let Some(child) = rt.child.take() {
+            if let Some(mut child) = rt.child.take() {
                 let status = child.wait().map_err(|e| format!("wait {e}"))?;
                 if !status.success() {
                     return Err(format!("child exited {status:?}"));
