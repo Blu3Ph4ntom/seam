@@ -4,11 +4,11 @@
 pub mod authority;
 pub mod credit;
 pub mod fabric;
-pub mod pipe_table;
 pub mod fabric_state;
 pub mod ids;
 pub mod limits;
 pub mod materializer;
+pub mod pipe_table;
 pub mod transfer;
 pub mod wire;
 

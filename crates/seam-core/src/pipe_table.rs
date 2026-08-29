@@ -78,7 +78,16 @@ mod tests {
         let mut t = PipeTable::new(Limits::default());
         let id = pipe(1);
         t.create(id, 4096, pid(1), pid(2)).unwrap();
-        assert_eq!(t.get(&id), Some((4096, PipeState::Active { producer: pid(1), consumer: pid(2) })));
+        assert_eq!(
+            t.get(&id),
+            Some((
+                4096,
+                PipeState::Active {
+                    producer: pid(1),
+                    consumer: pid(2)
+                }
+            ))
+        );
     }
 
     #[test]
