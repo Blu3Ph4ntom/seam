@@ -256,23 +256,20 @@ impl FabricState {
     }
 
     pub fn decide_abort(&mut self, tid: TransferId) -> Result<(), FabricError> {
-        // Mark transfer as aborting, but keep ledger Escrow until restore
-        // For now, we just mark materializer aborted and transfer aborted, but keep ledger Escrow
-        // Instead, we will use abort_needs_restore to track need for physical restore
         let bundle_state = self
             .transfers
             .status(&tid)
             .ok_or(FabricError::UnknownTransfer)?;
-        if bundle_state == BundleState::Committed {
+        if bundle_state == BundleState::Committed || bundle_state == BundleState::Aborted {
+            return Err(FabricError::WrongPeer);
+        }
+        if bundle_state == BundleState::Restoring {
             return Err(FabricError::WrongPeer);
         }
         self.abort_needs_restore.insert(tid);
         self.materializer.mark_aborted(tid);
-        // Do not yet move ledger; keep Escrow
-        // Mark transfer as Aborted? But we need to keep it as aborting, not yet terminal
-        // For simplicity, we will abort transfer now but keep ledger Escrow, and require finish_abort_restore to move ledger
-        // TransferTable abort will remove bundle and retain Aborted
-        self.transfers.abort(&tid)?;
+        // Mark transfer as Restoring, not yet terminal Aborted
+        self.transfers.mark_restoring(&tid)?;
         Ok(())
     }
 
@@ -281,6 +278,7 @@ impl FabricState {
             return Err(FabricError::UnknownTransfer);
         }
         self.authority.abort_bundle(tid)?;
+        self.transfers.abort(&tid)?;
         self.abort_needs_restore.remove(&tid);
         Ok(())
     }
@@ -392,11 +390,14 @@ mod tests {
         s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
             .unwrap();
         s.decide_abort(tid(1)).unwrap();
-        // ledger should still be Escrow, not Held
+        // ledger should still be Escrow, not Held, and transfer Restoring
         assert!(matches!(
             s.authority.lookup(&k),
             Some(crate::authority::AuthorityState::Escrow { .. })
         ));
+        assert_eq!(s.transfers.status(&tid(1)), Some(BundleState::Restoring));
+        // STATUS should not yet be Aborted
+        assert_ne!(s.transfers.status(&tid(1)), Some(BundleState::Aborted));
         s.finish_abort_restore(tid(1)).unwrap();
         assert_eq!(
             s.authority.lookup(&k),

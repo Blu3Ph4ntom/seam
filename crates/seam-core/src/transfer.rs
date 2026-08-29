@@ -12,6 +12,7 @@ pub enum BundleState {
     Accepted,
     Committed,
     Aborted,
+    Restoring,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +150,21 @@ impl TransferTable {
         Ok(b)
     }
 
+    pub fn mark_restoring(&mut self, tid: &TransferId) -> Result<(), TransferError> {
+        let b = self
+            .bundles
+            .get_mut(tid)
+            .ok_or(TransferError::UnknownTransfer)?;
+        if b.state == BundleState::Committed
+            || b.state == BundleState::Aborted
+            || b.state == BundleState::Restoring
+        {
+            return Err(TransferError::WrongState);
+        }
+        b.state = BundleState::Restoring;
+        Ok(())
+    }
+
     pub fn abort(&mut self, tid: &TransferId) -> Result<Bundle, TransferError> {
         let b = self
             .bundles
@@ -157,6 +173,7 @@ impl TransferTable {
         if b.state == BundleState::Committed {
             return Err(TransferError::WrongState);
         }
+        // If Restoring, allow abort to become Aborted
         let mut b = self.bundles.remove(tid).unwrap();
         b.state = BundleState::Aborted;
         self.retain(tid, BundleState::Aborted);
