@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn zero_credit_symmetric() {
         assert_eq!(encode_credit(0), Err(CodecError::ZeroCredit));
-        let mut enc = vec![RecordKind::Credit as u8, 0, 0, 0, 0];
+        let enc = vec![RecordKind::Credit as u8, 0, 0, 0, 0];
         assert_eq!(decode_one(&enc, 10), Err(CodecError::ZeroCredit));
     }
 
@@ -182,16 +182,11 @@ mod tests {
         let mut records = Vec::new();
         for &b in &stream {
             buf.push(b);
-            loop {
-                match decode_one(&buf, 10).unwrap() {
-                    Decoded::Complete { record, consumed } => {
-                        records.push(record);
-                        buf.drain(..consumed);
-                        if buf.is_empty() {
-                            break;
-                        }
-                    }
-                    Decoded::NeedMore => break,
+            while let Decoded::Complete { record, consumed } = decode_one(&buf, 10).unwrap() {
+                records.push(record);
+                buf.drain(..consumed);
+                if buf.is_empty() {
+                    break;
                 }
             }
         }
@@ -221,16 +216,11 @@ mod tests {
         let mut records = Vec::new();
         for &b in &stream {
             buf.push(b);
-            loop {
-                match decode_one(&buf, 10).unwrap() {
-                    Decoded::Complete { record, consumed } => {
-                        records.push(record);
-                        buf.drain(..consumed);
-                        if buf.is_empty() {
-                            break;
-                        }
-                    }
-                    Decoded::NeedMore => break,
+            while let Decoded::Complete { record, consumed } = decode_one(&buf, 10).unwrap() {
+                records.push(record);
+                buf.drain(..consumed);
+                if buf.is_empty() {
+                    break;
                 }
             }
         }

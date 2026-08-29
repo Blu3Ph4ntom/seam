@@ -132,46 +132,60 @@ pub mod unix_lane {
         }
 
         /// Receive a native frame carrying exactly one fd via SCM_RIGHTS.
+        /// SOCK_STREAM is not message-atomic: recvmsg may return partial bytes
+        /// while SCM_RIGHTS arrives with some chunk. Loop recvmsg, accumulate
+        /// header+body, capture the owned fd, then return. EOF before a full
+        /// frame is UnexpectedEof.
         pub fn recv_frame_fd(
             &self,
             limits: &Limits,
         ) -> std::io::Result<(Header, Vec<u8>, OwnedFd)> {
             use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
             use std::io::IoSliceMut;
-            // Single recvmsg for header+body+FD — plain read would discard ancillary data.
-            let mut buf = vec![0u8; 4096];
-            let mut space = [0u8; rustix::cmsg_space!(ScmRights(1))];
-            let mut cmsg = RecvAncillaryBuffer::new(&mut space);
-            let mut iov = [IoSliceMut::new(&mut buf)];
-            let ret = rustix::net::recvmsg(&self.inner, &mut iov, &mut cmsg, RecvFlags::empty())
-                .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
-            let n = ret.bytes;
-            if n < 32 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "short header",
-                ));
-            }
-            let mut hdr = [0u8; 32];
-            hdr.copy_from_slice(&buf[0..32]);
-            let h = Header::decode(&hdr, limits)
-                .map_err(|e| std::io::Error::other(format!("bad header: {e:?}")))?;
-            let need = 32 + h.body_len as usize;
-            if n < need {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "short body",
-                ));
-            }
-            let body = buf[32..need].to_vec();
-            for msg in cmsg.drain() {
-                if let RecvAncillaryMessage::ScmRights(mut fds) = msg {
-                    if let Some(fd) = fds.next() {
-                        return Ok((h, body, fd));
+            let mut collected: Vec<u8> = Vec::new();
+            let mut fd_opt: Option<OwnedFd> = None;
+            let mut h_opt: Option<Header> = None;
+            loop {
+                if let Some(h) = &h_opt {
+                    if collected.len() >= 32 + h.body_len as usize && fd_opt.is_some() {
+                        let body = collected[32..32 + h.body_len as usize].to_vec();
+                        return Ok((*h, body, fd_opt.take().unwrap()));
                     }
                 }
+                let mut buf = [0u8; 64];
+                let mut space = [0u8; rustix::cmsg_space!(ScmRights(1))];
+                let mut cmsg = RecvAncillaryBuffer::new(&mut space);
+                let mut iov = [IoSliceMut::new(&mut buf)];
+                let ret =
+                    rustix::net::recvmsg(&self.inner, &mut iov, &mut cmsg, RecvFlags::empty())
+                        .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+                let n = ret.bytes;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "eof before full native frame",
+                    ));
+                }
+                collected.extend_from_slice(&buf[..n]);
+                if fd_opt.is_none() {
+                    for msg in cmsg.drain() {
+                        if let RecvAncillaryMessage::ScmRights(mut fds) = msg {
+                            if let Some(fd) = fds.next() {
+                                fd_opt = Some(fd);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if h_opt.is_none() && collected.len() >= 32 {
+                    let mut hdr = [0u8; 32];
+                    hdr.copy_from_slice(&collected[0..32]);
+                    h_opt = Some(
+                        Header::decode(&hdr, limits)
+                            .map_err(|e| std::io::Error::other(format!("bad header: {e:?}")))?,
+                    );
+                }
             }
-            Err(std::io::Error::other("native frame without fd"))
         }
     }
 }
