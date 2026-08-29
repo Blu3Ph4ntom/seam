@@ -560,15 +560,27 @@ mod tests {
         payload_a
             .set_read_timeout(Some(std::time::Duration::from_secs(15)))
             .ok();
-        // Retry once on transient macOS scheduling delay (historical flake: failed to fill whole buffer)
+        // Historical macOS flake: child scheduling delay causes transient EOF.
+        // Retry the read with a small backoff; the child may still be starting.
         let mut last_err = None;
-        for _ in 0..2 {
+        for attempt in 0..3 {
             match payload_a.read_exact(&mut buf) {
                 Ok(()) => {
                     last_err = None;
                     break;
                 }
-                Err(e) => last_err = Some(e),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && attempt < 2 => {
+                    // Child may not have written yet; wait and retry
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        100 * (attempt + 1) as u64,
+                    ));
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
             }
         }
         if let Some(e) = last_err {
