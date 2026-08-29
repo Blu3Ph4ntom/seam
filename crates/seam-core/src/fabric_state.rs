@@ -273,22 +273,40 @@ impl FabricState {
 
     pub fn mark_fabric_escrowed(
         &mut self,
-        _sender: PeerId,
+        sender: PeerId,
         tid: TransferId,
         idx: u16,
     ) -> Result<(), FabricError> {
-        // Validate sender is sender of transfer and still Active (or at least not Gone)
+        let expected = self
+            .transfers
+            .sender_of(&tid)
+            .ok_or(FabricError::UnknownTransfer)?;
+        if expected != sender {
+            return Err(FabricError::WrongPeer);
+        }
+        if self.peers.get(&sender) != Some(&PeerState::Active) {
+            return Err(FabricError::PeerNotActive);
+        }
         self.transfers.mark_fabric_escrowed(&tid, idx)?;
         Ok(())
     }
 
     pub fn mark_recipient_staged(
         &mut self,
-        _recipient: PeerId,
+        recipient: PeerId,
         tid: TransferId,
         idx: u16,
     ) -> Result<MaterialAction, FabricError> {
-        // Validate recipient
+        let expected = self
+            .transfers
+            .recipient_of(&tid)
+            .ok_or(FabricError::UnknownTransfer)?;
+        if expected != recipient {
+            return Err(FabricError::WrongPeer);
+        }
+        if self.peers.get(&recipient) != Some(&PeerState::Active) {
+            return Err(FabricError::PeerNotActive);
+        }
         self.transfers.stage_native(&tid, idx)?;
         let act = self.materializer.stage_native(tid, idx, true); // native_required true for now; should be from metadata
                                                                   // For native_required false, this would be not required, but we assume true for NativeFile
@@ -401,8 +419,8 @@ impl FabricState {
     ) {
         if self.retained.len() >= self.limits.max_retained_results {
             if let Some(front) = self.retained.pop_front() {
-                Self::remove_index(&mut self.by_sender, front.sender, tid);
-                Self::remove_index(&mut self.by_recipient, front.recipient, tid);
+                Self::remove_index(&mut self.by_sender, front.sender, front.tid);
+                Self::remove_index(&mut self.by_recipient, front.recipient, front.tid);
             }
         }
         self.retained.push_back(RetainedResult {
@@ -928,5 +946,87 @@ mod tests {
         s.accept_bundle(b, tid(1)).unwrap();
         assert!(s.commit_if_ready(tid(1)).is_err());
         assert_eq!(s.status(&tid(1)), TransferStatus::Pending);
+    }
+
+    #[test]
+    fn retained_eviction_cleans_secondary_indexes() {
+        let mut lim = Limits::default();
+        lim.max_retained_results = 2;
+        let mut s = FabricState::new(lim);
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        for i in 1..=3u8 {
+            let k = key_res(i);
+            s.register_authority(k, a).unwrap();
+            s.offer_bundle(a, b, tid(i), vec![(k, res(i), 2, true)])
+                .unwrap();
+            s.accept_bundle(b, tid(i)).unwrap();
+            s.mark_fabric_escrowed(a, tid(i), 0).unwrap();
+            s.mark_recipient_staged(b, tid(i), 0).unwrap();
+            s.commit_if_ready(tid(i)).unwrap();
+        }
+        // FIFO eviction: tid1 should be gone from retained and both indexes
+        assert_eq!(s.status(&tid(1)), TransferStatus::Unknown);
+        assert!(!s.by_sender(&a).contains(&tid(1)));
+        assert!(!s.by_recipient(&b).contains(&tid(1)));
+        assert_eq!(s.status(&tid(2)), TransferStatus::Committed);
+        assert_eq!(s.status(&tid(3)), TransferStatus::Committed);
+        assert!(s.by_sender(&a).contains(&tid(2)));
+        assert!(s.by_recipient(&b).contains(&tid(3)));
+    }
+
+    #[test]
+    fn wrong_recipient_accept_rejected() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        let c = peer(3);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.add_peer(c).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        assert!(s.accept_bundle(c, tid(1)).is_err());
+        assert_eq!(s.status(&tid(1)), TransferStatus::Pending);
+    }
+
+    #[test]
+    fn wrong_sender_escrow_rejected() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        let c = peer(3);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.add_peer(c).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        assert!(s.mark_fabric_escrowed(c, tid(1), 0).is_err());
+        assert!(s.mark_fabric_escrowed(b, tid(1), 0).is_err());
+    }
+
+    #[test]
+    fn wrong_recipient_stage_rejected() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        let c = peer(3);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        s.add_peer(c).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        s.accept_bundle(b, tid(1)).unwrap();
+        s.mark_fabric_escrowed(a, tid(1), 0).unwrap();
+        assert!(s.mark_recipient_staged(c, tid(1), 0).is_err());
+        assert!(s.mark_recipient_staged(a, tid(1), 0).is_err());
     }
 }
