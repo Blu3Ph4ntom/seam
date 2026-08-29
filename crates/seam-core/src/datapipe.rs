@@ -40,7 +40,12 @@ pub fn decode_data(buf: &[u8], max: usize) -> Result<(DataRecord, usize), &'stat
     if buf.len() < 5 + len {
         return Err("truncated body");
     }
-    Ok((DataRecord { payload: buf[5..5 + len].to_vec() }, 5 + len))
+    Ok((
+        DataRecord {
+            payload: buf[5..5 + len].to_vec(),
+        },
+        5 + len,
+    ))
 }
 
 #[cfg(test)]
