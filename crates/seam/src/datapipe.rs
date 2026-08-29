@@ -5,8 +5,6 @@
 
 #![cfg(unix)]
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex};

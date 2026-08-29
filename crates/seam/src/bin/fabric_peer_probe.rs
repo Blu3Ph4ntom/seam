@@ -176,7 +176,12 @@ mod imp {
             control
                 .send_frame(&header(Kind::Accept, 16), &tid.0)
                 .unwrap();
-            let (k, _b, fd) = native.recv_frame_fd(&Limits::default()).unwrap();
+            let (k, _b, fd) = match native.recv_frame_fd(&Limits::default()) {
+                Ok(x) => x,
+                // Fabric rejected the transfer before delivery (hostile cases);
+                // exit quietly so test logs stay clean. Exit code is not authority.
+                Err(_) => exit(0),
+            };
             assert_eq!(k.kind, Kind::NativeDeliver, "expected NATIVE_DELIVER");
             control
                 .send_frame(&header(Kind::NativeStaged, 16), &tid.0)
