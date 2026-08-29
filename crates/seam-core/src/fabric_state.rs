@@ -182,7 +182,7 @@ impl FabricState {
         tid: TransferId,
         keys: Vec<(AuthorityKey, crate::ids::ResourceId, u8, bool)>, // (key, object_id, kind, native_required)
     ) -> Result<(), FabricError> {
-        // Validate peers
+        // ---- PREFLIGHT: zero mutation on any failure ----
         if self.peers.get(&sender) != Some(&PeerState::Active) {
             return Err(FabricError::PeerNotActive);
         }
@@ -192,17 +192,38 @@ impl FabricState {
         if keys.len() > self.limits.max_attachments {
             return Err(FabricError::Transfer(TransferError::TooManyAttachments));
         }
-        // Check duplicate TransferId already exists (via transfers or materializer)
         if self.transfers.status(&tid).is_some() {
             return Err(FabricError::AlreadyExists);
         }
-        // Validate authority keys unique and Held(sender)
+        // authority keys: unique and all Held(sender)
+        let mut seen = std::collections::HashSet::new();
+        for (k, _, _, _) in &keys {
+            if !seen.insert(k) {
+                return Err(FabricError::Ledger(LedgerError::DuplicateKeyInBundle));
+            }
+            match self.authority.lookup(k) {
+                Some(crate::authority::AuthorityState::Held(owner)) if owner == sender => {}
+                Some(_) => return Err(FabricError::Ledger(LedgerError::WrongHolder)),
+                None => return Err(FabricError::Ledger(LedgerError::NotFound)),
+            }
+        }
+        // materializer preflight for every attachment (pure)
+        for (idx, (_, oid, kind, native_required)) in keys.iter().enumerate() {
+            let meta = Metadata {
+                recipient,
+                object_id: oid.0,
+                object_kind: *kind,
+                native_required: *native_required,
+            };
+            if !self.materializer.can_authorize(tid, idx as u16, &meta) {
+                return Err(FabricError::Materializer("metadata conflict"));
+            }
+        }
+        // ---- MUTATION: cannot fail after preflight ----
         let auth_keys: Vec<AuthorityKey> = keys.iter().map(|(k, _, _, _)| *k).collect();
-        // Use authority ledger to validate and transition
-        // First, try to offer via ledger (validates)
-        self.authority
-            .offer_bundle(sender, recipient, tid, &auth_keys)?;
-        // Build Bundle for TransferTable
+        let _ = self
+            .authority
+            .offer_bundle(sender, recipient, tid, &auth_keys);
         let attachments = keys
             .iter()
             .enumerate()
@@ -224,28 +245,15 @@ impl FabricState {
             attachments,
             state: crate::transfer::BundleState::Offered,
         };
-        // If transfer offer fails, rollback ledger (abort)
-        if let Err(e) = self.transfers.offer(bundle) {
-            // rollback ledger
-            let _ = self.authority.abort_bundle(tid);
-            return Err(FabricError::Transfer(e));
-        }
-        // Authorize materializer metadata for each attachment
-        for (idx, (key, oid, kind, native_required)) in keys.iter().enumerate() {
+        self.transfers.offer(bundle).expect("preflighted offer");
+        for (idx, (_, oid, kind, native_required)) in keys.iter().enumerate() {
             let meta = Metadata {
                 recipient,
                 object_id: oid.0,
                 object_kind: *kind,
                 native_required: *native_required,
             };
-            let act = self.materializer.authorize_metadata(tid, idx as u16, meta);
-            if let MaterialAction::Reject(_) = act {
-                // rollback
-                let _ = self.transfers.abort(&tid);
-                let _ = self.authority.abort_bundle(tid);
-                return Err(FabricError::Materializer("metadata reject"));
-            }
-            let _ = key; // keep
+            let _ = self.materializer.authorize_metadata(tid, idx as u16, meta);
         }
         Ok(())
     }
@@ -302,9 +310,12 @@ impl FabricState {
             return Err(FabricError::PeerNotActive);
         }
         self.transfers.stage_native(&tid, idx)?;
-        let act = self.materializer.stage_native(tid, idx, true); // native_required true for now; should be from metadata
-                                                                  // For native_required false, this would be not required, but we assume true for NativeFile
-                                                                  // If materializer says CloseNative, we should close
+        // native_required comes from authoritative attachment metadata, not a hardcoded true
+        let native_required = self
+            .transfers
+            .native_required_of(&tid, idx)
+            .unwrap_or(false);
+        let act = self.materializer.stage_native(tid, idx, native_required);
         Ok(act)
     }
 
@@ -940,6 +951,131 @@ mod tests {
         s.accept_bundle(b, tid(1)).unwrap();
         assert!(s.commit_if_ready(tid(1)).is_err());
         assert_eq!(s.status(&tid(1)), TransferStatus::Pending);
+    }
+
+    /// Invariant: retained rows and secondary indexes are mutually consistent.
+    fn retained_invariant(s: &FabricState) -> bool {
+        // every retained tid appears exactly once in each index
+        for r in &s.retained {
+            let sender_hits = s
+                .by_sender
+                .get(&r.sender)
+                .map(|v| v.iter().filter(|t| **t == r.tid).count())
+                .unwrap_or(0);
+            let recipient_hits = s
+                .by_recipient
+                .get(&r.recipient)
+                .map(|v| v.iter().filter(|t| **t == r.tid).count())
+                .unwrap_or(0);
+            if sender_hits != 1 || recipient_hits != 1 {
+                return false;
+            }
+        }
+        // every index tid has a retained row
+        for (_peer, tids) in s.by_sender.iter().chain(s.by_recipient.iter()) {
+            for t in tids {
+                if !s.retained.iter().any(|r| &r.tid == t) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn retained_invariant_holds_after_churn() {
+        let lim = Limits {
+            max_retained_results: 4,
+            ..Limits::default()
+        };
+        let mut s = FabricState::new(lim);
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        for i in 1u8..=10 {
+            let k = key_res(i);
+            s.register_authority(k, a).unwrap();
+            s.offer_bundle(a, b, tid(i), vec![(k, res(i), 2, true)])
+                .unwrap();
+            s.accept_bundle(b, tid(i)).unwrap();
+            s.mark_fabric_escrowed(a, tid(i), 0).unwrap();
+            s.mark_recipient_staged(b, tid(i), 0).unwrap();
+            s.commit_if_ready(tid(i)).unwrap();
+        }
+        assert!(
+            retained_invariant(&s),
+            "invariant after 10 commits w/ cap 4"
+        );
+        assert!(s.by_sender(&a).len() <= 4);
+        assert!(s.by_recipient(&b).len() <= 4);
+    }
+
+    #[test]
+    fn offer_atomic_zero_mutation_on_late_failure() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k1 = key_res(1);
+        let k2 = key_res(2);
+        s.register_authority(k1, a).unwrap();
+        s.register_authority(k2, a).unwrap();
+        let bad = key_res(99); // not registered -> preflight fails
+        let res = s.offer_bundle(
+            a,
+            b,
+            tid(1),
+            vec![
+                (k1, res(1), 2, true),
+                (k2, res(2), 2, true),
+                (bad, res(99), 2, true),
+            ],
+        );
+        assert!(res.is_err());
+        // zero mutation: k1/k2 still Held(a), no transfer, no materializer slot
+        assert_eq!(
+            s.authority.lookup(&k1),
+            Some(crate::authority::AuthorityState::Held(a))
+        );
+        assert_eq!(
+            s.authority.lookup(&k2),
+            Some(crate::authority::AuthorityState::Held(a))
+        );
+        assert_eq!(s.transfers.status(&tid(1)), None);
+        assert!(!s.materializer.is_materialized(tid(1), 0));
+        assert!(retained_invariant(&s));
+    }
+
+    #[test]
+    fn native_required_from_metadata_mixed_bundle() {
+        // attachment 0 native -> must be escrowed+staged; attachment 1 non-native -> not required
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k1 = key_res(1);
+        let k2 = key_res(2);
+        s.register_authority(k1, a).unwrap();
+        s.register_authority(k2, a).unwrap();
+        s.offer_bundle(
+            a,
+            b,
+            tid(1),
+            vec![(k1, res(1), 2, true), (k2, res(2), 9, false)],
+        )
+        .unwrap();
+        s.accept_bundle(b, tid(1)).unwrap();
+        // Not ready: attachment0 never escrowed/staged
+        assert!(s.commit_if_ready(tid(1)).is_err());
+        s.mark_fabric_escrowed(a, tid(1), 0).unwrap();
+        assert!(s.commit_if_ready(tid(1)).is_err());
+        s.mark_recipient_staged(b, tid(1), 0).unwrap();
+        // readiness met: attachment0 staged + attachment1 non-native
+        s.commit_if_ready(tid(1)).unwrap();
+        assert_eq!(s.status(&tid(1)), TransferStatus::Committed);
     }
 
     #[test]

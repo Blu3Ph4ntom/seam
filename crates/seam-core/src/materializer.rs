@@ -63,6 +63,25 @@ impl Materializer {
         }
     }
 
+    /// Pure preflight: would authorize_metadata(tid, idx, meta) succeed without mutation?
+    pub fn can_authorize(&self, tid: TransferId, idx: u16, meta: &Metadata) -> bool {
+        if self.aborted_tids.contains(&tid) {
+            return false;
+        }
+        match self.slots.get(&(tid, idx)) {
+            None => true,
+            Some(s) => {
+                if s.materialized {
+                    return false;
+                }
+                match &s.metadata {
+                    None => true,
+                    Some(m) => m == meta,
+                }
+            }
+        }
+    }
+
     pub fn authorize_metadata(&mut self, tid: TransferId, idx: u16, meta: Metadata) -> Action {
         let key = (tid, idx);
         // Wrong tid already aborted/committed? Still allow but will be rejected if mismatched

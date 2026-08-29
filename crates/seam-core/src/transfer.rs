@@ -211,6 +211,16 @@ impl TransferTable {
     }
 
     /// Active (non-terminal) status only; terminal results live in FabricState.retained.
+    /// Authoritative native_required flag for an attachment (active bundle only).
+    pub fn native_required_of(&self, tid: &TransferId, idx: u16) -> Option<bool> {
+        self.bundles.get(tid).and_then(|b| {
+            b.attachments
+                .iter()
+                .find(|a| a.index == idx)
+                .map(|a| a.native_required)
+        })
+    }
+
     pub fn active_status(&self, tid: &TransferId) -> Option<BundleState> {
         self.bundles.get(tid).map(|b| b.state)
     }
