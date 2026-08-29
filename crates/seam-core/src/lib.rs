@@ -3,6 +3,7 @@
 
 pub mod authority;
 pub mod credit;
+pub mod datapipe;
 pub mod fabric;
 pub mod fabric_state;
 pub mod ids;
