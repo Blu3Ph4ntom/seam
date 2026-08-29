@@ -66,10 +66,18 @@ impl SharedRegionMut {
     }
 }
 
-/// DataPipe
+/// DataPipe — physical Producer/Consumer (unix), stubs elsewhere.
+#[cfg(unix)]
+pub mod datapipe;
+#[cfg(unix)]
+pub use datapipe::{Consumer, DataPipe, Producer};
+#[cfg(not(unix))]
 pub struct Producer;
+#[cfg(not(unix))]
 pub struct Consumer;
+#[cfg(not(unix))]
 pub struct DataPipe;
+#[cfg(not(unix))]
 #[allow(clippy::new_ret_no_self)]
 impl DataPipe {
     pub fn new(_fabric: &Fabric, _cap: usize) -> Result<(Producer, Consumer), String> {
