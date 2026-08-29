@@ -138,16 +138,31 @@ pub mod unix_lane {
         ) -> std::io::Result<(Header, Vec<u8>, OwnedFd)> {
             use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
             use std::io::IoSliceMut;
-            let mut hdr = [0u8; 32];
-            self.recv_exact(&mut hdr)?;
-            let h = Header::decode(&hdr, limits)
-                .map_err(|e| std::io::Error::other(format!("bad header: {e:?}")))?;
-            let mut body = vec![0u8; h.body_len as usize];
+            // Single recvmsg for header+body+FD — plain read would discard ancillary data.
+            let mut buf = vec![0u8; 4096];
             let mut space = [0u8; rustix::cmsg_space!(ScmRights(1))];
             let mut cmsg = RecvAncillaryBuffer::new(&mut space);
-            let mut iov = [IoSliceMut::new(&mut body)];
-            rustix::net::recvmsg(&self.inner, &mut iov, &mut cmsg, RecvFlags::empty())
+            let mut iov = [IoSliceMut::new(&mut buf)];
+            let n = rustix::net::recvmsg(&self.inner, &mut iov, &mut cmsg, RecvFlags::empty())
                 .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+            if n < 32 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short header",
+                ));
+            }
+            let mut hdr = [0u8; 32];
+            hdr.copy_from_slice(&buf[0..32]);
+            let h = Header::decode(&hdr, limits)
+                .map_err(|e| std::io::Error::other(format!("bad header: {e:?}")))?;
+            let need = 32 + h.body_len as usize;
+            if n < need {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short body",
+                ));
+            }
+            let body = buf[32..need].to_vec();
             for msg in cmsg.drain() {
                 if let RecvAncillaryMessage::ScmRights(mut fds) = msg {
                     if let Some(fd) = fds.next() {
