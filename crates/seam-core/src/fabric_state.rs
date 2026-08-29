@@ -293,3 +293,149 @@ impl FabricState {
         self.transfers.result_ack(tid)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authority::AuthorityKey;
+    use crate::ids::{PeerId, ResourceId, TransferId};
+
+    fn peer(n: u8) -> PeerId {
+        PeerId([n; 16])
+    }
+    fn res(n: u8) -> ResourceId {
+        ResourceId([n; 16])
+    }
+    fn tid(n: u8) -> TransferId {
+        TransferId([n; 16])
+    }
+    fn key_res(n: u8) -> AuthorityKey {
+        AuthorityKey::Resource(res(n))
+    }
+
+    #[test]
+    fn fstate_offer_single() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        assert!(matches!(
+            s.authority.lookup(&k),
+            Some(crate::authority::AuthorityState::Escrow { .. })
+        ));
+        assert_eq!(s.transfers.status(&tid(1)), Some(BundleState::Offered));
+    }
+
+    #[test]
+    fn fstate_offer_invalid_second_leaves_first() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k1 = key_res(1);
+        let k2 = key_res(2);
+        s.register_authority(k1, a).unwrap();
+        s.register_authority(k2, a).unwrap();
+        let k3 = key_res(3); // not registered
+        let res = s.offer_bundle(
+            a,
+            b,
+            tid(1),
+            vec![(k1, res(1), 2, true), (k3, res(3), 2, true)],
+        );
+        assert!(res.is_err());
+        assert_eq!(
+            s.authority.lookup(&k1),
+            Some(crate::authority::AuthorityState::Held(a))
+        );
+        assert_eq!(s.transfers.status(&tid(1)), None);
+    }
+
+    #[test]
+    fn fstate_commit_ready() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        s.accept_bundle(b, tid(1)).unwrap();
+        s.mark_fabric_escrowed(a, tid(1), 0).unwrap();
+        let act = s.mark_recipient_staged(b, tid(1), 0).unwrap();
+        assert_eq!(act, MaterialAction::Wait); // not yet committed
+        s.commit_if_ready(tid(1)).unwrap();
+        assert_eq!(
+            s.authority.lookup(&k),
+            Some(crate::authority::AuthorityState::Held(b))
+        );
+        assert_eq!(s.transfers.status(&tid(1)), Some(BundleState::Committed));
+    }
+
+    #[test]
+    fn fstate_abort_decide_and_finish() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        s.decide_abort(tid(1)).unwrap();
+        // ledger should still be Escrow, not Held
+        assert!(matches!(
+            s.authority.lookup(&k),
+            Some(crate::authority::AuthorityState::Escrow { .. })
+        ));
+        s.finish_abort_restore(tid(1)).unwrap();
+        assert_eq!(
+            s.authority.lookup(&k),
+            Some(crate::authority::AuthorityState::Held(a))
+        );
+        assert_eq!(s.transfers.status(&tid(1)), Some(BundleState::Aborted));
+    }
+
+    #[test]
+    fn fstate_duplicate_finish_abort_rejected() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        s.decide_abort(tid(1)).unwrap();
+        s.finish_abort_restore(tid(1)).unwrap();
+        assert!(s.finish_abort_restore(tid(1)).is_err());
+    }
+
+    #[test]
+    fn fstate_committed_cannot_abort() {
+        let mut s = FabricState::new(Limits::default());
+        let a = peer(1);
+        let b = peer(2);
+        s.add_peer(a).unwrap();
+        s.add_peer(b).unwrap();
+        let k = key_res(1);
+        s.register_authority(k, a).unwrap();
+        s.offer_bundle(a, b, tid(1), vec![(k, res(1), 2, true)])
+            .unwrap();
+        s.accept_bundle(b, tid(1)).unwrap();
+        s.mark_fabric_escrowed(a, tid(1), 0).unwrap();
+        s.mark_recipient_staged(b, tid(1), 0).unwrap();
+        s.commit_if_ready(tid(1)).unwrap();
+        assert!(s.decide_abort(tid(1)).is_err());
+    }
+}
