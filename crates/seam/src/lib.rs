@@ -38,15 +38,8 @@ pub fn channel<T>(_fabric: &Fabric) -> (Client<T>, Receiver<T>) {
     )
 }
 
-/// Linear NativeFile wrapper (example kind).
-pub struct NativeFile {
-    _inner: (),
-}
-impl NativeFile {
-    pub fn open(_p: &str) -> Result<Self, String> {
-        Ok(Self { _inner: () })
-    }
-}
+pub mod native_file;
+pub use native_file::NativeFile;
 
 /// SharedRegion types (stub)
 pub struct SharedRegionMut;
