@@ -561,35 +561,8 @@ mod tests {
         lane_a.send_fd(fd_to_send).unwrap();
         // Child should echo SUFFIX on the moved fd's peer
         let mut buf = [0u8; 6];
-        payload_a
-            .set_read_timeout(Some(std::time::Duration::from_secs(15)))
-            .ok();
-        // Historical macOS flake: child scheduling delay causes transient EOF.
-        // Retry the read with a small backoff; the child may still be starting.
-        let mut last_err = None;
-        for attempt in 0..3 {
-            match payload_a.read_exact(&mut buf) {
-                Ok(()) => {
-                    last_err = None;
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && attempt < 2 => {
-                    // Child may not have written yet; wait and retry
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        100 * (attempt + 1) as u64,
-                    ));
-                    last_err = Some(e);
-                    continue;
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    break;
-                }
-            }
-        }
-        if let Some(e) = last_err {
-            panic!("parent read suffix: {e}");
-        }
+        // Blocking read — deterministic, no timeout. Child scheduling is handled by blocking, not polling.
+        payload_a.read_exact(&mut buf).expect("parent read suffix");
         assert_eq!(&buf, b"SUFFIX");
         let status = child.wait().expect("wait child");
         assert!(status.success(), "child failed: {:?}", status);
