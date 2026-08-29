@@ -112,7 +112,9 @@ mod imp {
             env[18] = 2;
             env[19] = 1;
             env[20..36].copy_from_slice(&rid.0);
-            native.send_frame_fd(&header(Kind::NativeEscrow, 35), &env, owned).unwrap();
+            native
+                .send_frame_fd(&header(Kind::NativeEscrow, 35), &env, owned)
+                .unwrap();
             // ESCROW_ACQUIRED
             let (k, _) = control.recv_frame(&Limits::default()).unwrap();
             assert_eq!(k.kind, Kind::EscrowAcquired, "expected ESCROW_ACQUIRED");
@@ -124,15 +126,21 @@ mod imp {
                 assert_eq!(k2.kind, Kind::Restore, "expected RESTORE");
                 let file = unsafe { File::from_raw_fd(fd2.into_raw_fd()) };
                 verify_file(file);
-                control.send_frame(&header(Kind::RestoreAck, 16), &tid.0).unwrap();
+                control
+                    .send_frame(&header(Kind::RestoreAck, 16), &tid.0)
+                    .unwrap();
                 exit(0);
             }
         } else {
             // recipient
-            control.send_frame(&header(Kind::Accept, 16), &tid.0).unwrap();
+            control
+                .send_frame(&header(Kind::Accept, 16), &tid.0)
+                .unwrap();
             let (k, _b, fd) = native.recv_frame_fd(&Limits::default()).unwrap();
             assert_eq!(k.kind, Kind::NativeDeliver, "expected NATIVE_DELIVER");
-            control.send_frame(&header(Kind::NativeStaged, 16), &tid.0).unwrap();
+            control
+                .send_frame(&header(Kind::NativeStaged, 16), &tid.0)
+                .unwrap();
             let (k2, _) = control.recv_frame(&Limits::default()).unwrap();
             if k2.kind == Kind::Commit {
                 let file = unsafe { File::from_raw_fd(fd.into_raw_fd()) };
