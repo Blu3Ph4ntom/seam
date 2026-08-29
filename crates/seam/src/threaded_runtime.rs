@@ -89,6 +89,7 @@ impl DeathGate {
 }
 
 struct PeerRuntime {
+    #[allow(dead_code)]
     peer: PeerId,
     control_rx: Receiver<DriverEvent>,
     native_rx: Receiver<DriverEvent>,
@@ -99,7 +100,7 @@ struct PeerRuntime {
 }
 
 fn spawn_reader(
-    peer: PeerId,
+    _peer: PeerId,
     gate: Arc<DeathGate>,
     state: Arc<Mutex<FabricState>>,
     tx: Sender<DriverEvent>,
@@ -109,39 +110,29 @@ fn spawn_reader(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         if let Some(lane) = control {
-            loop {
-                match lane.recv_frame(&limits) {
-                    Ok((hdr, body)) => {
-                        if tx
-                            .send(DriverEvent::Control {
-                                kind: hdr.kind,
-                                body,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok((hdr, body)) = lane.recv_frame(&limits) {
+                if tx
+                    .send(DriverEvent::Control {
+                        kind: hdr.kind,
+                        body,
+                    })
+                    .is_err()
+                {
+                    break;
                 }
             }
         }
         if let Some(lane) = native {
-            loop {
-                match lane.recv_frame_fd(&limits) {
-                    Ok((hdr, body, fd)) => {
-                        if tx
-                            .send(DriverEvent::Native {
-                                kind: hdr.kind,
-                                body,
-                                fd: Some(fd),
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok((hdr, body, fd)) = lane.recv_frame_fd(&limits) {
+                if tx
+                    .send(DriverEvent::Native {
+                        kind: hdr.kind,
+                        body,
+                        fd: Some(fd),
+                    })
+                    .is_err()
+                {
+                    break;
                 }
             }
         }
@@ -538,7 +529,6 @@ pub fn spawn_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixStream;
 
     #[test]
     fn death_gate_exactly_once() {
