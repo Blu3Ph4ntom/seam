@@ -474,6 +474,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "fork flake on macOS; canonical via_command covers macOS"
+    )]
     fn lane_cross_process_fd_transfer() {
         // REAL CROSS-PROCESS KERNEL PROOF — TEST HARNESS PROVISIONAL:
         // distinct PIDs via fork, SCM_RIGHTS continuity. Fork-from-harness
