@@ -56,9 +56,6 @@ impl CreditTracker {
         if want == 0 {
             return Ok(0);
         }
-        if want > self.capacity {
-            return Err(CreditError::TooLarge);
-        }
         let grant = std::cmp::min(want, self.available);
         self.available -= grant;
         self.reserved = self
