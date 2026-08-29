@@ -185,7 +185,7 @@ impl ThreadedRuntime {
         child: Child,
     ) -> Result<(), String> {
         {
-            let mut peers = self.peers.lock().unwrap();
+            let peers = self.peers.lock().unwrap();
             if peers.len() >= 1024 {
                 return Err("too many peers".into());
             }
