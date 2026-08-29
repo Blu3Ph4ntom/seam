@@ -100,7 +100,7 @@ struct PeerRuntime {
 }
 
 fn spawn_reader(
-    _peer: PeerId,
+    peer: PeerId,
     gate: Arc<DeathGate>,
     state: Arc<Mutex<FabricState>>,
     tx: Sender<DriverEvent>,
