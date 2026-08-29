@@ -620,6 +620,81 @@ mod tests {
         let status = child.wait().expect("wait child");
         assert!(status.success(), "file-child failed {:?}", status);
     }
+
+    #[test]
+    fn stream_framing_fragmented_header_and_body() {
+        // CTO §6 deterministic fragmentation: header split at every boundary, body in 1/2/3/5/7 chunks, truncated detection.
+        use seam_core::limits::Limits;
+        use seam_core::wire::{Header, Kind, CURRENT_MAJOR, CURRENT_MINOR, MAGIC};
+        fn roundtrip(chunk: usize) {
+            let (a, b) = NativeLane::pair().unwrap();
+            let limits = Limits::default();
+            let body = b"hello-framing-";
+            let h = Header {
+                magic: MAGIC,
+                major: CURRENT_MAJOR,
+                minor: CURRENT_MINOR,
+                kind: Kind::Control,
+                flags: 0,
+                body_len: body.len() as u32,
+                request_id: 0x1234,
+                channel_id: 0x5678,
+                attachment_count: 0,
+                reserved: 0,
+            };
+            let mut hdr = [0u8; 32];
+            h.encode(&mut hdr);
+            let frame = [&hdr[..], &body[..]].concat();
+            // Fragmented send in `chunk`-byte pieces
+            let mut off = 0;
+            while off < frame.len() {
+                let n = std::cmp::min(chunk, frame.len() - off);
+                a.send(&frame[off..off + n]).unwrap();
+                off += n;
+            }
+            let (rh, rbody) = b.recv_frame(&limits).unwrap();
+            assert_eq!(rh, h);
+            assert_eq!(rbody, body);
+        }
+        for &c in &[1, 2, 3, 5, 7, 11] {
+            roundtrip(c);
+        }
+        // Truncated header: only 10 bytes, then EOF
+        {
+            let (a, b) = NativeLane::pair().unwrap();
+            a.send(&[0u8; 10]).unwrap();
+            drop(a); // EOF
+            assert!(
+                b.recv_frame(&Limits::default()).is_err(),
+                "truncated header should fail"
+            );
+        }
+        // Truncated body: header claims body_len 10, only 3 bytes arrive
+        {
+            let (a, b) = NativeLane::pair().unwrap();
+            let mut hdr = [0u8; 32];
+            Header {
+                magic: MAGIC,
+                major: CURRENT_MAJOR,
+                minor: CURRENT_MINOR,
+                kind: Kind::Control,
+                flags: 0,
+                body_len: 10,
+                request_id: 0,
+                channel_id: 0,
+                attachment_count: 0,
+                reserved: 0,
+            }
+            .encode(&mut hdr);
+            a.send(&hdr).unwrap();
+            a.send(b"abc").unwrap();
+            drop(a);
+            assert!(
+                b.recv_frame(&Limits::default()).is_err(),
+                "truncated body should fail"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

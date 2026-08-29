@@ -107,7 +107,14 @@ mod imp {
             let fd = file.into_raw_fd();
             let owned = unsafe { OwnedFd::from_raw_fd(fd) };
             let mut env = [0u8; 36];
-            env[0..16].copy_from_slice(&tid.0);
+            if mode == "wrong-envelope" {
+                // Wrong TransferId in envelope
+                let mut wrong = tid.0;
+                wrong[0] ^= 0xFF;
+                env[0..16].copy_from_slice(&wrong);
+            } else {
+                env[0..16].copy_from_slice(&tid.0);
+            }
             env[16..18].copy_from_slice(&0u16.to_le_bytes());
             env[18] = 2;
             env[19] = 1;
@@ -115,12 +122,17 @@ mod imp {
             native
                 .send_frame_fd(&header(Kind::NativeEscrow, 36), &env, owned)
                 .unwrap();
-            // ESCROW_ACQUIRED
+            // ESCROW_ACQUIRED (not for wrong-envelope — Fabric will reject and close)
+            if mode == "wrong-envelope" {
+                // Give Fabric time to read and reject, then exit (test checks Fabric Err).
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                exit(0);
+            }
             let (k, _) = control.recv_frame(&Limits::default()).unwrap();
             assert_eq!(k.kind, Kind::EscrowAcquired, "expected ESCROW_ACQUIRED");
             if mode == "success" {
                 exit(0);
-            } else {
+            } else if mode == "abort" {
                 // ABORT: wait RESTORE (native lane, SCM_RIGHTS back)
                 let (k2, _b, fd2) = native.recv_frame_fd(&Limits::default()).unwrap();
                 assert_eq!(k2.kind, Kind::Restore, "expected RESTORE");

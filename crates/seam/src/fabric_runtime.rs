@@ -25,6 +25,7 @@ use seam_platform::NativeLane;
 pub enum Mode {
     Success,
     Abort,
+    WrongEnvelope,
 }
 
 struct PeerLanes {
@@ -132,7 +133,7 @@ impl FabricRuntime {
         }
 
         // 2) NATIVE_ESCROW from sender (native lane, SCM_RIGHTS)
-        let (_, _env, fd) = self
+        let (_, env, fd) = self
             .peers
             .lock()
             .unwrap()
@@ -143,6 +144,14 @@ impl FabricRuntime {
             .map_err(|e| format!("escrow: {e}"))?;
         if fd.as_raw_fd() < 0 {
             return Err("bad escrow fd".into());
+        }
+        if env.len() != 36 || env[0..16] != tid.0 || env[20..36] != rid.0 {
+            drop(fd);
+            return Err("wrong transfer envelope".into());
+        }
+        if self.escrow.lock().unwrap().contains_key(&(tid, 0)) {
+            drop(fd);
+            return Err("duplicate native fd".into());
         }
         self.escrow.lock().unwrap().insert((tid, 0), fd);
         {
@@ -397,10 +406,10 @@ pub fn spawn_peer(
     let n_raw = n_c.into_owned_fd().into_raw_fd();
     let mut cmd = Command::new(bin);
     cmd.arg("--role").arg(role);
-    cmd.arg("--mode").arg(if mode == Mode::Success {
-        "success"
-    } else {
-        "abort"
+    cmd.arg("--mode").arg(match mode {
+        Mode::Success => "success",
+        Mode::Abort => "abort",
+        Mode::WrongEnvelope => "wrong-envelope",
     });
     cmd.arg("--transfer-id").arg(tid_hex);
     cmd.arg("--resource-id").arg(rid_hex);

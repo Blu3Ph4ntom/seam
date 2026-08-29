@@ -95,3 +95,41 @@ fn linux_native_file_abort() {
         d.ledger_after
     );
 }
+
+#[test]
+fn linux_native_file_wrong_envelope_rejected() {
+    // Wrong TransferId in native envelope must be rejected, leaked FD closed, no commit.
+    let a = PeerId([5; 16]);
+    let b = PeerId([6; 16]);
+    let rid = ResourceId([12; 16]);
+    let tid = TransferId([22; 16]);
+    let rt = FabricRuntime::new(Limits::default());
+    let bin = env!("CARGO_BIN_EXE_fabric_peer_probe");
+    let (c_a, n_a, child_a) = spawn_peer(
+        "holder",
+        Mode::WrongEnvelope,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&a.0),
+        bin,
+    )
+    .expect("spawn holder");
+    let (c_b, n_b, child_b) = spawn_peer(
+        "recipient",
+        Mode::Success,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&b.0),
+        bin,
+    )
+    .expect("spawn recipient");
+    rt.add_peer(a, c_a, n_a, child_a);
+    rt.add_peer(b, c_b, n_b, child_b);
+    let res = rt.run_native_file(a, b, tid, rid, Mode::Success);
+    assert!(res.is_err(), "wrong envelope must be rejected");
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("wrong transfer"),
+        "expected wrong transfer, got {err}"
+    );
+}
