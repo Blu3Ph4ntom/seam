@@ -2,6 +2,7 @@
 //! No OS APIs. No async runtime. Wire header is exactly 32 bytes LE.
 
 pub mod authority;
+pub mod credit;
 pub mod fabric;
 pub mod fabric_state;
 pub mod ids;
