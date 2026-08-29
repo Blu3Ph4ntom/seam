@@ -43,6 +43,8 @@ pub use native_file::NativeFile;
 
 #[cfg(unix)]
 pub mod fabric_runtime;
+#[cfg(unix)]
+pub mod threaded_runtime;
 
 /// SharedRegion types (stub)
 pub struct SharedRegionMut;
