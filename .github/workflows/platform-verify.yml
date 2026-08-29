@@ -41,5 +41,7 @@ jobs:
         run: cargo test -p seam-platform lane_cross_process_via_command -- --nocapture
       - name: seam-core full
         run: cargo test -p seam-core -- --nocapture
+      - name: seam fabric e2e (NativeFile 3-process)
+        run: cargo test -p seam -- --nocapture
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings

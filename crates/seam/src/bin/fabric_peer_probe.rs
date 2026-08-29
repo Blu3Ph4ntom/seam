@@ -124,7 +124,6 @@ mod imp {
                 .unwrap();
             // ESCROW_ACQUIRED (not for wrong-envelope — Fabric will reject and close)
             if mode == "wrong-envelope" {
-                // Give Fabric time to read and reject, then exit (test checks Fabric Err).
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 exit(0);
             }

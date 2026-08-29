@@ -41,6 +41,14 @@ pub fn channel<T>(_fabric: &Fabric) -> (Client<T>, Receiver<T>) {
 pub mod native_file;
 pub use native_file::NativeFile;
 
+/// Ownership-returning transfer result.
+/// `Committed` never carries `T`; `Aborted` only when physical authority restored.
+#[derive(Debug)]
+pub enum TransferOutcome<T> {
+    Committed,
+    Aborted(T),
+}
+
 #[cfg(unix)]
 pub mod fabric_runtime;
 #[cfg(unix)]
