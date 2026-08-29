@@ -944,8 +944,10 @@ mod tests {
 
     #[test]
     fn retained_eviction_cleans_secondary_indexes() {
-        let mut lim = Limits::default();
-        lim.max_retained_results = 2;
+        let lim = Limits {
+            max_retained_results: 2,
+            ..Limits::default()
+        };
         let mut s = FabricState::new(lim);
         let a = peer(1);
         let b = peer(2);
