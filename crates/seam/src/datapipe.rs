@@ -31,6 +31,7 @@ pub struct Producer {
 pub struct Consumer {
     _pid: PipeId,
     stream: UnixStream, // DATA in, CREDIT out
+    #[allow(dead_code)]
     shared: Arc<Shared>,
     framing: Vec<u8>, // raw stream bytes for the in-progress record
     pending: Vec<u8>, // delivered payload surplus not yet handed to app
@@ -42,6 +43,7 @@ pub struct DataPipe {
 }
 
 impl DataPipe {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(pid: PipeId, capacity: usize) -> std::io::Result<(Producer, Consumer)> {
         let credit = CreditTracker::new(capacity)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad capacity"))?;
@@ -215,6 +217,8 @@ impl Consumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
 
     fn pid() -> PipeId {
         PipeId([1; 16])
