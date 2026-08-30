@@ -9,3 +9,6 @@ publish = false
 seam-core = { path = "../seam-core" }
 seam-platform = { path = "../seam-platform" }
 libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winbase", "namedpipeapi", "fileapi", "minwinbase"] }

@@ -1,6 +1,8 @@
 //! seam-process — spawn/bootstrap helper.
 
 pub mod bootstrap;
+#[cfg(windows)]
+pub mod bootstrap_windows;
 
 use seam_core::ids::PeerId;
 
