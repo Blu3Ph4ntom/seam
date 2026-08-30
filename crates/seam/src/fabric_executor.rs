@@ -51,6 +51,7 @@ pub struct RestoreSession {
 }
 
 struct PeerEntry {
+    #[allow(dead_code)]
     peer: PeerId,
     liveness: PeerLiveness,
     control_writer: NativeLane,
@@ -65,6 +66,7 @@ struct PeerEntry {
 struct TransferContext {
     sender: PeerId,
     recipient: PeerId,
+    #[allow(dead_code)]
     tid: TransferId,
     rid: ResourceId,
     mode: crate::threaded_runtime::Mode,
@@ -224,6 +226,8 @@ pub struct FabricExecutor {
     escrow: HashMap<(TransferId, u16), (OwnedFd, [u8; 16])>,
     restore_sessions: HashMap<TransferId, RestoreSession>,
     transfers: HashMap<TransferId, TransferContext>,
+    pending_control: HashMap<TransferId, Vec<(PeerId, Kind, Vec<u8>)>>,
+    pending_native: HashMap<TransferId, Vec<(PeerId, Kind, Vec<u8>, OwnedFd)>>,
     limits: Limits,
     tx: Sender<ExecutorEvent>,
     rx: Receiver<ExecutorEvent>,
@@ -240,6 +244,8 @@ impl FabricExecutor {
             escrow: HashMap::new(),
             restore_sessions: HashMap::new(),
             transfers: HashMap::new(),
+            pending_control: HashMap::new(),
+            pending_native: HashMap::new(),
             limits,
             tx: tx_clone,
             rx,
@@ -347,25 +353,19 @@ impl FabricExecutor {
         let tx = self.tx.clone();
         let peer_c = peer;
         let control_reader_lane = control;
-        // Control reader
-        std::thread::spawn(move || {
-            let mut closed_sent = false;
-            loop {
-                match control_reader_lane.recv_frame(&limits) {
-                    Ok((hdr, body)) => {
-                        let _ = tx.send(ExecutorEvent::ControlFrame {
-                            peer: peer_c,
-                            kind: hdr.kind,
-                            body,
-                        });
-                    }
-                    Err(_) => {
-                        if !closed_sent {
-                            let _ = tx.send(ExecutorEvent::ControlClosed { peer: peer_c });
-                            closed_sent = true;
-                        }
-                        break;
-                    }
+        // Control reader — observation only, emits frames then terminal frontier
+        std::thread::spawn(move || loop {
+            match control_reader_lane.recv_frame(&limits) {
+                Ok((hdr, body)) => {
+                    let _ = tx.send(ExecutorEvent::ControlFrame {
+                        peer: peer_c,
+                        kind: hdr.kind,
+                        body,
+                    });
+                }
+                Err(_) => {
+                    let _ = tx.send(ExecutorEvent::ControlClosed { peer: peer_c });
+                    break;
                 }
             }
         });
@@ -470,8 +470,25 @@ impl FabricExecutor {
                 done: false,
             },
         );
-        // Note: we do not wait here; subsequent ControlFrame/NativeFrame events will drive progression.
-        // If holder already sent Offer/Escrow, those events are already queued and will be processed next.
+        // Drain any early frames that arrived before Transfer context was created.
+        if let Some(pending) = self.pending_control.remove(&tid) {
+            for (p, k, b) in pending {
+                self.handle_control_frame_inner(p, k, b);
+            }
+        }
+        if let Some(pending) = self.pending_native.remove(&tid) {
+            for (p, k, b, f) in pending {
+                self.handle_native_frame_inner(p, k, b, f);
+            }
+        }
+    }
+
+    fn extract_tid_from_body(body: &[u8]) -> Option<TransferId> {
+        if body.len() >= 16 {
+            Some(TransferId(body[0..16].try_into().unwrap()))
+        } else {
+            None
+        }
     }
 
     fn handle_control_frame(&mut self, peer: PeerId, kind: Kind, body: Vec<u8>) {
@@ -480,12 +497,30 @@ impl FabricExecutor {
             self.handle_restore_ack(peer, body);
             return;
         }
-        // Find transfer context that involves this peer
-        // For Offer: sender sends Offer
-        // For Accept: recipient sends Accept
-        // For NativeStaged: recipient
-        // For EscrowAcquired ack? Actually sender receives that, but holder doesn't send it.
-        // So handle per kind.
+        // If no context yet for this tid, buffer for later (covers early Offer/Accept/Staged).
+        let needs_buffer = match kind {
+            Kind::Offer | Kind::Accept | Kind::NativeStaged => {
+                if let Some(tid) = Self::extract_tid_from_body(&body) {
+                    !self.transfers.contains_key(&tid)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if needs_buffer {
+            if let Some(tid) = Self::extract_tid_from_body(&body) {
+                self.pending_control
+                    .entry(tid)
+                    .or_default()
+                    .push((peer, kind, body));
+            }
+            return;
+        }
+        self.handle_control_frame_inner(peer, kind, body);
+    }
+
+    fn handle_control_frame_inner(&mut self, peer: PeerId, kind: Kind, body: Vec<u8>) {
         match kind {
             Kind::Offer => {
                 // Mark offer_seen for relevant transfer where sender == peer and tid matches body
@@ -600,7 +635,27 @@ impl FabricExecutor {
 
     fn handle_native_frame(&mut self, peer: PeerId, kind: Kind, body: Vec<u8>, fd: OwnedFd) {
         if kind != Kind::NativeEscrow {
-            // Unexpected native kind — close fd
+            drop(fd);
+            return;
+        }
+        if body.len() != 36 {
+            drop(fd);
+            return;
+        }
+        let tid = TransferId(body[0..16].try_into().unwrap());
+        if !self.transfers.contains_key(&tid) {
+            // Buffer early escrow until Transfer context exists
+            self.pending_native
+                .entry(tid)
+                .or_default()
+                .push((peer, kind, body, fd));
+            return;
+        }
+        self.handle_native_frame_inner(peer, kind, body, fd);
+    }
+
+    fn handle_native_frame_inner(&mut self, peer: PeerId, kind: Kind, body: Vec<u8>, fd: OwnedFd) {
+        if kind != Kind::NativeEscrow {
             drop(fd);
             return;
         }
@@ -611,11 +666,9 @@ impl FabricExecutor {
         let tid = TransferId(body[0..16].try_into().unwrap());
         let idx = u16::from_le_bytes([body[16], body[17]]);
         let oid_slice: [u8; 16] = body[20..36].try_into().unwrap();
-        // Validate envelope: tid must have transfer context with sender == peer and rid == oid
         let ctx_opt = self.transfers.get(&tid);
         if ctx_opt.is_none() {
             drop(fd);
-            // Could be late duplicate after commit; close
             return;
         }
         let ctx = ctx_opt.unwrap();

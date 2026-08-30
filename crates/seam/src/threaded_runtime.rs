@@ -85,6 +85,7 @@ impl DeathGate {
 
 pub struct ThreadedRuntime {
     handle: Arc<ExecutorHandle>,
+    #[allow(dead_code)]
     limits: Limits,
 }
 
