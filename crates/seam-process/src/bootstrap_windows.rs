@@ -2,10 +2,7 @@
 //! Parent permanent handles are NON-INHERITABLE; child-specific duplicates are
 //! INHERITABLE and placed in PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
 //! No global HandleFlag inheritance window.
-//! NOTE: Windows bootstrap is DESIGN LOCKED, not yet production proven — this
-//! file is a stub that compiles on Windows; full STARTUPINFOEXW logic pending.
 
-#![cfg(FALSE)] // TODO: enable when Windows bootstrap is production proven; currently stub to keep CI green
 #![cfg(windows)]
 
 use std::ffi::OsString;
@@ -38,10 +35,14 @@ pub fn spawn_bootstrap_windows(command_line: &str) -> std::io::Result<BootstrapH
     let child_read_inheritable = duplicate_inheritable(&child_read)?;
 
     // Prepare attribute list
+    const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x20002;
     let mut attr_size: usize = 0;
-    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size) };
+    unsafe {
+        InitializeProcThreadAttributeList(std::ptr::null_mut() as *mut _, 1, 0, &mut attr_size)
+    };
     let mut attr_mem = vec![0u8; attr_size];
-    let attr_list = attr_mem.as_mut_ptr() as *mut winapi::um::winbase::LPPROC_THREAD_ATTRIBUTE_LIST;
+    let attr_list: winapi::um::processthreadsapi::LPPROC_THREAD_ATTRIBUTE_LIST =
+        attr_mem.as_mut_ptr() as *mut _;
     let ok = unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) };
     if ok == 0 {
         return Err(std::io::Error::last_os_error());
@@ -55,7 +56,7 @@ pub fn spawn_bootstrap_windows(command_line: &str) -> std::io::Result<BootstrapH
         UpdateProcThreadAttribute(
             attr_list,
             0,
-            winapi::um::winbase::PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
             handles.as_ptr() as *mut _,
             (handles.len() * std::mem::size_of::<HANDLE>()) as usize,
             std::ptr::null_mut(),
@@ -88,7 +89,7 @@ pub fn spawn_bootstrap_windows(command_line: &str) -> std::io::Result<BootstrapH
             EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
             std::ptr::null_mut(),
             std::ptr::null(),
-            &mut si_ex.StartupInfo as *mut _ as *mut winapi::um::winbase::STARTUPINFOW,
+            &mut si_ex.StartupInfo as *mut _ as *mut _,
             &mut pi,
         )
     };

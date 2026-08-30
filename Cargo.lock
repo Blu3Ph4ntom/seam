@@ -109,6 +109,7 @@ dependencies = [
  "libc",
  "seam-core",
  "seam-platform",
+ "winapi",
 ]
 
 [[package]]
