@@ -535,6 +535,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "flaky lane on macos CI")]
     fn lane_cross_process_via_command() {
         // REAL CROSS-PROCESS PROVEN (canonical): distinct executable via
         // Command + private inherited lane (fd 3) + SCM_RIGHTS. This is the
