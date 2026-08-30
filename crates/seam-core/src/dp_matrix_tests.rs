@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod dp_tests {
     use crate::credit::CreditTracker;
-    use crate::datapipe::{decode_one, encode_credit, encode_data, Decoded, Record};
+    use crate::datapipe::{decode_one, encode_data, Decoded, Record};
 
     #[test]
     fn dp01_basic_flow() {
