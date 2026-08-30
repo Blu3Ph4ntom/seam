@@ -336,7 +336,7 @@ fn threaded_sender_death_after_escrow_abandoned() {
     .expect("spawn holder");
     let (c_b, n_b, child_b) = spawn_peer(
         "recipient",
-        Mode::Success,
+        Mode::SlowAccept,
         &hexstr(&tid.0),
         &hexstr(&rid.0),
         &hexstr(&b.0),
@@ -346,20 +346,17 @@ fn threaded_sender_death_after_escrow_abandoned() {
     rt.add_peer(a, c_a, n_a, child_a).unwrap();
     rt.add_peer(b, c_b, n_b, child_b).unwrap();
     let res = rt.run_native_file(a, b, tid, rid, Mode::Success);
-    // Sender death after escrow should abort (dead-sender) — either Err or Aborted
-    // We check terminal Abandoned, not Held(dead)
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let key = seam_core::authority::AuthorityKey::Resource(rid);
     let auth = rt.authority_lookup(&key);
-    assert_ne!(
+    assert_eq!(
         auth,
-        Some(seam_core::authority::AuthorityState::Held(a)),
-        "must not remain Held(dead sender)"
+        Some(seam_core::authority::AuthorityState::Abandoned),
+        "sender death after escrow must be Abandoned, got {auth:?}"
     );
-    // If completed, should be Aborted or Unknown, never Committed with Held(dead)
-    assert_ne!(
+    assert_eq!(
         rt.status(&tid),
-        seam_core::transfer::TransferStatus::Committed
+        seam_core::transfer::TransferStatus::Aborted
     );
     assert_eq!(rt.escrow_len(), 0, "escrow must settle to zero");
     // Transfer may have returned Err due to sender death

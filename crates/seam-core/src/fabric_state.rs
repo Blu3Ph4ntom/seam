@@ -110,6 +110,27 @@ impl FabricState {
         self.peers.insert(*pid, PeerState::Gone);
     }
 
+    /// Abandon any Held authority for a dead peer (post-terminal holder death).
+    pub fn abandon_held_for_peer(&mut self, peer: PeerId) {
+        let keys: Vec<AuthorityKey> = self
+            .authority
+            .map
+            .iter()
+            .filter_map(|(k, s)| {
+                if *s == crate::authority::AuthorityState::Held(peer) {
+                    Some(*k)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for k in keys {
+            self.authority
+                .map
+                .insert(k, crate::authority::AuthorityState::Abandoned);
+        }
+    }
+
     pub fn peer_gone(&mut self, pid: PeerId) -> Vec<DeathAction> {
         // Exactly-once: if already Gone, no second effects.
         if self.peers.get(&pid) == Some(&PeerState::Gone) {

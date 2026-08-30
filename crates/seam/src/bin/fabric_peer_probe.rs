@@ -131,8 +131,7 @@ mod imp {
                 exit(0);
             }
             if mode == "die-after-escrow" {
-                // Sender dies after escrow, before commit/abort
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                // Sender dies immediately after escrow
                 exit(0);
             }
             let (k, _) = control.recv_frame(&Limits::default()).unwrap();
@@ -196,9 +195,10 @@ mod imp {
         } else {
             // recipient
             if mode == "die-before-accept" {
-                // Die before sending ACCEPT: triggers recipient-death precommit
-                // path; Fabric must restore the physical capability to sender.
                 exit(0);
+            }
+            if mode == "slow-accept" {
+                std::thread::sleep(std::time::Duration::from_millis(300));
             }
             control
                 .send_frame(&header(Kind::Accept, 16), &tid.0)

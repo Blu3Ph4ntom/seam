@@ -173,6 +173,7 @@ pub enum Mode {
     DieAfterEscrow,
     DieBeforeAck,
     AckThenExit,
+    SlowAccept,
 }
 
 #[derive(Debug)]
@@ -232,6 +233,7 @@ pub fn spawn_peer(
         Mode::DieAfterEscrow => "die-after-escrow",
         Mode::DieBeforeAck => "die-before-ack",
         Mode::AckThenExit => "ack-then-exit",
+        Mode::SlowAccept => "slow-accept",
     });
     cmd.arg("--transfer-id").arg(tid_hex);
     cmd.arg("--resource-id").arg(rid_hex);

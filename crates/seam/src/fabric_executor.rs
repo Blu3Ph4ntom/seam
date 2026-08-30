@@ -48,6 +48,7 @@ pub struct RestoreSession {
     pub recipient: PeerId,
     pub oid: [u8; 16],
     pub state: RestoreState,
+    pub pending_ack: bool,
 }
 
 struct PeerEntry {
@@ -947,6 +948,7 @@ impl FabricExecutor {
                 recipient: self.transfers.get(&tid).unwrap().recipient,
                 oid,
                 state: RestoreState::SendInFlight,
+                pending_ack: false,
             },
         );
         let writer = match self.peers.get(&sender) {
@@ -997,6 +999,11 @@ impl FabricExecutor {
                 if sess.sender == peer {
                     if success {
                         sess.state = RestoreState::AwaitingAck;
+                        if sess.pending_ack {
+                            // Ack arrived early before effect completed — now honor it
+                            drop(sess);
+                            self.handle_restore_ack(peer, tid.0.to_vec());
+                        }
                     } else {
                         sess.state = RestoreState::Failed;
                         let _ = self.state.finish_abort_dead(tid);
@@ -1016,6 +1023,13 @@ impl FabricExecutor {
             return;
         }
         let tid = TransferId(body[0..16].try_into().unwrap());
+        // Early ack while still SendInFlight — buffer
+        if let Some(sess) = self.restore_sessions.get_mut(&tid) {
+            if sess.sender == peer && sess.state == RestoreState::SendInFlight {
+                sess.pending_ack = true;
+                return;
+            }
+        }
         let sess = match self.restore_sessions.get(&tid) {
             Some(s) => s,
             None => return,
@@ -1164,6 +1178,7 @@ impl FabricExecutor {
                         recipient: peer,
                         oid,
                         state: RestoreState::SendInFlight,
+                        pending_ack: false,
                     },
                 );
                 let escrow_fd = match self.escrow.get(&(tid, 0)).map(|(f, _)| dup_owned(f)) {
@@ -1202,6 +1217,7 @@ impl FabricExecutor {
                     });
                 });
             }
+            self.state.abandon_held_for_peer(peer);
             return;
         }
         let control_closed = self
@@ -1280,6 +1296,7 @@ impl FabricExecutor {
                             recipient: peer,
                             oid,
                             state: RestoreState::SendInFlight,
+                            pending_ack: false,
                         },
                     );
                     // Capture needed vars for spawn
@@ -1339,6 +1356,8 @@ impl FabricExecutor {
                 DeathAction::LeaveCommitted { .. } => {}
             }
         }
+        // Post-terminal holder death: ensure no Held(dead) remains
+        self.state.abandon_held_for_peer(peer);
     }
 
     fn complete_transfer(&mut self, tid: TransferId, committed: bool) {
@@ -1622,6 +1641,7 @@ mod executor_tests {
                 recipient,
                 oid: rid.0,
                 state: RestoreState::AwaitingAck,
+                pending_ack: false,
             },
         );
         // Now test ordering: ProcessExited arrives first (sender still alive, but we simulate sender exit after ack)
@@ -1700,6 +1720,7 @@ mod executor_tests {
                 recipient,
                 oid: rid.0,
                 state: RestoreState::AwaitingAck,
+                pending_ack: false,
             },
         );
         // Sender dies before ack, control closes without ack
@@ -1762,6 +1783,7 @@ mod executor_tests {
                     recipient,
                     oid: rid.0,
                     state: RestoreState::AwaitingAck,
+                    pending_ack: false,
                 },
             );
             // Alternate ordering based on i
