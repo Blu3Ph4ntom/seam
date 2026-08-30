@@ -51,6 +51,7 @@ pub enum TransferOutcome<T> {
 
 #[cfg(unix)]
 pub mod fabric_executor;
+pub mod fabric_executor_core;
 #[cfg(unix)]
 pub mod fabric_runtime;
 #[cfg(unix)]
