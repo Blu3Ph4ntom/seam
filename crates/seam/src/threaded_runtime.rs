@@ -140,12 +140,12 @@ fn spawn_reader(
                 }
             }
         }
-        // Reader OBSERVES ONLY. Exactly one observer wins the death gate and
-        // reports death to the central driver, which performs the semantic
-        // transition and all physical restoration outside the state lock.
-        if gate.try_gone() {
-            let _ = tx.send(DriverEvent::PeerGone);
-        }
+        // Reader OBSERVES ONLY. Signal death on THIS channel regardless of
+        // gate winner: the driver may be blocked on either control or native.
+        // handle_death performs peer_gone idempotently, so exactly one semantic
+        // transition occurs even if both channels deliver PeerGone.
+        let _ = gate.try_gone();
+        let _ = tx.send(DriverEvent::PeerGone);
     })
 }
 
