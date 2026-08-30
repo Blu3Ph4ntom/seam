@@ -98,8 +98,8 @@ impl DeathGate {
 struct PeerRuntime {
     #[allow(dead_code)]
     peer: PeerId,
-    control_rx: Receiver<DriverEvent>,
-    native_rx: Receiver<DriverEvent>,
+    control_rx: Arc<Mutex<Receiver<DriverEvent>>>,
+    native_rx: Arc<Mutex<Receiver<DriverEvent>>>,
     death_gate: Arc<DeathGate>,
     child: Option<Child>,
     _control_handle: Option<JoinHandle<()>>,
@@ -108,7 +108,9 @@ struct PeerRuntime {
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_reader(
+    peer: PeerId,
     gate: Arc<DeathGate>,
+    death_tx: Sender<PeerId>,
     tx: Sender<DriverEvent>,
     control: Option<NativeLane>,
     native: Option<NativeLane>,
@@ -142,11 +144,12 @@ fn spawn_reader(
                 }
             }
         }
-        // Reader OBSERVES ONLY. Signal death on THIS channel regardless of
-        // gate winner: the driver may be blocked on either control or native.
-        // handle_death performs peer_gone idempotently, so exactly one semantic
-        // transition occurs even if both channels deliver PeerGone.
+        // Reader OBSERVES ONLY. Report death to the central supervisor AND
+        // wake any local waiter blocked on our channel. The supervisor and the
+        // waiting driver both call handle_death, which is idempotent (peer_gone
+        // yields actions only from the first caller).
         let _ = gate.try_gone();
+        let _ = death_tx.send(peer);
         let _ = tx.send(DriverEvent::PeerGone);
     })
 }
@@ -157,6 +160,9 @@ pub struct ThreadedRuntime {
     control_writers: Mutex<HashMap<PeerId, NativeLane>>,
     native_writers: Mutex<HashMap<PeerId, NativeLane>>,
     escrow: Arc<Mutex<EscrowMap>>,
+    // Central always-running death supervisor.
+    death_tx: Sender<PeerId>,
+    supervisor: Mutex<Option<JoinHandle<()>>>,
     limits: Limits,
 }
 
@@ -172,14 +178,34 @@ fn dup_lane(lane: &NativeLane) -> std::io::Result<NativeLane> {
 
 impl ThreadedRuntime {
     pub fn new(limits: Limits) -> Arc<Self> {
-        Arc::new(Self {
+        let (death_tx, death_rx) = mpsc::channel::<PeerId>();
+        let rt = Arc::new(Self {
             state: Arc::new(Mutex::new(FabricState::new(limits.clone()))),
             peers: Mutex::new(HashMap::new()),
             control_writers: Mutex::new(HashMap::new()),
             native_writers: Mutex::new(HashMap::new()),
             escrow: Arc::new(Mutex::new(HashMap::new())),
+            death_tx,
+            supervisor: Mutex::new(None),
             limits,
-        })
+        });
+        // Supervisor: consumes death events promptly, independent of any
+        // application recv_* call. handle_death is idempotent.
+        let weak = Arc::downgrade(&rt);
+        let handle = std::thread::spawn(move || loop {
+            match death_rx.recv() {
+                Ok(peer) => {
+                    if let Some(runtime) = weak.upgrade() {
+                        runtime.handle_death(&peer);
+                    } else {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        });
+        *rt.supervisor.lock().unwrap() = Some(handle);
+        rt
     }
 
     pub fn add_peer(
@@ -207,22 +233,33 @@ impl ThreadedRuntime {
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<DriverEvent>();
         let (nat_tx, nat_rx) = mpsc::channel::<DriverEvent>();
         let limits = self.limits.clone();
+        let death_tx = self.death_tx.clone();
         let c_h = spawn_reader(
+            peer,
             Arc::clone(&gate),
+            death_tx.clone(),
             ctrl_tx,
             Some(control),
             None,
             limits.clone(),
         );
-        let n_h = spawn_reader(Arc::clone(&gate), nat_tx, None, Some(native), limits);
+        let n_h = spawn_reader(
+            peer,
+            Arc::clone(&gate),
+            death_tx,
+            nat_tx,
+            None,
+            Some(native),
+            limits,
+        );
         self.control_writers.lock().unwrap().insert(peer, control_w);
         self.native_writers.lock().unwrap().insert(peer, native_w);
         self.peers.lock().unwrap().insert(
             peer,
             PeerRuntime {
                 peer,
-                control_rx: ctrl_rx,
-                native_rx: nat_rx,
+                control_rx: Arc::new(Mutex::new(ctrl_rx)),
+                native_rx: Arc::new(Mutex::new(nat_rx)),
                 death_gate: gate,
                 child: Some(child),
                 _control_handle: Some(c_h),
@@ -233,13 +270,18 @@ impl ThreadedRuntime {
     }
 
     fn recv_control(&self, peer: &PeerId) -> Result<(Kind, Vec<u8>), String> {
-        let ev = self
-            .peers
+        // Clone the receiver handle under the map lock, release the map lock,
+        // then block: the global peer registry is never held across recv().
+        let rx = {
+            let peers = self.peers.lock().unwrap();
+            let rt = peers.get(peer).ok_or("peer gone")?;
+            Arc::clone(&rt.control_rx)
+        };
+        let ev = rx
             .lock()
             .unwrap()
-            .get(peer)
-            .and_then(|rt| rt.control_rx.recv().ok())
-            .ok_or("peer gone")?;
+            .recv()
+            .map_err(|_| "control channel closed".into())?;
         match ev {
             DriverEvent::Control { kind, body } => Ok((kind, body)),
             DriverEvent::Native { .. } => Err("unexpected native on control".into()),
@@ -251,13 +293,16 @@ impl ThreadedRuntime {
     }
 
     fn recv_native(&self, peer: &PeerId) -> Result<(Kind, Vec<u8>, OwnedFd), String> {
-        let ev = self
-            .peers
+        let rx = {
+            let peers = self.peers.lock().unwrap();
+            let rt = peers.get(peer).ok_or("peer gone")?;
+            Arc::clone(&rt.native_rx)
+        };
+        let ev = rx
             .lock()
             .unwrap()
-            .get(peer)
-            .and_then(|rt| rt.native_rx.recv().ok())
-            .ok_or("peer gone")?;
+            .recv()
+            .map_err(|_| "native channel closed".into())?;
         match ev {
             DriverEvent::Native { kind, body, fd } => {
                 let fd = fd.ok_or("native without fd")?;
@@ -307,8 +352,13 @@ impl ThreadedRuntime {
                                 )
                                 .is_ok();
                             if ok {
-                                if let Ok((k, _)) = self.recv_control(&sender) {
-                                    if k == Kind::RestoreAck {
+                                if let Ok((k, body)) = self.recv_control(&sender) {
+                                    // RESTORE_ACK must be transaction-specific: exact
+                                    // kind + exact 16-byte TransferId, nothing else.
+                                    let valid_ack = k == Kind::RestoreAck
+                                        && body.len() == 16
+                                        && body[..16] == tid.0;
+                                    if valid_ack {
                                         {
                                             let mut st = self.state.lock().unwrap();
                                             let _ = st.finish_abort_restore(tid);
@@ -363,13 +413,16 @@ impl ThreadedRuntime {
     }
 
     fn reap(&self, peer: &PeerId) -> Result<(), String> {
-        let mut peers = self.peers.lock().unwrap();
-        if let Some(rt) = peers.get_mut(peer) {
-            if let Some(mut child) = rt.child.take() {
-                let status = child.wait().map_err(|e| format!("wait {e}"))?;
-                if !status.success() {
-                    return Err(format!("child exited {status:?}"));
-                }
+        // Take the child under the map lock, release it, then wait: the global
+        // registry is never held across a blocking process wait.
+        let child = {
+            let mut peers = self.peers.lock().unwrap();
+            peers.get_mut(peer).and_then(|rt| rt.child.take())
+        };
+        if let Some(mut child) = child {
+            let status = child.wait().map_err(|e| format!("wait {e}"))?;
+            if !status.success() {
+                return Err(format!("child exited {status:?}"));
             }
         }
         Ok(())
@@ -378,10 +431,14 @@ impl ThreadedRuntime {
     /// Drain late/duplicate native events for a peer and close their fds.
     /// Late natives after COMMIT/ABORT must never leak descriptors.
     fn close_late_natives(&self, peer: &PeerId) {
-        let peers = self.peers.lock().unwrap();
-        if let Some(rt) = peers.get(peer) {
+        let rx = {
+            let peers = self.peers.lock().unwrap();
+            peers.get(peer).map(|rt| Arc::clone(&rt.native_rx))
+        };
+        if let Some(rx) = rx {
+            let mut rx = rx.lock().unwrap();
             loop {
-                match rt.native_rx.try_recv() {
+                match rx.try_recv() {
                     Ok(DriverEvent::Native { fd: Some(fd), .. }) => drop(fd),
                     Ok(_) => {}
                     Err(_) => break,
