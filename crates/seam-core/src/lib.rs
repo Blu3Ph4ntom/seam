@@ -4,6 +4,8 @@
 pub mod authority;
 pub mod credit;
 pub mod datapipe;
+#[cfg(test)]
+mod dp_matrix_tests;
 pub mod fabric;
 pub mod fabric_state;
 pub mod ids;
