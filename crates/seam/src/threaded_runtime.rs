@@ -15,7 +15,7 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
-use seam_core::fabric_state::FabricState;
+use seam_core::fabric_state::{DeathAction, FabricState};
 use seam_core::ids::{PeerId, ResourceId, TransferId};
 use seam_core::limits::Limits;
 use seam_core::wire::{Header, Kind, CURRENT_MAJOR, CURRENT_MINOR, MAGIC};
@@ -103,6 +103,7 @@ fn spawn_reader(
     peer: PeerId,
     gate: Arc<DeathGate>,
     state: Arc<Mutex<FabricState>>,
+    escrow: Arc<Mutex<HashMap<(TransferId, u16), OwnedFd>>>,
     tx: Sender<DriverEvent>,
     control: Option<NativeLane>,
     native: Option<NativeLane>,
@@ -136,11 +137,22 @@ fn spawn_reader(
                 }
             }
         }
-        // Peer observed dead (lane EOF/error). Exactly one reader performs the
-        // semantic death transition; both notify the driver.
-        if gate.try_gone() {
+        // Peer observed dead (lane EOF/error). Exactly one reader performs
+        // the semantic death transition and executes physical escrow cleanup
+        // outside the FabricState lock.
+        let actions = if gate.try_gone() {
             let mut st = state.lock().unwrap();
-            let _actions = st.peer_gone(peer);
+            st.peer_gone(peer)
+        } else {
+            Vec::new()
+        };
+        for act in actions {
+            match act {
+                DeathAction::AbortDeadSender { tid } | DeathAction::RestoreToSender { tid, .. } => {
+                    escrow.lock().unwrap().remove(&(tid, 0));
+                }
+                DeathAction::LeaveCommitted { .. } => {}
+            }
         }
         let _ = tx.send(DriverEvent::PeerGone);
     })
@@ -151,7 +163,7 @@ pub struct ThreadedRuntime {
     peers: Mutex<HashMap<PeerId, PeerRuntime>>,
     control_writers: Mutex<HashMap<PeerId, NativeLane>>,
     native_writers: Mutex<HashMap<PeerId, NativeLane>>,
-    escrow: Mutex<HashMap<(TransferId, u16), OwnedFd>>,
+    escrow: Arc<Mutex<HashMap<(TransferId, u16), OwnedFd>>>,
     limits: Limits,
 }
 
@@ -172,7 +184,7 @@ impl ThreadedRuntime {
             peers: Mutex::new(HashMap::new()),
             control_writers: Mutex::new(HashMap::new()),
             native_writers: Mutex::new(HashMap::new()),
-            escrow: Mutex::new(HashMap::new()),
+            escrow: Arc::new(Mutex::new(HashMap::new())),
             limits,
         })
     }
@@ -207,6 +219,7 @@ impl ThreadedRuntime {
             peer,
             Arc::clone(&gate),
             Arc::clone(&state_clone),
+            Arc::clone(&self.escrow),
             ctrl_tx,
             Some(control),
             None,
@@ -216,6 +229,7 @@ impl ThreadedRuntime {
             peer,
             Arc::clone(&gate),
             state_clone,
+            Arc::clone(&self.escrow),
             nat_tx,
             None,
             Some(native),
