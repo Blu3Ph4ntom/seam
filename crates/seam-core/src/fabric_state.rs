@@ -106,6 +106,19 @@ impl FabricState {
         self.authority.lookup(key)
     }
 
+    pub fn authority_iter(
+        &self,
+    ) -> impl Iterator<Item = (&AuthorityKey, &crate::authority::AuthorityState)> {
+        self.authority.map.iter()
+    }
+
+    pub fn has_held(&self, peer: PeerId) -> bool {
+        self.authority
+            .map
+            .values()
+            .any(|s| *s == crate::authority::AuthorityState::Held(peer))
+    }
+
     pub fn remove_peer(&mut self, pid: &PeerId) {
         self.peers.insert(*pid, PeerState::Gone);
     }

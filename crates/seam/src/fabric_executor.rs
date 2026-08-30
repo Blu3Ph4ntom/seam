@@ -1229,14 +1229,23 @@ impl FabricExecutor {
         if !control_closed {
             return;
         }
-        // Defer FabricState peer_gone until there is at least one transfer involving this peer.
-        // If death happens before any transfer, keep Dying and let future Transfer trigger restore.
+        // Defer FabricState peer_gone until there is at least one transfer involving this peer,
+        // unless the peer already holds some authority (post-terminal death).
         let has_involved = self
             .transfers
             .values()
             .any(|c| c.recipient == peer || c.sender == peer);
         if !has_involved {
-            // No transfer yet — keep Dying, defer Gone until transfer arrives
+            // Check if peer holds any already-Held authority (post-terminal)
+            let has_held = self.state.has_held(peer);
+            if has_held {
+                if let Some(e) = self.peers.get_mut(&peer) {
+                    e.liveness = PeerLiveness::Gone;
+                }
+                self.state.abandon_held_for_peer(peer);
+                return;
+            }
+            // No transfer yet and no held — keep Dying, defer Gone until transfer arrives
             return;
         }
         // Now call FabricState peer_gone exactly once

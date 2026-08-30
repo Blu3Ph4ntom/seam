@@ -346,9 +346,19 @@ fn threaded_sender_death_after_escrow_abandoned() {
     rt.add_peer(a, c_a, n_a, child_a).unwrap();
     rt.add_peer(b, c_b, n_b, child_b).unwrap();
     let res = rt.run_native_file(a, b, tid, rid, Mode::Success);
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Poll for terminal state (death handling is async via ControlClosed frontier)
     let key = seam_core::authority::AuthorityKey::Resource(rid);
-    let auth = rt.authority_lookup(&key);
+    let mut auth = None;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        auth = rt.authority_lookup(&key);
+        if auth == Some(seam_core::authority::AuthorityState::Abandoned)
+            && rt.status(&tid) == seam_core::transfer::TransferStatus::Aborted
+            && rt.escrow_len() == 0
+        {
+            break;
+        }
+    }
     assert_eq!(
         auth,
         Some(seam_core::authority::AuthorityState::Abandoned),

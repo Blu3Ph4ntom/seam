@@ -173,6 +173,8 @@ mod imp {
                 control
                     .send_frame(&header(Kind::RestoreAck, 16), &tid.0)
                     .unwrap();
+                // Stay alive briefly so fabric can observe Held before holder exit
+                std::thread::sleep(std::time::Duration::from_millis(200));
                 exit(0);
             } else if mode == "die-before-ack" {
                 let (k2, _b, fd2) = native.recv_frame_fd(&Limits::default()).unwrap();
