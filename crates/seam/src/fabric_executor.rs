@@ -425,19 +425,29 @@ impl FabricExecutor {
         mode: crate::threaded_runtime::Mode,
         reply: Sender<Result<Diagnostics, String>>,
     ) {
-        // Check peer liveness
-        let sender_live = self
+        // Check peer existence — allow Dying recipient for death-before-accept restore path
+        let sender_exists = self
             .peers
             .get(&sender)
-            .map(|e| e.liveness == PeerLiveness::Active)
+            .map(|e| e.liveness != PeerLiveness::Gone)
             .unwrap_or(false);
-        let recipient_live = self
+        let recipient_exists = self
             .peers
             .get(&recipient)
-            .map(|e| e.liveness == PeerLiveness::Active)
+            .map(|e| e.liveness != PeerLiveness::Gone)
             .unwrap_or(false);
-        if !sender_live || !recipient_live {
-            let _ = reply.send(Err("peer not active".into()));
+        if !sender_exists || !recipient_exists {
+            let _ = reply.send(Err("peer gone".into()));
+            return;
+        }
+        // Sender must be Active (cannot start transfer from a dying sender)
+        if self
+            .peers
+            .get(&sender)
+            .map(|e| e.liveness != PeerLiveness::Active)
+            .unwrap_or(true)
+        {
+            let _ = reply.send(Err("sender not active".into()));
             return;
         }
         let key = AuthorityKey::Resource(rid);
@@ -480,6 +490,38 @@ impl FabricExecutor {
             for (p, k, b, f) in pending {
                 self.handle_native_frame_inner(p, k, b, f);
             }
+        }
+        // Hostile wrong envelope that arrived early under a wrong tid — check pending_native for any
+        // entry from this sender whose body tid != correct tid (still buffered under wrong key)
+        let mut wrong_found = None;
+        for (wrong_tid, vec) in &self.pending_native {
+            for (p, _, body, _) in vec {
+                if *p == sender && *wrong_tid != tid && body.len() == 36 {
+                    wrong_found = Some(*wrong_tid);
+                    break;
+                }
+            }
+            if wrong_found.is_some() {
+                break;
+            }
+        }
+        if let Some(wrong_tid) = wrong_found {
+            if let Some(v) = self.pending_native.remove(&wrong_tid) {
+                for (_, _, _, fd) in v {
+                    drop(fd);
+                }
+            }
+            self.fail_transfer(tid, "wrong transfer envelope".into());
+            return;
+        }
+        // If recipient already reached control frontier before Transfer insertion, finalize immediately.
+        let recipient_closed = self
+            .peers
+            .get(&recipient)
+            .map(|e| e.control_closed)
+            .unwrap_or(false);
+        if recipient_closed {
+            self.try_finalize_peer(recipient);
         }
     }
 
@@ -644,7 +686,18 @@ impl FabricExecutor {
         }
         let tid = TransferId(body[0..16].try_into().unwrap());
         if !self.transfers.contains_key(&tid) {
-            // Buffer early escrow until Transfer context exists
+            // Hostile wrong envelope: if this peer has a pending transfer without escrow, fail it
+            if let Some(correct_tid) = self
+                .transfers
+                .iter()
+                .find(|(_, c)| c.sender == peer && !c.escrow_seen)
+                .map(|(t, _)| *t)
+            {
+                drop(fd);
+                self.fail_transfer(correct_tid, "wrong transfer envelope".into());
+                return;
+            }
+            // Otherwise buffer early escrow until Transfer context exists
             self.pending_native
                 .entry(tid)
                 .or_default()
@@ -1199,10 +1252,11 @@ impl FabricExecutor {
                 return;
             }
             ctx.done = true;
+            if committed {
+                self.escrow.remove(&(tid, 0));
+            }
             let ledger_after = format!("{:?}", self.state.status(&tid));
             let escrow_count_after = self.escrow.len();
-            // For abort via restore, ledger should be Aborted, for commit Committed
-            // For death without reply? Still complete.
             let diag = Diagnostics {
                 fabric_pid: std::process::id(),
                 sender_pid: 0,
@@ -1215,61 +1269,17 @@ impl FabricExecutor {
             };
             if let Some(reply) = ctx.reply.take() {
                 if committed {
-                    // Success path expects Ok(diag)
+                    let _ = reply.send(Ok(diag));
+                } else if ctx.staged_seen {
+                    // Normal abort where recipient staged then fabric aborted
                     let _ = reply.send(Ok(diag));
                 } else {
-                    // For abort/restore cases initiated via Transfer command, the original
-                    // run_native_file expects Ok(diag) for abort (Mode::Abort) vs Err for death?
-                    // In death case, run_native_file currently expects Err (recipient death).
-                    // We need to decide: For normal Abort (recipient staged then abort) we return Ok.
-                    // For death-driven abort (recipient died before accept) we return Err to match existing test
-                    // threaded_recipient_death_precommit_restores_sender expects Err.
-                    // Check mode: if mode == Abort and death occurred, is it normal abort or death?
-                    // The test calls run_native_file with Mode::Abort while recipient does DieBeforeAccept.
-                    // That test expects Err. So death abort should be Err.
-                    // We can distinguish: if restoration happened via death path (restore_sessions) then Err.
-                    // Simpler: if ctx.mode == Abort and we are completing via death (i.e., peer was dying) we send Err.
-                    // But current complete_transfer is called from multiple places; we need to know if it's death.
-                    // For now, if tid corresponds to a death that triggered restore, we send Err.
-                    // We can check if transfer was initiated with Mode::Abort but recipient is Dying/Gone: then Err.
-                    let peer_dying = self
-                        .peers
-                        .get(&ctx.recipient)
-                        .map(|e| e.liveness != PeerLiveness::Active)
-                        .unwrap_or(false);
-                    if peer_dying
-                        || ctx.mode == crate::threaded_runtime::Mode::Abort
-                            && committed == false
-                            && self.state.status(&tid) == TransferStatus::Aborted
-                    {
-                        // Heuristic: if recipient died, return Err
-                        // Check if recipient liveness is Dying/Gone
-                        if peer_dying {
-                            let _ = reply.send(Err("recipient death abort".into()));
-                        } else {
-                            let _ = reply.send(Ok(diag));
-                        }
-                    } else if committed {
-                        let _ = reply.send(Ok(diag));
-                    } else {
-                        // For normal abort with Mode::Abort where recipient staged, we previously returned Ok
-                        // Let's check if staged_seen was true: then it's normal abort
-                        if ctx.staged_seen {
-                            let _ = reply.send(Ok(diag));
-                        } else {
-                            let _ = reply.send(Err("aborted".into()));
-                        }
-                    }
+                    // Recipient died before accept/staged — restore path, caller expects Err
+                    let _ = reply.send(Err("recipient death abort".into()));
                 }
             }
-            // Ensure escrow cleanup for committed case already removed earlier? For commit we removed after commit.
-            // For abort via restore, escrow removed on ack. For death without ack, removed.
-            // For success commit, escrow should be removed.
-            if committed {
-                self.escrow.remove(&(tid, 0));
-            }
         } else {
-            // No context — maybe death-driven transfer where reply already gone; just ensure escrow cleaned via earlier paths
+            // No context — maybe death-driven transfer where reply already gone
         }
     }
 
