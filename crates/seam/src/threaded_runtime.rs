@@ -587,13 +587,15 @@ pub fn spawn_peer(
     peer_hex: &str,
     bin: &str,
 ) -> std::io::Result<(NativeLane, NativeLane, Child)> {
-    use std::os::unix::io::IntoRawFd;
+    use std::os::unix::io::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::process::Command;
     let (c_p, c_c) = NativeLane::pair()?; // control: parent c_p, child c_c
     let (n_p, n_c) = NativeLane::pair()?; // native: parent n_p, child n_c
-    let c_raw = c_c.into_owned_fd().into_raw_fd();
-    let n_raw = n_c.into_owned_fd().into_raw_fd();
+    let c_child_owned = c_c.into_owned_fd();
+    let n_child_owned = n_c.into_owned_fd();
+    let c_raw = c_child_owned.as_raw_fd();
+    let n_raw = n_child_owned.as_raw_fd();
     let mut cmd = Command::new(bin);
     cmd.arg("--role").arg(role);
     cmd.arg("--mode").arg(match mode {
@@ -622,6 +624,12 @@ pub fn spawn_peer(
         });
     }
     let child = cmd.spawn()?;
+    // Close the parent copies of the child-side lane fds now that dup2 has
+    // placed them at fixed descriptors in the child. Without this the parent
+    // keeps the socketpair peer end open, so lane EOF never fires when the
+    // child exits and death detection hangs.
+    drop(c_child_owned);
+    drop(n_child_owned);
     Ok((c_p, n_p, child))
 }
 
