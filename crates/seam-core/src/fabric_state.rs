@@ -101,6 +101,11 @@ impl FabricState {
         self.peers.get(pid).copied()
     }
 
+    /// Public read-only authority lookup for diagnostics/tests.
+    pub fn authority_lookup(&self, key: &AuthorityKey) -> Option<crate::authority::AuthorityState> {
+        self.authority.lookup(key)
+    }
+
     pub fn remove_peer(&mut self, pid: &PeerId) {
         self.peers.insert(*pid, PeerState::Gone);
     }

@@ -298,7 +298,7 @@ fn threaded_recipient_death_precommit_restores_sender() {
         let st = rt.state.lock().unwrap();
         let key = seam_core::authority::AuthorityKey::Resource(rid);
         assert_eq!(
-            st.authority.lookup(&key),
+            st.authority_lookup(&key),
             Some(seam_core::authority::AuthorityState::Held(a))
         );
         assert_eq!(
