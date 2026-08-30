@@ -281,7 +281,7 @@ impl ThreadedRuntime {
             .lock()
             .unwrap()
             .recv()
-            .map_err(|_| "control channel closed".into())?;
+            .map_err(|_| String::from("control channel closed"))?;
         match ev {
             DriverEvent::Control { kind, body } => Ok((kind, body)),
             DriverEvent::Native { .. } => Err("unexpected native on control".into()),
@@ -302,7 +302,7 @@ impl ThreadedRuntime {
             .lock()
             .unwrap()
             .recv()
-            .map_err(|_| "native channel closed".into())?;
+            .map_err(|_| String::from("native channel closed"))?;
         match ev {
             DriverEvent::Native { kind, body, fd } => {
                 let fd = fd.ok_or("native without fd")?;
