@@ -1599,7 +1599,6 @@ mod executor_tests {
         );
         // Simulate escrow
         let (a, b) = NativeLane::pair().unwrap();
-        use std::os::unix::io::AsRawFd;
         let fd = unsafe { OwnedFd::from_raw_fd(libc::dup(a.as_raw_fd())) };
         drop(a);
         drop(b);
@@ -1614,7 +1613,7 @@ mod executor_tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, DeathAction::RestoreToSender { .. })));
-        // Create restore session as executor would
+        // Create restore session as executor would (peer_gone already moved to Restoring)
         exec.restore_sessions.insert(
             tid,
             RestoreSession {
@@ -1625,7 +1624,6 @@ mod executor_tests {
                 state: RestoreState::AwaitingAck,
             },
         );
-        exec.state.decide_abort(tid).unwrap();
         // Now test ordering: ProcessExited arrives first (sender still alive, but we simulate sender exit after ack)
         // Actually for this test, sender is the one that will ack then exit.
         // Simulate: ProcessExited for sender arrives BEFORE RestoreAck is processed, but Ack was sent before close.
@@ -1688,7 +1686,6 @@ mod executor_tests {
             },
         );
         let (a, b) = NativeLane::pair().unwrap();
-        use std::os::unix::io::AsRawFd;
         let fd = unsafe { OwnedFd::from_raw_fd(libc::dup(a.as_raw_fd())) };
         drop(a);
         drop(b);
@@ -1751,7 +1748,6 @@ mod executor_tests {
                 },
             );
             let (a, b) = NativeLane::pair().unwrap();
-            use std::os::unix::io::AsRawFd;
             let fd = unsafe { OwnedFd::from_raw_fd(libc::dup(a.as_raw_fd())) };
             drop(a);
             drop(b);
