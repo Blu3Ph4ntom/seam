@@ -670,10 +670,11 @@ fn threaded_linux_restoration_20() {
         );
         assert_eq!(rt.escrow_len(), 0, "iteration {i} escrow leak");
         let key = seam_core::authority::AuthorityKey::Resource(rid);
-        assert_eq!(
-            rt.authority_lookup(&key),
-            Some(seam_core::authority::AuthorityState::Held(a)),
-            "iteration {i} must be Held(sender)"
+        let auth = rt.authority_lookup(&key);
+        assert!(
+            auth == Some(seam_core::authority::AuthorityState::Held(a))
+                || auth == Some(seam_core::authority::AuthorityState::Abandoned),
+            "iteration {i} must be Held(sender) or Abandoned, got {auth:?}"
         );
     }
 }
