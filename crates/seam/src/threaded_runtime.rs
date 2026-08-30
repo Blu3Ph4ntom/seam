@@ -99,6 +99,7 @@ struct PeerRuntime {
     _native_handle: Option<JoinHandle<()>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_reader(
     peer: PeerId,
     gate: Arc<DeathGate>,
