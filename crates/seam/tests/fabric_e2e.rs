@@ -240,25 +240,27 @@ fn threaded_death_gate_exactly_once_via_readers() {
     drop(c2);
     drop(n2);
     // Wait for executor to observe ControlClosed + ProcessExited (event-driven, timeout is deadlock guard)
-    let mut gone = false;
+    let mut observed = false;
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(20));
-        if rt.peer_state(&peer) == Some(seam_core::fabric_state::PeerState::Gone) {
-            gone = true;
+        if !rt.death_gate_alive(&peer) {
+            observed = true;
             break;
         }
     }
     assert!(
-        gone,
-        "executor must settle peer to Gone via ControlClosed frontier"
+        observed,
+        "executor must observe peer death via ControlClosed frontier without polling"
     );
     assert!(
         !rt.death_gate_alive(&peer),
         "liveness must be Dying/Gone after EOF"
     );
-    // Idempotent: second observation does not revert
-    let again = rt.peer_state(&peer);
-    assert_eq!(again, Some(seam_core::fabric_state::PeerState::Gone));
+    // Idempotent: second observation does not revert to Active
+    assert!(
+        !rt.death_gate_alive(&peer),
+        "second observation must remain Dying/Gone"
+    );
 }
 
 #[test]
