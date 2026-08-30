@@ -163,6 +163,9 @@ pub struct ThreadedRuntime {
     // Central always-running death supervisor.
     death_tx: Sender<PeerId>,
     supervisor: Mutex<Option<JoinHandle<()>>>,
+    // Serializes death restoration per transfer: whichever thread wins the
+    // actions blocks others until the physical restore settles.
+    restore_guards: Mutex<HashMap<TransferId, Arc<(Mutex<()>, Condvar)>>>,
     limits: Limits,
 }
 
@@ -187,6 +190,7 @@ impl ThreadedRuntime {
             escrow: Arc::new(Mutex::new(HashMap::new())),
             death_tx,
             supervisor: Mutex::new(None),
+            restore_guards: Mutex::new(HashMap::new()),
             limits,
         });
         // Supervisor: consumes death events promptly, independent of any
@@ -314,13 +318,29 @@ impl ThreadedRuntime {
     }
 
     /// Central death orchestration. Exactly one semantic transition (peer_gone
-    /// is idempotent), then physical actions executed outside the state lock.
+    /// is idempotent); restore execution is serialized per transfer so a racing
+    /// supervisor/waiter blocks until settlement rather than observing a
+    /// half-restored state.
     pub fn handle_death(&self, peer: &PeerId) {
         let actions = {
             let mut st = self.state.lock().unwrap();
             st.peer_gone(*peer)
         };
         for act in actions {
+            let tid = match act {
+                DeathAction::AbortDeadSender { tid } | DeathAction::RestoreToSender { tid, .. } => {
+                    tid
+                }
+                DeathAction::LeaveCommitted { .. } => continue,
+            };
+            let guard = {
+                let mut m = self.restore_guards.lock().unwrap();
+                m.entry(tid)
+                    .or_insert_with(|| Arc::new((Mutex::new(()), Condvar::new())))
+                    .clone()
+            };
+            let (lock, cv) = &*guard;
+            let _held = lock.lock().unwrap(); // wait for any in-flight restore of this tid
             match act {
                 DeathAction::AbortDeadSender { tid } => {
                     {
@@ -329,59 +349,57 @@ impl ThreadedRuntime {
                     }
                     self.escrow.lock().unwrap().remove(&(tid, 0));
                 }
-                DeathAction::RestoreToSender { tid, sender } => {
-                    let sender_alive = {
-                        let st = self.state.lock().unwrap();
-                        st.peer_state(&sender) == Some(PeerState::Active)
-                    };
-                    if sender_alive {
-                        let restore = {
-                            let esc = self.escrow.lock().unwrap();
-                            esc.get(&(tid, 0)).map(|(fd, oid)| (*oid, dup_owned(fd)))
-                        };
-                        if let Some((oid, Ok(restore_fd))) = restore {
-                            let ok = self
-                                .send_native_fd(
-                                    &sender,
-                                    Kind::Restore,
-                                    &envelope_oid(&tid, oid),
-                                    restore_fd,
-                                )
-                                .is_ok();
-                            if ok {
-                                if let Ok((k, body)) = self.recv_control(&sender) {
-                                    // RESTORE_ACK must be transaction-specific: exact
-                                    // kind + exact 16-byte TransferId, nothing else.
-                                    let valid_ack = k == Kind::RestoreAck
-                                        && body.len() == 16
-                                        && body[..16] == tid.0;
-                                    if valid_ack {
-                                        {
-                                            let mut st = self.state.lock().unwrap();
-                                            let _ = st.finish_abort_restore(tid);
-                                        }
-                                        self.escrow.lock().unwrap().remove(&(tid, 0));
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                        // Sender alive but restoration failed: dead-sender path.
-                        {
-                            let mut st = self.state.lock().unwrap();
-                            let _ = st.finish_abort_dead(tid);
-                        }
-                        self.escrow.lock().unwrap().remove(&(tid, 0));
-                    } else {
-                        {
-                            let mut st = self.state.lock().unwrap();
-                            let _ = st.finish_abort_dead(tid);
-                        }
-                        self.escrow.lock().unwrap().remove(&(tid, 0));
-                    }
-                }
+                DeathAction::RestoreToSender { tid, sender } => self.restore_to_sender(tid, sender),
                 DeathAction::LeaveCommitted { .. } => {}
             }
+            drop(_held);
+            cv.notify_all();
+        }
+    }
+
+    fn restore_to_sender(&self, tid: TransferId, sender: PeerId) {
+        let sender_alive = {
+            let st = self.state.lock().unwrap();
+            st.peer_state(&sender) == Some(PeerState::Active)
+        };
+        if sender_alive {
+            let restore = {
+                let esc = self.escrow.lock().unwrap();
+                esc.get(&(tid, 0)).map(|(fd, oid)| (*oid, dup_owned(fd)))
+            };
+            if let Some((oid, Ok(restore_fd))) = restore {
+                let ok = self
+                    .send_native_fd(&sender, Kind::Restore, &envelope_oid(&tid, oid), restore_fd)
+                    .is_ok();
+                if ok {
+                    if let Ok((k, body)) = self.recv_control(&sender) {
+                        // RESTORE_ACK must be transaction-specific: exact kind
+                        // + exact 16-byte TransferId, nothing else.
+                        let valid_ack =
+                            k == Kind::RestoreAck && body.len() == 16 && body[..16] == tid.0;
+                        if valid_ack {
+                            {
+                                let mut st = self.state.lock().unwrap();
+                                let _ = st.finish_abort_restore(tid);
+                            }
+                            self.escrow.lock().unwrap().remove(&(tid, 0));
+                            return;
+                        }
+                    }
+                }
+            }
+            // Sender alive but restoration failed: dead-sender path.
+            {
+                let mut st = self.state.lock().unwrap();
+                let _ = st.finish_abort_dead(tid);
+            }
+            self.escrow.lock().unwrap().remove(&(tid, 0));
+        } else {
+            {
+                let mut st = self.state.lock().unwrap();
+                let _ = st.finish_abort_dead(tid);
+            }
+            self.escrow.lock().unwrap().remove(&(tid, 0));
         }
     }
 
