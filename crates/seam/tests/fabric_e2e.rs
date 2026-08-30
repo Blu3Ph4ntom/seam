@@ -301,9 +301,21 @@ fn threaded_recipient_death_precommit_restores_sender() {
         "recipient death must abort the transfer, got {:?}",
         res.map(|_| ())
     );
-    // Logical: Held(sender), terminal Aborted, no Held(dead).
+    // Poll for Held to allow async restore to settle
+    let key = seam_core::authority::AuthorityKey::Resource(rid);
+    let mut ok = false;
+    for _ in 0..50 {
+        if rt.authority_lookup(&key) == Some(seam_core::authority::AuthorityState::Held(a))
+            && rt.status(&tid) == seam_core::transfer::TransferStatus::Aborted
+            && rt.escrow_len() == 0
+        {
+            ok = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ok, "must settle to Held(sender), Aborted, escrow 0");
     {
-        let key = seam_core::authority::AuthorityKey::Resource(rid);
         assert_eq!(
             rt.authority_lookup(&key),
             Some(seam_core::authority::AuthorityState::Held(a))
