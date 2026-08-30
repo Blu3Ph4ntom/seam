@@ -137,8 +137,7 @@ impl FabricState {
                         }
                     }
                     BundleState::Restoring => {
-                        // Recipient died during Restoring: restore-to-sender is
-                        // already in flight; recipient death must not abandon it.
+                        actions.push(DeathAction::AbortDeadSender { tid });
                     }
                     BundleState::Committed => {
                         actions.push(DeathAction::LeaveCommitted { tid });
@@ -165,16 +164,6 @@ impl FabricState {
             self.abort_needs_restore.insert(tid);
             self.materializer.mark_aborted(tid);
         }
-    }
-
-    /// Active Restoring transfers involving this peer (sender or recipient).
-    pub fn restoring_tids_for(&self, peer: &PeerId) -> Vec<TransferId> {
-        self.transfers
-            .iter()
-            .filter(|(_, b)| b.state == crate::transfer::BundleState::Restoring)
-            .filter(|(_, b)| &b.sender == peer || &b.recipient == peer)
-            .map(|(t, _)| *t)
-            .collect()
     }
 
     pub fn register_authority(

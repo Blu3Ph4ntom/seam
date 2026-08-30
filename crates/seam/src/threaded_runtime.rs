@@ -98,8 +98,8 @@ impl DeathGate {
 struct PeerRuntime {
     #[allow(dead_code)]
     peer: PeerId,
-    control_rx: Arc<Mutex<Receiver<DriverEvent>>>,
-    native_rx: Arc<Mutex<Receiver<DriverEvent>>>,
+    control_rx: Receiver<DriverEvent>,
+    native_rx: Receiver<DriverEvent>,
     death_gate: Arc<DeathGate>,
     child: Option<Child>,
     _control_handle: Option<JoinHandle<()>>,
@@ -142,9 +142,10 @@ fn spawn_reader(
                 }
             }
         }
-        // Reader OBSERVES ONLY. Signal death on this channel; the waiter
-        // (driver or supervisor-in-future) calls handle_death which is
-        // idempotent (peer_gone yields actions only from the first caller).
+        // Reader OBSERVES ONLY. Signal death on THIS channel regardless of
+        // gate winner: the driver may be blocked on either control or native.
+        // handle_death performs peer_gone idempotently, so exactly one semantic
+        // transition occurs even if both channels deliver PeerGone.
         let _ = gate.try_gone();
         let _ = tx.send(DriverEvent::PeerGone);
     })
@@ -156,9 +157,6 @@ pub struct ThreadedRuntime {
     control_writers: Mutex<HashMap<PeerId, NativeLane>>,
     native_writers: Mutex<HashMap<PeerId, NativeLane>>,
     escrow: Arc<Mutex<EscrowMap>>,
-    // Death dispatch (driver-driven via per-peer channels; an always-running
-    // supervisor thread is DESIGN LOCKED but PENDING — the S-era waiter-driven
-    // model remains canonical and is exercised by all E2Es).
     limits: Limits,
 }
 
@@ -223,8 +221,8 @@ impl ThreadedRuntime {
             peer,
             PeerRuntime {
                 peer,
-                control_rx: Arc::new(Mutex::new(ctrl_rx)),
-                native_rx: Arc::new(Mutex::new(nat_rx)),
+                control_rx: ctrl_rx,
+                native_rx: nat_rx,
                 death_gate: gate,
                 child: Some(child),
                 _control_handle: Some(c_h),
@@ -235,18 +233,13 @@ impl ThreadedRuntime {
     }
 
     fn recv_control(&self, peer: &PeerId) -> Result<(Kind, Vec<u8>), String> {
-        // Clone the receiver handle under the map lock, release the map lock,
-        // then block: the global peer registry is never held across recv().
-        let rx = {
-            let peers = self.peers.lock().unwrap();
-            let rt = peers.get(peer).ok_or("peer gone")?;
-            Arc::clone(&rt.control_rx)
-        };
-        let ev = rx
+        let ev = self
+            .peers
             .lock()
             .unwrap()
-            .recv()
-            .map_err(|_| String::from("control channel closed"))?;
+            .get(peer)
+            .and_then(|rt| rt.control_rx.recv().ok())
+            .ok_or("peer gone")?;
         match ev {
             DriverEvent::Control { kind, body } => Ok((kind, body)),
             DriverEvent::Native { .. } => Err("unexpected native on control".into()),
@@ -258,16 +251,13 @@ impl ThreadedRuntime {
     }
 
     fn recv_native(&self, peer: &PeerId) -> Result<(Kind, Vec<u8>, OwnedFd), String> {
-        let rx = {
-            let peers = self.peers.lock().unwrap();
-            let rt = peers.get(peer).ok_or("peer gone")?;
-            Arc::clone(&rt.native_rx)
-        };
-        let ev = rx
+        let ev = self
+            .peers
             .lock()
             .unwrap()
-            .recv()
-            .map_err(|_| String::from("native channel closed"))?;
+            .get(peer)
+            .and_then(|rt| rt.native_rx.recv().ok())
+            .ok_or("peer gone")?;
         match ev {
             DriverEvent::Native { kind, body, fd } => {
                 let fd = fd.ok_or("native without fd")?;
@@ -282,9 +272,7 @@ impl ThreadedRuntime {
     }
 
     /// Central death orchestration. Exactly one semantic transition (peer_gone
-    /// is idempotent); restore execution is serialized per transfer. A loser
-    /// with no actions waits for any in-flight restore involving this peer to
-    /// settle, so recv_* never observes a half-restored state.
+    /// is idempotent), then physical actions executed outside the state lock.
     pub fn handle_death(&self, peer: &PeerId) {
         let actions = {
             let mut st = self.state.lock().unwrap();
@@ -299,55 +287,54 @@ impl ThreadedRuntime {
                     }
                     self.escrow.lock().unwrap().remove(&(tid, 0));
                 }
-                DeathAction::RestoreToSender { tid, sender } => self.restore_to_sender(tid, sender),
-                DeathAction::LeaveCommitted { .. } => {}
-            }
-        }
-    }
-
-    fn restore_to_sender(&self, tid: TransferId, sender: PeerId) {
-        let sender_alive = {
-            let st = self.state.lock().unwrap();
-            st.peer_state(&sender) == Some(PeerState::Active)
-        };
-        if sender_alive {
-            let restore = {
-                let esc = self.escrow.lock().unwrap();
-                esc.get(&(tid, 0)).map(|(fd, oid)| (*oid, dup_owned(fd)))
-            };
-            if let Some((oid, Ok(restore_fd))) = restore {
-                let ok = self
-                    .send_native_fd(&sender, Kind::Restore, &envelope_oid(&tid, oid), restore_fd)
-                    .is_ok();
-                if ok {
-                    if let Ok((k, body)) = self.recv_control(&sender) {
-                        // RESTORE_ACK must be transaction-specific: exact kind
-                        // + exact 16-byte TransferId, nothing else.
-                        let valid_ack =
-                            k == Kind::RestoreAck && body.len() == 16 && body[..16] == tid.0;
-                        if valid_ack {
-                            {
-                                let mut st = self.state.lock().unwrap();
-                                let _ = st.finish_abort_restore(tid);
+                DeathAction::RestoreToSender { tid, sender } => {
+                    let sender_alive = {
+                        let st = self.state.lock().unwrap();
+                        st.peer_state(&sender) == Some(PeerState::Active)
+                    };
+                    if sender_alive {
+                        let restore = {
+                            let esc = self.escrow.lock().unwrap();
+                            esc.get(&(tid, 0)).map(|(fd, oid)| (*oid, dup_owned(fd)))
+                        };
+                        if let Some((oid, Ok(restore_fd))) = restore {
+                            let ok = self
+                                .send_native_fd(
+                                    &sender,
+                                    Kind::Restore,
+                                    &envelope_oid(&tid, oid),
+                                    restore_fd,
+                                )
+                                .is_ok();
+                            if ok {
+                                if let Ok((k, _)) = self.recv_control(&sender) {
+                                    if k == Kind::RestoreAck {
+                                        {
+                                            let mut st = self.state.lock().unwrap();
+                                            let _ = st.finish_abort_restore(tid);
+                                        }
+                                        self.escrow.lock().unwrap().remove(&(tid, 0));
+                                        continue;
+                                    }
+                                }
                             }
-                            self.escrow.lock().unwrap().remove(&(tid, 0));
-                            return;
                         }
+                        // Sender alive but restoration failed: dead-sender path.
+                        {
+                            let mut st = self.state.lock().unwrap();
+                            let _ = st.finish_abort_dead(tid);
+                        }
+                        self.escrow.lock().unwrap().remove(&(tid, 0));
+                    } else {
+                        {
+                            let mut st = self.state.lock().unwrap();
+                            let _ = st.finish_abort_dead(tid);
+                        }
+                        self.escrow.lock().unwrap().remove(&(tid, 0));
                     }
                 }
+                DeathAction::LeaveCommitted { .. } => {}
             }
-            // Sender alive but restoration failed: dead-sender path.
-            {
-                let mut st = self.state.lock().unwrap();
-                let _ = st.finish_abort_dead(tid);
-            }
-            self.escrow.lock().unwrap().remove(&(tid, 0));
-        } else {
-            {
-                let mut st = self.state.lock().unwrap();
-                let _ = st.finish_abort_dead(tid);
-            }
-            self.escrow.lock().unwrap().remove(&(tid, 0));
         }
     }
 
@@ -376,16 +363,13 @@ impl ThreadedRuntime {
     }
 
     fn reap(&self, peer: &PeerId) -> Result<(), String> {
-        // Take the child under the map lock, release it, then wait: the global
-        // registry is never held across a blocking process wait.
-        let child = {
-            let mut peers = self.peers.lock().unwrap();
-            peers.get_mut(peer).and_then(|rt| rt.child.take())
-        };
-        if let Some(mut child) = child {
-            let status = child.wait().map_err(|e| format!("wait {e}"))?;
-            if !status.success() {
-                return Err(format!("child exited {status:?}"));
+        let mut peers = self.peers.lock().unwrap();
+        if let Some(rt) = peers.get_mut(peer) {
+            if let Some(mut child) = rt.child.take() {
+                let status = child.wait().map_err(|e| format!("wait {e}"))?;
+                if !status.success() {
+                    return Err(format!("child exited {status:?}"));
+                }
             }
         }
         Ok(())
@@ -394,14 +378,14 @@ impl ThreadedRuntime {
     /// Drain late/duplicate native events for a peer and close their fds.
     /// Late natives after COMMIT/ABORT must never leak descriptors.
     fn close_late_natives(&self, peer: &PeerId) {
-        let rx = {
-            let peers = self.peers.lock().unwrap();
-            peers.get(peer).map(|rt| Arc::clone(&rt.native_rx))
-        };
-        if let Some(rx) = rx {
-            let mut guard = rx.lock().unwrap();
-            while let Ok(DriverEvent::Native { fd: Some(fd), .. }) = guard.try_recv() {
-                drop(fd);
+        let peers = self.peers.lock().unwrap();
+        if let Some(rt) = peers.get(peer) {
+            loop {
+                match rt.native_rx.try_recv() {
+                    Ok(DriverEvent::Native { fd: Some(fd), .. }) => drop(fd),
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
             }
         }
     }
