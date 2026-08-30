@@ -318,14 +318,18 @@ impl ThreadedRuntime {
     }
 
     /// Central death orchestration. Exactly one semantic transition (peer_gone
-    /// is idempotent); restore execution is serialized per transfer so a racing
-    /// supervisor/waiter blocks until settlement rather than observing a
-    /// half-restored state.
+    /// is idempotent); restore execution is serialized per transfer. A loser
+    /// with no actions waits for any in-flight restore involving this peer to
+    /// settle, so recv_* never observes a half-restored state.
     pub fn handle_death(&self, peer: &PeerId) {
         let actions = {
             let mut st = self.state.lock().unwrap();
             st.peer_gone(*peer)
         };
+        if actions.is_empty() {
+            self.wait_restore_quiesce(peer);
+            return;
+        }
         for act in actions {
             let tid = match act {
                 DeathAction::AbortDeadSender { tid } | DeathAction::RestoreToSender { tid, .. } => {
@@ -340,7 +344,7 @@ impl ThreadedRuntime {
                     .clone()
             };
             let (lock, cv) = &*guard;
-            let _held = lock.lock().unwrap(); // wait for any in-flight restore of this tid
+            let _held = lock.lock().unwrap(); // wait for prior in-flight restore
             match act {
                 DeathAction::AbortDeadSender { tid } => {
                     {
@@ -354,6 +358,37 @@ impl ThreadedRuntime {
             }
             drop(_held);
             cv.notify_all();
+        }
+    }
+
+    /// Wait (event-driven via per-tid guards) until every Restoring transfer
+    /// involving `peer` has settled. Used by death-handler losers so the driver
+    /// never returns before physical restoration completes.
+    fn wait_restore_quiesce(&self, peer: &PeerId) {
+        loop {
+            let tids = {
+                let st = self.state.lock().unwrap();
+                st.restoring_tids_for(peer)
+            };
+            if tids.is_empty() {
+                return;
+            }
+            let mut acquired_any = false;
+            for tid in tids {
+                if let Some(guard) = self.restore_guards.lock().unwrap().get(&tid).cloned() {
+                    let (lock, cv) = &*guard;
+                    let mut held = lock.lock().unwrap();
+                    // Returned: the restoring thread finished (or is finishing).
+                    drop(held);
+                    cv.notify_all();
+                    acquired_any = true;
+                }
+            }
+            if !acquired_any {
+                // No guard yet: the winner will create one; retry via a small
+                // handoff. The winner's completion is tracked by state change.
+                std::thread::yield_now();
+            }
         }
     }
 

@@ -167,6 +167,16 @@ impl FabricState {
         }
     }
 
+    /// Active Restoring transfers involving this peer (sender or recipient).
+    pub fn restoring_tids_for(&self, peer: &PeerId) -> Vec<TransferId> {
+        self.transfers
+            .iter()
+            .filter(|(_, b)| b.state == crate::transfer::BundleState::Restoring)
+            .filter(|(_, b)| &b.sender == peer || &b.recipient == peer)
+            .map(|(t, _)| *t)
+            .collect()
+    }
+
     pub fn register_authority(
         &mut self,
         key: AuthorityKey,
