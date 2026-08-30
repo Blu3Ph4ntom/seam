@@ -228,6 +228,7 @@ pub struct FabricExecutor {
     restore_sessions: HashMap<TransferId, RestoreSession>,
     transfers: HashMap<TransferId, TransferContext>,
     pending_control: HashMap<TransferId, Vec<(PeerId, Kind, Vec<u8>)>>,
+    #[allow(clippy::type_complexity)]
     pending_native: HashMap<TransferId, Vec<(PeerId, Kind, Vec<u8>, OwnedFd)>>,
     limits: Limits,
     tx: Sender<ExecutorEvent>,
@@ -995,23 +996,27 @@ impl FabricExecutor {
         success: bool,
     ) {
         if kind == Kind::Restore {
-            if let Some(sess) = self.restore_sessions.get_mut(&tid) {
+            let pending = if let Some(sess) = self.restore_sessions.get_mut(&tid) {
                 if sess.sender == peer {
                     if success {
                         sess.state = RestoreState::AwaitingAck;
-                        if sess.pending_ack {
-                            // Ack arrived early before effect completed — now honor it
-                            drop(sess);
-                            self.handle_restore_ack(peer, tid.0.to_vec());
-                        }
+                        sess.pending_ack
                     } else {
                         sess.state = RestoreState::Failed;
                         let _ = self.state.finish_abort_dead(tid);
                         self.escrow.remove(&(tid, 0));
                         self.restore_sessions.remove(&tid);
                         self.complete_transfer(tid, false);
+                        false
                     }
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if pending {
+                self.handle_restore_ack(peer, tid.0.to_vec());
             }
         } else if kind == Kind::NativeDeliver {
             // nothing extra
@@ -1145,12 +1150,11 @@ impl FabricExecutor {
             // Find any pending transfer where recipient == peer and escrow exists
             let mut to_restore = Vec::new();
             for (tid, ctx) in &self.transfers {
-                if ctx.recipient == peer {
-                    if self.escrow.contains_key(&(*tid, 0))
-                        && !self.restore_sessions.contains_key(tid)
-                    {
-                        to_restore.push((*tid, ctx.sender));
-                    }
+                if ctx.recipient == peer
+                    && self.escrow.contains_key(&(*tid, 0))
+                    && !self.restore_sessions.contains_key(tid)
+                {
+                    to_restore.push((*tid, ctx.sender));
                 }
             }
             for (tid, sender) in to_restore {
