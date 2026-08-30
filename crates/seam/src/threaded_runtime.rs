@@ -170,6 +170,9 @@ pub enum Mode {
     WrongIndex,
     Duplicate,
     DieBeforeAccept,
+    DieAfterEscrow,
+    DieBeforeAck,
+    AckThenExit,
 }
 
 #[derive(Debug)]
@@ -226,6 +229,9 @@ pub fn spawn_peer(
         Mode::WrongIndex => "wrong-index",
         Mode::Duplicate => "duplicate",
         Mode::DieBeforeAccept => "die-before-accept",
+        Mode::DieAfterEscrow => "die-after-escrow",
+        Mode::DieBeforeAck => "die-before-ack",
+        Mode::AckThenExit => "ack-then-exit",
     });
     cmd.arg("--transfer-id").arg(tid_hex);
     cmd.arg("--resource-id").arg(rid_hex);

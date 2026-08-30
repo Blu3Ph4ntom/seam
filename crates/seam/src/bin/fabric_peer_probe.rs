@@ -130,6 +130,11 @@ mod imp {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 exit(0);
             }
+            if mode == "die-after-escrow" {
+                // Sender dies after escrow, before commit/abort
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                exit(0);
+            }
             let (k, _) = control.recv_frame(&Limits::default()).unwrap();
             assert_eq!(k.kind, Kind::EscrowAcquired, "expected ESCROW_ACQUIRED");
             if mode == "duplicate" {
@@ -169,6 +174,23 @@ mod imp {
                 control
                     .send_frame(&header(Kind::RestoreAck, 16), &tid.0)
                     .unwrap();
+                exit(0);
+            } else if mode == "die-before-ack" {
+                let (k2, _b, fd2) = native.recv_frame_fd(&Limits::default()).unwrap();
+                assert_eq!(k2.kind, Kind::Restore, "expected RESTORE");
+                let file = unsafe { File::from_raw_fd(fd2.into_raw_fd()) };
+                verify_file(file);
+                // Die before sending RestoreAck
+                exit(0);
+            } else if mode == "ack-then-exit" {
+                let (k2, _b, fd2) = native.recv_frame_fd(&Limits::default()).unwrap();
+                assert_eq!(k2.kind, Kind::Restore, "expected RESTORE");
+                let file = unsafe { File::from_raw_fd(fd2.into_raw_fd()) };
+                verify_file(file);
+                control
+                    .send_frame(&header(Kind::RestoreAck, 16), &tid.0)
+                    .unwrap();
+                // Exit immediately after Ack — race with process exit vs ack ordering
                 exit(0);
             }
         } else {

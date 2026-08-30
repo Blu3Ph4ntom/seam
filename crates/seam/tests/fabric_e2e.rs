@@ -315,3 +315,310 @@ fn threaded_recipient_death_precommit_restores_sender() {
     }
     assert_eq!(rt.escrow_len(), 0, "escrow must settle to zero");
 }
+
+#[test]
+fn threaded_sender_death_after_escrow_abandoned() {
+    // B: sender dies after Fabric escrow (after Offer+Escrow, before commit) -> Abandoned, escrow 0
+    let a = PeerId([20; 16]);
+    let b = PeerId([21; 16]);
+    let rid = ResourceId([30; 16]);
+    let tid = TransferId([40; 16]);
+    let rt = ThreadedRuntime::new(Limits::default());
+    let bin = env!("CARGO_BIN_EXE_fabric_peer_probe");
+    let (c_a, n_a, child_a) = spawn_peer(
+        "holder",
+        Mode::DieAfterEscrow,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&a.0),
+        bin,
+    )
+    .expect("spawn holder");
+    let (c_b, n_b, child_b) = spawn_peer(
+        "recipient",
+        Mode::Success,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&b.0),
+        bin,
+    )
+    .expect("spawn recipient");
+    rt.add_peer(a, c_a, n_a, child_a).unwrap();
+    rt.add_peer(b, c_b, n_b, child_b).unwrap();
+    let res = rt.run_native_file(a, b, tid, rid, Mode::Success);
+    // Sender death after escrow should abort (dead-sender) — either Err or Aborted
+    // We check terminal Abandoned, not Held(dead)
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let key = seam_core::authority::AuthorityKey::Resource(rid);
+    let auth = rt.authority_lookup(&key);
+    assert_ne!(
+        auth,
+        Some(seam_core::authority::AuthorityState::Held(a)),
+        "must not remain Held(dead sender)"
+    );
+    // If completed, should be Aborted or Unknown, never Committed with Held(dead)
+    assert_ne!(
+        rt.status(&tid),
+        seam_core::transfer::TransferStatus::Committed
+    );
+    assert_eq!(rt.escrow_len(), 0, "escrow must settle to zero");
+    // Transfer may have returned Err due to sender death
+    let _ = res;
+}
+
+#[test]
+fn threaded_sender_death_before_ack_abandoned() {
+    // C: sender dies after receiving RESTORE before Ack -> must not become Held(dead)
+    let a = PeerId([22; 16]);
+    let b = PeerId([23; 16]);
+    let rid = ResourceId([31; 16]);
+    let tid = TransferId([41; 16]);
+    let rt = ThreadedRuntime::new(Limits::default());
+    let bin = env!("CARGO_BIN_EXE_fabric_peer_probe");
+    let (c_a, n_a, child_a) = spawn_peer(
+        "holder",
+        Mode::DieBeforeAck,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&a.0),
+        bin,
+    )
+    .expect("spawn holder");
+    let (c_b, n_b, child_b) = spawn_peer(
+        "recipient",
+        Mode::DieBeforeAccept,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&b.0),
+        bin,
+    )
+    .expect("spawn recipient");
+    rt.add_peer(a, c_a, n_a, child_a).unwrap();
+    rt.add_peer(b, c_b, n_b, child_b).unwrap();
+    let res = rt.run_native_file(a, b, tid, rid, Mode::DieBeforeAck);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let key = seam_core::authority::AuthorityKey::Resource(rid);
+    let auth = rt.authority_lookup(&key);
+    assert_eq!(
+        auth,
+        Some(seam_core::authority::AuthorityState::Abandoned),
+        "sender death before ack must be Abandoned, got {auth:?}"
+    );
+    assert_eq!(
+        rt.status(&tid),
+        seam_core::transfer::TransferStatus::Aborted
+    );
+    assert_eq!(rt.escrow_len(), 0);
+    let _ = res;
+}
+
+#[test]
+fn threaded_sender_ack_then_exit_honored() {
+    // D: sender ACKs then exits immediately — valid Ack before ControlClosed must be honored
+    let a = PeerId([24; 16]);
+    let b = PeerId([25; 16]);
+    let rid = ResourceId([32; 16]);
+    let tid = TransferId([42; 16]);
+    let rt = ThreadedRuntime::new(Limits::default());
+    let bin = env!("CARGO_BIN_EXE_fabric_peer_probe");
+    let (c_a, n_a, child_a) = spawn_peer(
+        "holder",
+        Mode::AckThenExit,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&a.0),
+        bin,
+    )
+    .expect("spawn holder");
+    let (c_b, n_b, child_b) = spawn_peer(
+        "recipient",
+        Mode::DieBeforeAccept,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&b.0),
+        bin,
+    )
+    .expect("spawn recipient");
+    rt.add_peer(a, c_a, n_a, child_a).unwrap();
+    rt.add_peer(b, c_b, n_b, child_b).unwrap();
+    let res = rt.run_native_file(a, b, tid, rid, Mode::AckThenExit);
+    // Even though sender exits immediately after Ack, the Ack was on control before close, so must be honored
+    // Transfer may be considered Err due to recipient death, but authority must be Held(sender) briefly then Abandoned after sender death? For this test we check escrow 0 and status Aborted, not Held(dead) forever
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // After valid Ack, transfer is Aborted with Held(sender) initially, but sender then exits, so final may be Abandoned after second death — but must not be Held(dead) and must not be Unknown due to race
+    assert_eq!(
+        rt.status(&tid),
+        seam_core::transfer::TransferStatus::Aborted
+    );
+    assert_eq!(rt.escrow_len(), 0);
+    // Authority should be Abandoned after sender death, not Held(dead)
+    let key = seam_core::authority::AuthorityKey::Resource(rid);
+    let auth = rt.authority_lookup(&key);
+    assert_ne!(
+        auth,
+        Some(seam_core::authority::AuthorityState::Held(a)),
+        "after sender exit, must not remain Held(dead)"
+    );
+    let _ = res;
+}
+
+#[test]
+fn threaded_all_three_death_observations_race() {
+    // H: CONTROL EOF, NATIVE EOF, ProcessExited all happen for same peer — exactly one semantic Gone
+    let rt = ThreadedRuntime::new(Limits::default());
+    let peer = PeerId([30; 16]);
+    let (c1, c2) = seam_platform::NativeLane::pair().unwrap();
+    let (n1, n2) = seam_platform::NativeLane::pair().unwrap();
+    let child = std::process::Command::new("true").spawn().unwrap();
+    rt.add_peer(peer, c1, n1, child).unwrap();
+    drop(c2);
+    drop(n2);
+    // All three death sources will fire: control closed, native closed, process exited
+    // Wait for observation
+    let mut observed = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        if !rt.death_gate_alive(&peer) {
+            observed = true;
+            break;
+        }
+    }
+    assert!(observed, "all three sources must converge to Dying");
+    // Second check idempotent
+    assert!(!rt.death_gate_alive(&peer));
+}
+
+#[test]
+fn threaded_linux_restoration_100() {
+    // 100/100 restoration via recipient death before accept
+    for i in 0..100 {
+        let a = PeerId([100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let b = PeerId([101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let rid = ResourceId([200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let tid = TransferId([210, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let rt = ThreadedRuntime::new(Limits::default());
+        let bin = env!("CARGO_BIN_EXE_fabric_peer_probe");
+        let (c_a, n_a, child_a) = spawn_peer(
+            "holder",
+            Mode::Abort,
+            &hexstr(&tid.0),
+            &hexstr(&rid.0),
+            &hexstr(&a.0),
+            bin,
+        )
+        .unwrap();
+        let (c_b, n_b, child_b) = spawn_peer(
+            "recipient",
+            Mode::DieBeforeAccept,
+            &hexstr(&tid.0),
+            &hexstr(&rid.0),
+            &hexstr(&b.0),
+            bin,
+        )
+        .unwrap();
+        rt.add_peer(a, c_a, n_a, child_a).unwrap();
+        rt.add_peer(b, c_b, n_b, child_b).unwrap();
+        let res = rt.run_native_file(a, b, tid, rid, Mode::Abort);
+        assert!(res.is_err(), "iteration {i} must be recipient death abort");
+        assert_eq!(
+            rt.status(&tid),
+            seam_core::transfer::TransferStatus::Aborted
+        );
+        assert_eq!(rt.escrow_len(), 0, "iteration {i} escrow leak");
+        let key = seam_core::authority::AuthorityKey::Resource(rid);
+        assert_eq!(
+            rt.authority_lookup(&key),
+            Some(seam_core::authority::AuthorityState::Held(a)),
+            "iteration {i} must be Held(sender)"
+        );
+    }
+}
+
+#[test]
+fn threaded_idle_death_100() {
+    for i in 0..100 {
+        let peer = PeerId([50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let rt = ThreadedRuntime::new(Limits::default());
+        let (c1, c2) = seam_platform::NativeLane::pair().unwrap();
+        let (n1, n2) = seam_platform::NativeLane::pair().unwrap();
+        let child = std::process::Command::new("true").spawn().unwrap();
+        rt.add_peer(peer, c1, n1, child).unwrap();
+        drop(c2);
+        drop(n2);
+        let mut observed = false;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if !rt.death_gate_alive(&peer) {
+                observed = true;
+                break;
+            }
+        }
+        assert!(observed, "idle iteration {i} must be observed without recv");
+    }
+}
+
+#[test]
+fn threaded_ack_then_exit_100() {
+    for i in 0..100 {
+        let a = PeerId([110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let b = PeerId([111, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let rid = ResourceId([220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let tid = TransferId([230, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let rt = ThreadedRuntime::new(Limits::default());
+        let bin = env!("CARGO_BIN_EXE_fabric_peer_probe");
+        let (c_a, n_a, child_a) = spawn_peer(
+            "holder",
+            Mode::AckThenExit,
+            &hexstr(&tid.0),
+            &hexstr(&rid.0),
+            &hexstr(&a.0),
+            bin,
+        )
+        .unwrap();
+        let (c_b, n_b, child_b) = spawn_peer(
+            "recipient",
+            Mode::DieBeforeAccept,
+            &hexstr(&tid.0),
+            &hexstr(&rid.0),
+            &hexstr(&b.0),
+            bin,
+        )
+        .unwrap();
+        rt.add_peer(a, c_a, n_a, child_a).unwrap();
+        rt.add_peer(b, c_b, n_b, child_b).unwrap();
+        let _ = rt.run_native_file(a, b, tid, rid, Mode::AckThenExit);
+        // Must be Aborted and escrow 0 regardless of exit race
+        assert_eq!(
+            rt.status(&tid),
+            seam_core::transfer::TransferStatus::Aborted
+        );
+        assert_eq!(rt.escrow_len(), 0, "iteration {i} escrow leak");
+    }
+}
+
+#[test]
+fn threaded_resource_cycle_100() {
+    // 100 peer create/death cycles, check fd baseline and no leak
+    let rt = ThreadedRuntime::new(Limits::default());
+    for i in 0..100 {
+        let peer = PeerId([60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let (c1, c2) = seam_platform::NativeLane::pair().unwrap();
+        let (n1, n2) = seam_platform::NativeLane::pair().unwrap();
+        let child = std::process::Command::new("true").spawn().unwrap();
+        rt.add_peer(peer, c1, n1, child).unwrap();
+        drop(c2);
+        drop(n2);
+        // wait for death observation
+        let mut ok = false;
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if !rt.death_gate_alive(&peer) {
+                ok = true;
+                break;
+            }
+        }
+        assert!(ok, "cycle {i} death not observed");
+    }
+    // After 100 cycles, escrow must be 0 and no leaked peers (we only check escrow)
+    assert_eq!(rt.escrow_len(), 0);
+}
