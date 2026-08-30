@@ -51,6 +51,9 @@ pub fn envelope_oid(tid: &TransferId, oid: [u8; 16]) -> [u8; 36] {
     b
 }
 
+/// Physical escrow: fabric holds (fd, object_id) per attachment until terminal.
+type EscrowMap = HashMap<(TransferId, u16), (OwnedFd, [u8; 16])>;
+
 /// Event delivered from a reader thread to the runtime driver.
 pub enum DriverEvent {
     Control {
@@ -105,7 +108,6 @@ struct PeerRuntime {
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_reader(
-    peer: PeerId,
     gate: Arc<DeathGate>,
     tx: Sender<DriverEvent>,
     control: Option<NativeLane>,
@@ -154,7 +156,7 @@ pub struct ThreadedRuntime {
     peers: Mutex<HashMap<PeerId, PeerRuntime>>,
     control_writers: Mutex<HashMap<PeerId, NativeLane>>,
     native_writers: Mutex<HashMap<PeerId, NativeLane>>,
-    escrow: Arc<Mutex<HashMap<(TransferId, u16), (OwnedFd, [u8; 16])>>>,
+    escrow: Arc<Mutex<EscrowMap>>,
     limits: Limits,
 }
 
@@ -206,14 +208,13 @@ impl ThreadedRuntime {
         let (nat_tx, nat_rx) = mpsc::channel::<DriverEvent>();
         let limits = self.limits.clone();
         let c_h = spawn_reader(
-            peer,
             Arc::clone(&gate),
             ctrl_tx,
             Some(control),
             None,
             limits.clone(),
         );
-        let n_h = spawn_reader(peer, Arc::clone(&gate), nat_tx, None, Some(native), limits);
+        let n_h = spawn_reader(Arc::clone(&gate), nat_tx, None, Some(native), limits);
         self.control_writers.lock().unwrap().insert(peer, control_w);
         self.native_writers.lock().unwrap().insert(peer, native_w);
         self.peers.lock().unwrap().insert(
