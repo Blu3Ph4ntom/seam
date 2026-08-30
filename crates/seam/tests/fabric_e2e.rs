@@ -229,13 +229,12 @@ fn threaded_duplicate_late_native_closed() {
 
 #[test]
 fn threaded_death_gate_exactly_once_via_readers() {
-    // Real reader-thread death: drop child-side lanes causing control+native
-    // EOF on both reader threads; exactly one semantic peer_gone occurs.
+    // Reader EOF converges through one DeathGate: only the gate winner emits
+    // PeerGone. The central driver then executes exactly one peer_gone.
     let rt = ThreadedRuntime::new(Limits::default());
     let peer = PeerId([9; 16]);
     let (c1, c2) = seam_platform::NativeLane::pair().unwrap();
     let (n1, n2) = seam_platform::NativeLane::pair().unwrap();
-    // No real child; use a trivially-exited shell to satisfy Child.
     let child = std::process::Command::new("true").spawn().unwrap();
     rt.add_peer(peer, c1, n1, child).unwrap();
     // Drop child-side ends -> both readers see EOF and race the death gate.
@@ -247,9 +246,65 @@ fn threaded_death_gate_exactly_once_via_readers() {
         !rt.death_gate_alive(&peer),
         "death gate must be tripped by reader EOF"
     );
+    // Central driver executes the (idempotent) semantic transition.
+    rt.handle_death(&peer);
     let st = rt.state.lock().unwrap();
     assert_eq!(
         st.peer_state(&peer),
         Some(seam_core::fabric_state::PeerState::Gone)
     );
+}
+
+#[test]
+fn threaded_recipient_death_precommit_restores_sender() {
+    // Recipient dies before ACCEPT while Fabric holds physical escrow.
+    // Precommit recipient death with live sender -> RestoreToSender: Fabric
+    // sends the SAME unlinked file fd back, sender verifies, sends RESTORE_ACK,
+    // then Held(sender) + terminal Aborted. Escrow returns to zero.
+    let a = PeerId([11; 16]);
+    let b = PeerId([12; 16]);
+    let rid = ResourceId([15; 16]);
+    let tid = TransferId([25; 16]);
+    let rt = ThreadedRuntime::new(Limits::default());
+    let bin = env!("CARGO_BIN_EXE_fabric_peer_probe");
+    let (c_a, n_a, child_a) = spawn_peer(
+        "holder",
+        Mode::Abort, // holder waits for RESTORE then RESTORE_ACK
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&a.0),
+        bin,
+    )
+    .expect("spawn holder");
+    let (c_b, n_b, child_b) = spawn_peer(
+        "recipient",
+        Mode::DieBeforeAccept,
+        &hexstr(&tid.0),
+        &hexstr(&rid.0),
+        &hexstr(&b.0),
+        bin,
+    )
+    .expect("spawn recipient");
+    rt.add_peer(a, c_a, n_a, child_a).unwrap();
+    rt.add_peer(b, c_b, n_b, child_b).unwrap();
+    let res = rt.run_native_file(a, b, tid, rid, Mode::Abort);
+    assert!(
+        res.is_err(),
+        "recipient death must abort the transfer, got {:?}",
+        res.map(|_| ())
+    );
+    // Logical: Held(sender), terminal Aborted, no Held(dead).
+    {
+        let st = rt.state.lock().unwrap();
+        let key = seam_core::authority::AuthorityKey::Resource(rid);
+        assert_eq!(
+            st.authority.lookup(&key),
+            Some(seam_core::authority::AuthorityState::Held(a))
+        );
+        assert_eq!(
+            st.status(&tid),
+            seam_core::transfer::TransferStatus::Aborted
+        );
+    }
+    assert_eq!(rt.escrow_len(), 0, "escrow must settle to zero");
 }

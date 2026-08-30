@@ -173,6 +173,11 @@ mod imp {
             }
         } else {
             // recipient
+            if mode == "die-before-accept" {
+                // Die before sending ACCEPT: triggers recipient-death precommit
+                // path; Fabric must restore the physical capability to sender.
+                exit(0);
+            }
             control
                 .send_frame(&header(Kind::Accept, 16), &tid.0)
                 .unwrap();

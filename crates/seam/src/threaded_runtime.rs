@@ -15,7 +15,7 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
-use seam_core::fabric_state::{DeathAction, FabricState};
+use seam_core::fabric_state::{DeathAction, FabricState, PeerState};
 use seam_core::ids::{PeerId, ResourceId, TransferId};
 use seam_core::limits::Limits;
 use seam_core::wire::{Header, Kind, CURRENT_MAJOR, CURRENT_MINOR, MAGIC};
@@ -38,12 +38,16 @@ pub fn header(kind: Kind, body_len: u32) -> Header {
 }
 
 pub fn envelope(tid: &TransferId, rid: &ResourceId) -> [u8; 36] {
+    envelope_oid(tid, rid.0)
+}
+
+pub fn envelope_oid(tid: &TransferId, oid: [u8; 16]) -> [u8; 36] {
     let mut b = [0u8; 36];
     b[0..16].copy_from_slice(&tid.0);
     b[16..18].copy_from_slice(&0u16.to_le_bytes()); // attachment index 0
     b[18] = 2; // ObjectKind::Native
     b[19] = 1; // native_required
-    b[20..36].copy_from_slice(&rid.0);
+    b[20..36].copy_from_slice(&oid);
     b
 }
 
@@ -103,8 +107,6 @@ struct PeerRuntime {
 fn spawn_reader(
     peer: PeerId,
     gate: Arc<DeathGate>,
-    state: Arc<Mutex<FabricState>>,
-    escrow: Arc<Mutex<HashMap<(TransferId, u16), OwnedFd>>>,
     tx: Sender<DriverEvent>,
     control: Option<NativeLane>,
     native: Option<NativeLane>,
@@ -138,24 +140,12 @@ fn spawn_reader(
                 }
             }
         }
-        // Peer observed dead (lane EOF/error). Exactly one reader performs
-        // the semantic death transition and executes physical escrow cleanup
-        // outside the FabricState lock.
-        let actions = if gate.try_gone() {
-            let mut st = state.lock().unwrap();
-            st.peer_gone(peer)
-        } else {
-            Vec::new()
-        };
-        for act in actions {
-            match act {
-                DeathAction::AbortDeadSender { tid } | DeathAction::RestoreToSender { tid, .. } => {
-                    escrow.lock().unwrap().remove(&(tid, 0));
-                }
-                DeathAction::LeaveCommitted { .. } => {}
-            }
+        // Reader OBSERVES ONLY. Exactly one observer wins the death gate and
+        // reports death to the central driver, which performs the semantic
+        // transition and all physical restoration outside the state lock.
+        if gate.try_gone() {
+            let _ = tx.send(DriverEvent::PeerGone);
         }
-        let _ = tx.send(DriverEvent::PeerGone);
     })
 }
 
@@ -164,7 +154,7 @@ pub struct ThreadedRuntime {
     peers: Mutex<HashMap<PeerId, PeerRuntime>>,
     control_writers: Mutex<HashMap<PeerId, NativeLane>>,
     native_writers: Mutex<HashMap<PeerId, NativeLane>>,
-    escrow: Arc<Mutex<HashMap<(TransferId, u16), OwnedFd>>>,
+    escrow: Arc<Mutex<HashMap<(TransferId, u16), (OwnedFd, [u8; 16])>>>,
     limits: Limits,
 }
 
@@ -214,28 +204,16 @@ impl ThreadedRuntime {
         let gate = Arc::new(DeathGate::new());
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<DriverEvent>();
         let (nat_tx, nat_rx) = mpsc::channel::<DriverEvent>();
-        let state_clone = Arc::clone(&self.state);
         let limits = self.limits.clone();
         let c_h = spawn_reader(
             peer,
             Arc::clone(&gate),
-            Arc::clone(&state_clone),
-            Arc::clone(&self.escrow),
             ctrl_tx,
             Some(control),
             None,
             limits.clone(),
         );
-        let n_h = spawn_reader(
-            peer,
-            Arc::clone(&gate),
-            state_clone,
-            Arc::clone(&self.escrow),
-            nat_tx,
-            None,
-            Some(native),
-            limits,
-        );
+        let n_h = spawn_reader(peer, Arc::clone(&gate), nat_tx, None, Some(native), limits);
         self.control_writers.lock().unwrap().insert(peer, control_w);
         self.native_writers.lock().unwrap().insert(peer, native_w);
         self.peers.lock().unwrap().insert(
@@ -264,7 +242,10 @@ impl ThreadedRuntime {
         match ev {
             DriverEvent::Control { kind, body } => Ok((kind, body)),
             DriverEvent::Native { .. } => Err("unexpected native on control".into()),
-            DriverEvent::PeerGone => Err("peer gone during control wait".into()),
+            DriverEvent::PeerGone => {
+                self.handle_death(peer);
+                Err("peer gone during control wait".into())
+            }
         }
     }
 
@@ -282,8 +263,82 @@ impl ThreadedRuntime {
                 Ok((kind, body, fd))
             }
             DriverEvent::Control { .. } => Err("unexpected control on native".into()),
-            DriverEvent::PeerGone => Err("peer gone during native wait".into()),
+            DriverEvent::PeerGone => {
+                self.handle_death(peer);
+                Err("peer gone during native wait".into())
+            }
         }
+    }
+
+    /// Central death orchestration. Exactly one semantic transition (peer_gone
+    /// is idempotent), then physical actions executed outside the state lock.
+    pub fn handle_death(&self, peer: &PeerId) {
+        let actions = {
+            let mut st = self.state.lock().unwrap();
+            st.peer_gone(*peer)
+        };
+        for act in actions {
+            match act {
+                DeathAction::AbortDeadSender { tid } => {
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        let _ = st.finish_abort_dead(tid);
+                    }
+                    self.escrow.lock().unwrap().remove(&(tid, 0));
+                }
+                DeathAction::RestoreToSender { tid, sender } => {
+                    let sender_alive = {
+                        let st = self.state.lock().unwrap();
+                        st.peer_state(&sender) == Some(PeerState::Active)
+                    };
+                    if sender_alive {
+                        let restore = {
+                            let esc = self.escrow.lock().unwrap();
+                            esc.get(&(tid, 0)).map(|(fd, oid)| (*oid, dup_owned(fd)))
+                        };
+                        if let Some((oid, Ok(restore_fd))) = restore {
+                            let ok = self
+                                .send_native_fd(
+                                    &sender,
+                                    Kind::Restore,
+                                    &envelope_oid(&tid, oid),
+                                    restore_fd,
+                                )
+                                .is_ok();
+                            if ok {
+                                if let Ok((k, _)) = self.recv_control(&sender) {
+                                    if k == Kind::RestoreAck {
+                                        {
+                                            let mut st = self.state.lock().unwrap();
+                                            let _ = st.finish_abort_restore(tid);
+                                        }
+                                        self.escrow.lock().unwrap().remove(&(tid, 0));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        // Sender alive but restoration failed: dead-sender path.
+                        {
+                            let mut st = self.state.lock().unwrap();
+                            let _ = st.finish_abort_dead(tid);
+                        }
+                        self.escrow.lock().unwrap().remove(&(tid, 0));
+                    } else {
+                        {
+                            let mut st = self.state.lock().unwrap();
+                            let _ = st.finish_abort_dead(tid);
+                        }
+                        self.escrow.lock().unwrap().remove(&(tid, 0));
+                    }
+                }
+                DeathAction::LeaveCommitted => {}
+            }
+        }
+    }
+
+    pub fn escrow_len(&self) -> usize {
+        self.escrow.lock().unwrap().len()
     }
 
     fn send_control(&self, peer: &PeerId, kind: Kind, body: &[u8]) -> Result<(), String> {
@@ -390,7 +445,7 @@ impl ThreadedRuntime {
                 drop(fd);
                 return Err("duplicate native fd".into());
             }
-            esc.insert((tid, 0), fd);
+            esc.insert((tid, 0), (fd, rid.0));
         }
         self.state
             .lock()
@@ -411,7 +466,7 @@ impl ThreadedRuntime {
 
         let send_fd = {
             let esc = self.escrow.lock().unwrap();
-            let escrow_fd = esc.get(&(tid, 0)).ok_or("escrow missing")?;
+            let escrow_fd = &esc.get(&(tid, 0)).ok_or("escrow missing")?.0;
             dup_owned(escrow_fd)?
         };
         self.send_native_fd(
@@ -455,7 +510,7 @@ impl ThreadedRuntime {
             self.send_control(&recipient, Kind::Abort, &tid.0)?;
             let restore_fd = {
                 let esc = self.escrow.lock().unwrap();
-                let escrow_fd = esc.get(&(tid, 0)).ok_or("escrow missing")?;
+                let escrow_fd = &esc.get(&(tid, 0)).ok_or("escrow missing")?.0;
                 dup_owned(escrow_fd)?
             };
             self.send_native_fd(&sender, Kind::Restore, &envelope(&tid, &rid), restore_fd)?;
@@ -498,6 +553,7 @@ pub enum Mode {
     WrongEnvelope,
     WrongIndex,
     Duplicate,
+    DieBeforeAccept,
 }
 
 #[derive(Debug)]
@@ -546,6 +602,7 @@ pub fn spawn_peer(
         Mode::WrongEnvelope => "wrong-envelope",
         Mode::WrongIndex => "wrong-index",
         Mode::Duplicate => "duplicate",
+        Mode::DieBeforeAccept => "die-before-accept",
     });
     cmd.arg("--transfer-id").arg(tid_hex);
     cmd.arg("--resource-id").arg(rid_hex);
