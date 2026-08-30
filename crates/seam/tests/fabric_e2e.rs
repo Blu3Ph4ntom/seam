@@ -229,30 +229,36 @@ fn threaded_duplicate_late_native_closed() {
 
 #[test]
 fn threaded_death_gate_exactly_once_via_readers() {
-    // Reader EOF converges through one DeathGate: only the gate winner emits
-    // PeerGone. The central driver then executes exactly one peer_gone.
+    // Idle peer death is observed via ControlClosed + ProcessExited without any
+    // incidental recv. Executor owns peer liveness and finalizes exactly once.
     let rt = ThreadedRuntime::new(Limits::default());
     let peer = PeerId([9; 16]);
     let (c1, c2) = seam_platform::NativeLane::pair().unwrap();
     let (n1, n2) = seam_platform::NativeLane::pair().unwrap();
     let child = std::process::Command::new("true").spawn().unwrap();
     rt.add_peer(peer, c1, n1, child).unwrap();
-    // Drop child-side ends -> both readers see EOF and race the death gate.
     drop(c2);
     drop(n2);
-    // Give readers a moment (blocking I/O threads, not a correctness sleep).
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Wait for executor to observe ControlClosed + ProcessExited (event-driven, timeout is deadlock guard)
+    let mut gone = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        if rt.peer_state(&peer) == Some(seam_core::fabric_state::PeerState::Gone) {
+            gone = true;
+            break;
+        }
+    }
+    assert!(
+        gone,
+        "executor must settle peer to Gone via ControlClosed frontier"
+    );
     assert!(
         !rt.death_gate_alive(&peer),
-        "death gate must be tripped by reader EOF"
+        "liveness must be Dying/Gone after EOF"
     );
-    // Central driver executes the (idempotent) semantic transition.
-    rt.handle_death(&peer);
-    let st = rt.state.lock().unwrap();
-    assert_eq!(
-        st.peer_state(&peer),
-        Some(seam_core::fabric_state::PeerState::Gone)
-    );
+    // Idempotent: second observation does not revert
+    let again = rt.peer_state(&peer);
+    assert_eq!(again, Some(seam_core::fabric_state::PeerState::Gone));
 }
 
 #[test]
@@ -295,14 +301,13 @@ fn threaded_recipient_death_precommit_restores_sender() {
     );
     // Logical: Held(sender), terminal Aborted, no Held(dead).
     {
-        let st = rt.state.lock().unwrap();
         let key = seam_core::authority::AuthorityKey::Resource(rid);
         assert_eq!(
-            st.authority_lookup(&key),
+            rt.authority_lookup(&key),
             Some(seam_core::authority::AuthorityState::Held(a))
         );
         assert_eq!(
-            st.status(&tid),
+            rt.status(&tid),
             seam_core::transfer::TransferStatus::Aborted
         );
     }
