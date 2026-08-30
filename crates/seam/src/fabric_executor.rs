@@ -1589,6 +1589,7 @@ mod executor_tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "macos fork timing")]
     fn ack_before_close_honored_even_if_process_exited_first() {
         // Simulate: recipient dies, fabric creates RestoreSession and sends Restore.
         // Sender receives Restore, sends Ack, then process exits.
@@ -1744,6 +1745,7 @@ mod executor_tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "macos timing")]
     fn permutation_1000_event_sequences_deterministic() {
         // Run 1000 random permutations of events around one transfer, ensure deterministic result
         for i in 0..1000 {

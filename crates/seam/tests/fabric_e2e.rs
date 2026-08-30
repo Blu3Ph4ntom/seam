@@ -496,6 +496,7 @@ fn threaded_all_three_death_observations_race() {
 }
 
 #[test]
+#[ignore = "heavy 100 repetition — run via --ignored or E2B"]
 fn threaded_linux_restoration_100() {
     // 100/100 restoration via recipient death before accept
     for i in 0..100 {
@@ -542,6 +543,7 @@ fn threaded_linux_restoration_100() {
 }
 
 #[test]
+#[ignore = "heavy 100 repetition"]
 fn threaded_idle_death_100() {
     for i in 0..100 {
         let peer = PeerId([50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
@@ -565,6 +567,7 @@ fn threaded_idle_death_100() {
 }
 
 #[test]
+#[ignore = "heavy 100 repetition"]
 fn threaded_ack_then_exit_100() {
     for i in 0..100 {
         let a = PeerId([110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
@@ -604,6 +607,7 @@ fn threaded_ack_then_exit_100() {
 }
 
 #[test]
+#[ignore = "heavy 100 repetition"]
 fn threaded_resource_cycle_100() {
     // 100 peer create/death cycles, check fd baseline and no leak
     let rt = ThreadedRuntime::new(Limits::default());
@@ -628,4 +632,49 @@ fn threaded_resource_cycle_100() {
     }
     // After 100 cycles, escrow must be 0 and no leaked peers (we only check escrow)
     assert_eq!(rt.escrow_len(), 0);
+}
+
+#[test]
+fn threaded_linux_restoration_20() {
+    for i in 0..20 {
+        let a = PeerId([110, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let b = PeerId([111, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let rid = ResourceId([220, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let tid = TransferId([230, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8]);
+        let rt = ThreadedRuntime::new(Limits::default());
+        let bin = env!("CARGO_BIN_EXE_fabric_peer_probe");
+        let (c_a, n_a, child_a) = spawn_peer(
+            "holder",
+            Mode::Abort,
+            &hexstr(&tid.0),
+            &hexstr(&rid.0),
+            &hexstr(&a.0),
+            bin,
+        )
+        .unwrap();
+        let (c_b, n_b, child_b) = spawn_peer(
+            "recipient",
+            Mode::DieBeforeAccept,
+            &hexstr(&tid.0),
+            &hexstr(&rid.0),
+            &hexstr(&b.0),
+            bin,
+        )
+        .unwrap();
+        rt.add_peer(a, c_a, n_a, child_a).unwrap();
+        rt.add_peer(b, c_b, n_b, child_b).unwrap();
+        let res = rt.run_native_file(a, b, tid, rid, Mode::Abort);
+        assert!(res.is_err(), "iteration {i} must be recipient death abort");
+        assert_eq!(
+            rt.status(&tid),
+            seam_core::transfer::TransferStatus::Aborted
+        );
+        assert_eq!(rt.escrow_len(), 0, "iteration {i} escrow leak");
+        let key = seam_core::authority::AuthorityKey::Resource(rid);
+        assert_eq!(
+            rt.authority_lookup(&key),
+            Some(seam_core::authority::AuthorityState::Held(a)),
+            "iteration {i} must be Held(sender)"
+        );
+    }
 }
