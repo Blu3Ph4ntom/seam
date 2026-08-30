@@ -137,7 +137,8 @@ impl FabricState {
                         }
                     }
                     BundleState::Restoring => {
-                        actions.push(DeathAction::AbortDeadSender { tid });
+                        // Recipient died during Restoring: restore-to-sender is
+                        // already in flight; recipient death must not abandon it.
                     }
                     BundleState::Committed => {
                         actions.push(DeathAction::LeaveCommitted { tid });

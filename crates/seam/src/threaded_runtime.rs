@@ -192,16 +192,13 @@ impl ThreadedRuntime {
         // Supervisor: consumes death events promptly, independent of any
         // application recv_* call. handle_death is idempotent.
         let weak = Arc::downgrade(&rt);
-        let handle = std::thread::spawn(move || loop {
-            match death_rx.recv() {
-                Ok(peer) => {
-                    if let Some(runtime) = weak.upgrade() {
-                        runtime.handle_death(&peer);
-                    } else {
-                        break;
-                    }
+        let handle = std::thread::spawn(move || {
+            while let Ok(peer) = death_rx.recv() {
+                if let Some(runtime) = weak.upgrade() {
+                    runtime.handle_death(&peer);
+                } else {
+                    break;
                 }
-                Err(_) => break,
             }
         });
         *rt.supervisor.lock().unwrap() = Some(handle);
@@ -436,13 +433,9 @@ impl ThreadedRuntime {
             peers.get(peer).map(|rt| Arc::clone(&rt.native_rx))
         };
         if let Some(rx) = rx {
-            let mut rx = rx.lock().unwrap();
-            loop {
-                match rx.try_recv() {
-                    Ok(DriverEvent::Native { fd: Some(fd), .. }) => drop(fd),
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
+            let mut guard = rx.lock().unwrap();
+            while let Ok(DriverEvent::Native { fd: Some(fd), .. }) = guard.try_recv() {
+                drop(fd);
             }
         }
     }
