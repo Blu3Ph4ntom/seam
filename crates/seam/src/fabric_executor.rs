@@ -1116,6 +1116,92 @@ impl FabricExecutor {
             .map(|e| e.liveness)
             .unwrap_or(PeerLiveness::Gone);
         if liveness == PeerLiveness::Gone {
+            // Already Gone — but new transfers may have been created after death.
+            // Need to handle pending transfers that arrived after peer was marked Gone.
+            // If there is a new transfer involving this peer, we must handle it.
+            let has_new = self
+                .transfers
+                .values()
+                .any(|c| c.recipient == peer || c.sender == peer);
+            if !has_new {
+                return;
+            }
+            // For new transfers, the FabricState peer is already Gone, so peer_gone would return empty.
+            // Manually handle restore for these post-death transfers.
+            // Find any pending transfer where recipient == peer and escrow exists
+            let mut to_restore = Vec::new();
+            for (tid, ctx) in &self.transfers {
+                if ctx.recipient == peer {
+                    if self.escrow.contains_key(&(*tid, 0))
+                        && !self.restore_sessions.contains_key(tid)
+                    {
+                        to_restore.push((*tid, ctx.sender));
+                    }
+                }
+            }
+            for (tid, sender) in to_restore {
+                let sender_alive = self
+                    .peers
+                    .get(&sender)
+                    .map(|e| e.liveness == PeerLiveness::Active)
+                    .unwrap_or(false);
+                if !sender_alive {
+                    let _ = self.state.finish_abort_dead(tid);
+                    self.escrow.remove(&(tid, 0));
+                    self.complete_transfer(tid, false);
+                    continue;
+                }
+                let oid = self
+                    .escrow
+                    .get(&(tid, 0))
+                    .map(|(_, o)| *o)
+                    .unwrap_or([0; 16]);
+                self.restore_sessions.insert(
+                    tid,
+                    RestoreSession {
+                        tid,
+                        sender,
+                        recipient: peer,
+                        oid,
+                        state: RestoreState::SendInFlight,
+                    },
+                );
+                let escrow_fd = match self.escrow.get(&(tid, 0)).map(|(f, _)| dup_owned(f)) {
+                    Some(Ok(fd)) => fd,
+                    _ => {
+                        let _ = self.state.finish_abort_dead(tid);
+                        self.escrow.remove(&(tid, 0));
+                        self.restore_sessions.remove(&tid);
+                        self.complete_transfer(tid, false);
+                        continue;
+                    }
+                };
+                let writer = match self
+                    .peers
+                    .get(&sender)
+                    .and_then(|e| dup_lane(&e.native_writer).ok())
+                {
+                    Some(l) => l,
+                    None => {
+                        let _ = self.state.finish_abort_dead(tid);
+                        self.escrow.remove(&(tid, 0));
+                        self.restore_sessions.remove(&tid);
+                        self.complete_transfer(tid, false);
+                        continue;
+                    }
+                };
+                let env = envelope_oid(&tid, oid);
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let res = writer.send_frame_fd(&header(Kind::Restore, 36), &env, escrow_fd);
+                    let _ = tx.send(ExecutorEvent::EffectCompleted {
+                        peer: sender,
+                        kind: Kind::Restore,
+                        tid,
+                        success: res.is_ok(),
+                    });
+                });
+            }
             return;
         }
         let control_closed = self
@@ -1127,7 +1213,16 @@ impl FabricExecutor {
         if !control_closed {
             return;
         }
-        // Check if there is a pending restore awaiting ack for this peer as sender — we already handled in handle_control_closed
+        // Defer FabricState peer_gone until there is at least one transfer involving this peer.
+        // If death happens before any transfer, keep Dying and let future Transfer trigger restore.
+        let has_involved = self
+            .transfers
+            .values()
+            .any(|c| c.recipient == peer || c.sender == peer);
+        if !has_involved {
+            // No transfer yet — keep Dying, defer Gone until transfer arrives
+            return;
+        }
         // Now call FabricState peer_gone exactly once
         let actions = self.state.peer_gone(peer);
         if actions.is_empty() {
