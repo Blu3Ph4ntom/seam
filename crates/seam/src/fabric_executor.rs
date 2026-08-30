@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Child;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::JoinHandle;
 
 use seam_core::authority::{AuthorityKey, AuthorityState};
 use seam_core::fabric_state::{DeathAction, FabricState, PeerState};

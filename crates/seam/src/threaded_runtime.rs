@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::AsRawFd;
 use std::process::Child;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -155,7 +155,9 @@ impl ThreadedRuntime {
         rid: ResourceId,
         mode: Mode,
     ) -> Result<Diagnostics, String> {
-        self.handle.transfer(sender, recipient, tid, rid, mode)
+        self.handle
+            .transfer(sender, recipient, tid, rid, mode)
+            .map(Into::into)
     }
 }
 
