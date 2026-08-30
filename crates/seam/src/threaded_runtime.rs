@@ -332,7 +332,7 @@ impl ThreadedRuntime {
                         self.escrow.lock().unwrap().remove(&(tid, 0));
                     }
                 }
-                DeathAction::LeaveCommitted => {}
+                DeathAction::LeaveCommitted { .. } => {}
             }
         }
     }
