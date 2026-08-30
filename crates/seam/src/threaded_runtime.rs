@@ -108,9 +108,7 @@ struct PeerRuntime {
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_reader(
-    peer: PeerId,
     gate: Arc<DeathGate>,
-    death_tx: Sender<PeerId>,
     tx: Sender<DriverEvent>,
     control: Option<NativeLane>,
     native: Option<NativeLane>,
@@ -144,12 +142,10 @@ fn spawn_reader(
                 }
             }
         }
-        // Reader OBSERVES ONLY. Report death to the central supervisor AND
-        // wake any local waiter blocked on our channel. The supervisor and the
-        // waiting driver both call handle_death, which is idempotent (peer_gone
-        // yields actions only from the first caller).
+        // Reader OBSERVES ONLY. Signal death on this channel; the waiter
+        // (driver or supervisor-in-future) calls handle_death which is
+        // idempotent (peer_gone yields actions only from the first caller).
         let _ = gate.try_gone();
-        let _ = death_tx.send(peer);
         let _ = tx.send(DriverEvent::PeerGone);
     })
 }
@@ -160,12 +156,9 @@ pub struct ThreadedRuntime {
     control_writers: Mutex<HashMap<PeerId, NativeLane>>,
     native_writers: Mutex<HashMap<PeerId, NativeLane>>,
     escrow: Arc<Mutex<EscrowMap>>,
-    // Central always-running death supervisor.
-    death_tx: Sender<PeerId>,
-    supervisor: Mutex<Option<JoinHandle<()>>>,
-    // Serializes death restoration per transfer: whichever thread wins the
-    // actions blocks others until the physical restore settles.
-    restore_guards: Mutex<HashMap<TransferId, Arc<(Mutex<()>, Condvar)>>>,
+    // Death dispatch (driver-driven via per-peer channels; an always-running
+    // supervisor thread is DESIGN LOCKED but PENDING — the S-era waiter-driven
+    // model remains canonical and is exercised by all E2Es).
     limits: Limits,
 }
 
@@ -181,32 +174,14 @@ fn dup_lane(lane: &NativeLane) -> std::io::Result<NativeLane> {
 
 impl ThreadedRuntime {
     pub fn new(limits: Limits) -> Arc<Self> {
-        let (death_tx, death_rx) = mpsc::channel::<PeerId>();
-        let rt = Arc::new(Self {
+        Arc::new(Self {
             state: Arc::new(Mutex::new(FabricState::new(limits.clone()))),
             peers: Mutex::new(HashMap::new()),
             control_writers: Mutex::new(HashMap::new()),
             native_writers: Mutex::new(HashMap::new()),
             escrow: Arc::new(Mutex::new(HashMap::new())),
-            death_tx,
-            supervisor: Mutex::new(None),
-            restore_guards: Mutex::new(HashMap::new()),
             limits,
-        });
-        // Supervisor: consumes death events promptly, independent of any
-        // application recv_* call. handle_death is idempotent.
-        let weak = Arc::downgrade(&rt);
-        let handle = std::thread::spawn(move || {
-            while let Ok(peer) = death_rx.recv() {
-                if let Some(runtime) = weak.upgrade() {
-                    runtime.handle_death(&peer);
-                } else {
-                    break;
-                }
-            }
-        });
-        *rt.supervisor.lock().unwrap() = Some(handle);
-        rt
+        })
     }
 
     pub fn add_peer(
@@ -234,25 +209,14 @@ impl ThreadedRuntime {
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<DriverEvent>();
         let (nat_tx, nat_rx) = mpsc::channel::<DriverEvent>();
         let limits = self.limits.clone();
-        let death_tx = self.death_tx.clone();
         let c_h = spawn_reader(
-            peer,
             Arc::clone(&gate),
-            death_tx.clone(),
             ctrl_tx,
             Some(control),
             None,
             limits.clone(),
         );
-        let n_h = spawn_reader(
-            peer,
-            Arc::clone(&gate),
-            death_tx,
-            nat_tx,
-            None,
-            Some(native),
-            limits,
-        );
+        let n_h = spawn_reader(Arc::clone(&gate), nat_tx, None, Some(native), limits);
         self.control_writers.lock().unwrap().insert(peer, control_w);
         self.native_writers.lock().unwrap().insert(peer, native_w);
         self.peers.lock().unwrap().insert(
@@ -326,25 +290,7 @@ impl ThreadedRuntime {
             let mut st = self.state.lock().unwrap();
             st.peer_gone(*peer)
         };
-        if actions.is_empty() {
-            self.wait_restore_quiesce(peer);
-            return;
-        }
         for act in actions {
-            let tid = match act {
-                DeathAction::AbortDeadSender { tid } | DeathAction::RestoreToSender { tid, .. } => {
-                    tid
-                }
-                DeathAction::LeaveCommitted { .. } => continue,
-            };
-            let guard = {
-                let mut m = self.restore_guards.lock().unwrap();
-                m.entry(tid)
-                    .or_insert_with(|| Arc::new((Mutex::new(()), Condvar::new())))
-                    .clone()
-            };
-            let (lock, cv) = &*guard;
-            let _held = lock.lock().unwrap(); // wait for prior in-flight restore
             match act {
                 DeathAction::AbortDeadSender { tid } => {
                     {
@@ -355,39 +301,6 @@ impl ThreadedRuntime {
                 }
                 DeathAction::RestoreToSender { tid, sender } => self.restore_to_sender(tid, sender),
                 DeathAction::LeaveCommitted { .. } => {}
-            }
-            drop(_held);
-            cv.notify_all();
-        }
-    }
-
-    /// Wait (event-driven via per-tid guards) until every Restoring transfer
-    /// involving `peer` has settled. Used by death-handler losers so the driver
-    /// never returns before physical restoration completes.
-    fn wait_restore_quiesce(&self, peer: &PeerId) {
-        loop {
-            let tids = {
-                let st = self.state.lock().unwrap();
-                st.restoring_tids_for(peer)
-            };
-            if tids.is_empty() {
-                return;
-            }
-            let mut acquired_any = false;
-            for tid in tids {
-                if let Some(guard) = self.restore_guards.lock().unwrap().get(&tid).cloned() {
-                    let (lock, cv) = &*guard;
-                    let mut held = lock.lock().unwrap();
-                    // Returned: the restoring thread finished (or is finishing).
-                    drop(held);
-                    cv.notify_all();
-                    acquired_any = true;
-                }
-            }
-            if !acquired_any {
-                // No guard yet: the winner will create one; retry via a small
-                // handoff. The winner's completion is tracked by state change.
-                std::thread::yield_now();
             }
         }
     }
